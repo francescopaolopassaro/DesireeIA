@@ -1,0 +1,19 @@
+# Internal working notes — kept locally, never published.
+docs/
+
+# .NET build output
+bin/
+obj/
+
+# Native build output (CMake)
+native/out/
+build/
+
+# Editor/IDE
+.vs/
+.vscode/
+*.user
+
+# OS cruft
+.DS_Store
+Thumbs.db

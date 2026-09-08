@@ -1,0 +1,103 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>DesireeIA</RootNamespace>
+    <AssemblyName>DesireeIA</AssemblyName>
+  </PropertyGroup>
+
+  <!--
+    Il motore nativo viene COMPILATO E COPIATO dalla build .NET.
+
+    Prima non era cosi': gli artefatti erano semplici <None
+    CopyToOutputDirectory="PreserveNewest">, che copiano solo quando gira una
+    build .NET. Ricostruendo solo il nativo con cmake ed eseguendo la CLI,
+    quest'ultima continuava a caricare in SILENZIO la copia precedente.
+    Costo dell'errore (2026-09-07): un'intera serie di misure di prestazioni
+    fatta contro un motore vecchio, con due decisioni tecniche prese di
+    conseguenza e poi da rifare. Un disallineamento che non da' alcun segnale
+    e' peggio di un errore di compilazione.
+
+    Impostare BuildNativeEngine=false per saltare la compilazione nativa
+    (es. su una macchina di sola analisi statica senza cmake).
+  -->
+  <PropertyGroup>
+    <NativeLibBaseName>DesireeIALocaleEngine</NativeLibBaseName>
+    <NativeSourceDir>$(MSBuildThisFileDirectory)..\DesireeIA.LocaleEngine</NativeSourceDir>
+    <NativeBuildDir>$(MSBuildThisFileDirectory)..\..\native\out</NativeBuildDir>
+    <BuildNativeEngine Condition="'$(BuildNativeEngine)' == ''">true</BuildNativeEngine>
+  </PropertyGroup>
+
+  <!-- Nome del file prodotto: cambia sui tre sistemi supportati. -->
+  <PropertyGroup Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' == 'true'">
+    <NativeLibFileName>$(NativeLibBaseName).dll</NativeLibFileName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))' == 'true'">
+    <NativeLibFileName>lib$(NativeLibBaseName).dylib</NativeLibFileName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))' == 'true'">
+    <NativeLibFileName>lib$(NativeLibBaseName).so</NativeLibFileName>
+  </PropertyGroup>
+
+  <Target Name="ConfigureNativeEngine"
+          Condition="'$(BuildNativeEngine)' == 'true' AND !Exists('$(NativeBuildDir)\CMakeCache.txt')">
+    <Message Importance="high" Text="Configurazione cmake del motore nativo..." />
+    <Exec Command="cmake -S &quot;$(NativeSourceDir)&quot; -B &quot;$(NativeBuildDir)&quot; -DCMAKE_BUILD_TYPE=Release" />
+  </Target>
+
+  <Target Name="CompileNativeEngine"
+          Condition="'$(BuildNativeEngine)' == 'true'"
+          DependsOnTargets="ConfigureNativeEngine"
+          BeforeTargets="BeforeBuild">
+    <Exec Command="cmake --build &quot;$(NativeBuildDir)&quot; --config Release" />
+  </Target>
+
+  <!--
+    Gli artefatti nativi restano item <None CopyToOutputDirectory>, non una
+    <Copy> in un target: solo gli item si propagano ai progetti che
+    REFERENZIANO questo (la CLI, i test), che e' esattamente dove serve che la
+    libreria finisca. Una <Copy> esplicita riempirebbe solo la cartella di
+    output di questo progetto, lasciando la CLI senza libreria.
+
+    Sulla condizione Exists() del file principale: volutamente assente. Il
+    target CompileNativeEngine qui sopra garantisce che esista, e se per
+    qualche motivo non esistesse e' meglio un errore di build chiaro che una
+    copia saltata in silenzio — che era proprio il difetto da eliminare.
+    PreserveNewest confronta le date al momento della copia, quindi una
+    libreria appena ricompilata viene sempre ripresa.
+  -->
+  <ItemGroup>
+    <None Include="$(NativeBuildDir)\$(NativeLibFileName)"
+          Link="$(NativeLibFileName)"
+          CopyToOutputDirectory="PreserveNewest" />
+    <!-- Runtime MinGW: solo nelle build Windows con quel toolchain. -->
+    <None Include="$(NativeBuildDir)\libstdc++-6.dll"
+          Condition="Exists('$(NativeBuildDir)\libstdc++-6.dll')"
+          Link="libstdc++-6.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(NativeBuildDir)\libgcc_s_seh-1.dll"
+          Condition="Exists('$(NativeBuildDir)\libgcc_s_seh-1.dll')"
+          Link="libgcc_s_seh-1.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(NativeBuildDir)\libwinpthread-1.dll"
+          Condition="Exists('$(NativeBuildDir)\libwinpthread-1.dll')"
+          Link="libwinpthread-1.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!--
+    Multi-platform NuGet packaging: picks up whatever Build\build.ps1 has
+    actually produced under Build\runtimes\<RID>\native\ (see Build\README.md
+    for exactly which RIDs are real today vs. still empty placeholders) and
+    packs each one under the standard runtimes\<RID>\native\ NuGet convention,
+    so `dotnet pack` yields a single package that works on every platform it
+    was built for, with no rebuild needed by the consumer.
+  -->
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\**\native\*"
+          Pack="true"
+          PackagePath="runtimes\%(RecursiveDir)"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes')" />
+  </ItemGroup>
+
+</Project>

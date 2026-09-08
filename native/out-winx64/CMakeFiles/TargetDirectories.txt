@@ -1,0 +1,3 @@
+C:/Sorgenti/Personal/DesireeIA/native/out-winx64/CMakeFiles/DesireeIALocaleEngine.dir
+C:/Sorgenti/Personal/DesireeIA/native/out-winx64/CMakeFiles/edit_cache.dir
+C:/Sorgenti/Personal/DesireeIA/native/out-winx64/CMakeFiles/rebuild_cache.dir

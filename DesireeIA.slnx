@@ -1,0 +1,14 @@
+﻿<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DesireeIA/DesireeIA.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DesireeIA.Tests/DesireeIA.Tests.csproj" />
+  </Folder>
+  <Folder Name="/bench/">
+    <Project Path="bench/DesireeIA.Bench/DesireeIA.Bench.csproj" />
+  </Folder>
+  <Folder Name="/cli/">
+    <Project Path="cli/DesireeIA.Cli/DesireeIA.Cli.csproj" />
+  </Folder>
+</Solution>
