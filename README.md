@@ -1,7 +1,7 @@
 # DesireeIA
 
 A local large language model inference engine for the .NET ecosystem: a native C++17 core exposed through a stable C ABI, with an idiomatic .NET wrapper on top.
-
+<img src="images/DesireeIA.jpg" />
 ## What it does
 
 DesireeIA loads quantized language models from disk and runs them entirely on local hardware — no network calls, no external services. It targets practical CPU throughput (the reference benchmark model sustains 19+ tokens/second on decode) while auto-adapting its execution plan to the hardware it's running on.
