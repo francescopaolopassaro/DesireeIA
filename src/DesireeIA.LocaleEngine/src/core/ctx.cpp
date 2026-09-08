@@ -7,11 +7,16 @@
 #include "models/dense_forward.h"
 #include "models/ssm_forward.h"
 #include "models/bert_forward.h"
+#include "ssd_tier/hybrid_tier.h"
 #include "tokenizer/tokenizer.h"
 #include <cstring>
+#include <cstdlib>
+#include <cstdio>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <set>
+#include <system_error>
 
 namespace desireeia {
 
@@ -139,13 +144,212 @@ desireeia_plan resolve_plan(const char* model_path, desireeia_plan plan) {
             plan.dual_ssd_enabled = auto_plan.dual_ssd_enabled;
             plan.expert_prefetch_enabled = auto_plan.expert_prefetch_enabled;
             plan.kv_compression_enabled = auto_plan.kv_compression_enabled;
+            // Only taken from the auto plan when the caller left the plan
+            // unconfigured; a caller that fills the plan in keeps full
+            // control of the tier, including turning it off outright.
+            plan.ssd_tier_mode = auto_plan.ssd_tier_mode;
+            plan.ssd_tier_cache_mb = auto_plan.ssd_tier_cache_mb;
         }
     }
+    // Applied last, and regardless of whether the caller configured the plan:
+    // it is the escape hatch for measuring the tier, and it would be useless
+    // if a filled-in plan could shadow it.
+    env_ssd_tier_override(plan.ssd_tier_mode);
     return plan;
 }
 
 std::string sidecar_path(const std::string& model_path, const char* suffix) {
     return model_path + suffix;
+}
+
+// Size of the model file in bytes, or 0 if it can't be determined.
+uint64_t model_file_bytes(const char* path) {
+    if (!path || path[0] == '\0') return 0;
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    return ec ? 0 : static_cast<uint64_t>(size);
+}
+
+constexpr uint64_t kMiB = 1024ull * 1024ull;
+
+// What a load is expected to cost in RAM, split into the parts that behave
+// differently. Everything is in bytes.
+struct TierBudget {
+    uint64_t budget = 0;          // What the plan says we may use in total.
+    uint64_t system_reserve = 0;  // Left to the OS so the machine stays usable.
+    uint64_t runtime_reserve = 0; // KV cache, activations, per-layer scratch.
+    uint64_t weight_ceiling = 0;  // What is left over for weights.
+    uint64_t model_bytes = 0;     // What the weights actually cost.
+    bool     feasible = true;     // False when not even the reserves fit.
+};
+
+// Reads an architecture-scoped metadata key ("<arch>.embedding_length" and
+// friends), falling back to `fallback` when the file does not carry it.
+uint32_t meta_dim(ModelReader* reader, const std::string& arch,
+                  const char* suffix, uint32_t fallback) {
+    uint32_t v = 0;
+    if (reader && reader->meta_u32(arch + suffix, v) && v > 0) return v;
+    return fallback;
+}
+
+// Estimates what this model needs beyond its weights, and how much of the
+// budget that leaves for the weights themselves.
+//
+// The three parts are estimated separately because they scale differently and
+// a single flat percentage gets all three wrong at once. A small model on a
+// large machine wants almost no reserve and should stay entirely in RAM; a
+// long-context model can spend more on its KV cache than on its weights. The
+// old "70% of the budget is for weights" rule was blind to both.
+TierBudget plan_tier_budget(const desireeia_plan& plan, const ModelMeta& meta,
+                            ModelReader* reader, const char* model_path) {
+    TierBudget b;
+    b.budget = plan.ram_budget_mb * kMiB;
+    b.model_bytes = model_file_bytes(model_path);
+
+    // System reserve: an eighth of the budget, but never less than 512 MiB
+    // (below that the machine starts paging under us) and never more than
+    // 4 GiB (past that we are just refusing to use RAM we were given).
+    b.system_reserve = b.budget / 8;
+    if (b.system_reserve < 512 * kMiB) b.system_reserve = 512 * kMiB;
+    if (b.system_reserve > 4096 * kMiB) b.system_reserve = 4096 * kMiB;
+
+    const uint32_t layers = meta.n_layers > 0 ? meta.n_layers : 1;
+    const uint32_t n_embd = meta_dim(reader, meta.arch, ".embedding_length", 4096);
+    const uint32_t n_head = meta_dim(reader, meta.arch, ".attention.head_count", 32);
+    const uint32_t n_head_kv =
+        meta_dim(reader, meta.arch, ".attention.head_count_kv", n_head);
+    const uint32_t head_dim = n_head > 0 ? n_embd / n_head : 128;
+
+    // Context we actually plan to hold. Files routinely advertise a maximum
+    // far past what a session uses, and sizing the reserve for 128k context
+    // would push every model onto the SSD tier for a cache nobody fills.
+    uint32_t n_ctx = meta.n_ctx > 0 ? meta.n_ctx : 4096;
+    if (n_ctx > 8192) n_ctx = 8192;
+
+    // K and V, one entry per layer per position, float32.
+    const uint64_t kv_bytes = 2ull * layers * n_ctx *
+                              static_cast<uint64_t>(n_head_kv) * head_dim * sizeof(float);
+
+    // Activations: a handful of live vectors of width n_embd, plus the logits
+    // row over the vocabulary. Small next to the rest, but not nothing for a
+    // 256k vocabulary.
+    const uint64_t act_bytes =
+        (16ull * n_embd + 2ull * (meta.n_vocab > 0 ? meta.n_vocab : 32000)) * sizeof(float);
+
+    // Scratch for dequantizing weights on the way in: two layers' worth, so a
+    // layer can be prepared while the previous one is still in use.
+    const uint64_t layer_bytes = b.model_bytes / layers;
+    const uint64_t scratch_bytes = 2ull * layer_bytes;
+
+    b.runtime_reserve = kv_bytes + act_bytes + scratch_bytes;
+
+    const uint64_t reserved = b.system_reserve + b.runtime_reserve;
+    if (reserved >= b.budget) {
+        b.feasible = false;
+        b.weight_ceiling = 0;
+    } else {
+        b.weight_ceiling = b.budget - reserved;
+    }
+    return b;
+}
+
+// How many tensor slots the tier may hold in RAM.
+//
+// The tier's cache is counted in entries, not bytes, so the byte budget has
+// to be turned into a slot count. Tensors within a model are close enough in
+// size that an average works: a transformer layer carries roughly nine of
+// them (attention projections, norms, the FFN matrices), which is the divisor
+// below. Getting this wrong in either direction is expensive — too few slots
+// and every layer is re-read from SSD each token, too many and the cache
+// evicts the rest of the process.
+int32_t tier_cache_slots(const desireeia_plan& plan, const ModelMeta& meta,
+                         ModelReader* reader, const char* model_path, LogFn log) {
+    const TierBudget b = plan_tier_budget(plan, meta, reader, model_path);
+
+    // An explicit cache size wins; 0 means "work it out from the budget".
+    uint64_t cache_bytes = plan.ssd_tier_cache_mb * kMiB;
+    if (cache_bytes == 0) cache_bytes = b.weight_ceiling;
+    if (cache_bytes == 0) cache_bytes = 256 * kMiB;
+
+    const uint32_t layers = meta.n_layers > 0 ? meta.n_layers : 1;
+    const uint64_t avg_tensor = b.model_bytes / (static_cast<uint64_t>(layers) * 9ull + 4ull);
+
+    int32_t slots = plan.expert_cache_count > 0 ? plan.expert_cache_count : 256;
+    if (avg_tensor > 0) {
+        uint64_t n = cache_bytes / avg_tensor;
+        if (n < 16) n = 16;              // Below this the tier cannot hold a layer.
+        if (n > 65536) n = 65536;
+        slots = static_cast<int32_t>(n);
+    }
+
+    if (log) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+                      "ssd tier: cache %llu MiB, avg tensor %llu KiB -> %d slots",
+                      (unsigned long long) (cache_bytes / kMiB),
+                      (unsigned long long) (avg_tensor / 1024ull), slots);
+        log(5, msg);
+    }
+    return slots;
+}
+
+// Decides whether the SSD tier should actually be constructed for this load.
+//
+// OFF and ALWAYS are literal. AUTO is the interesting one: it engages only
+// when the weights do not fit what is left of the budget after the reserves,
+// which is exactly the case the tier exists for. A model that fits stays
+// entirely on the RAM path and pays nothing for the tier being available.
+bool resolve_ssd_tier(const desireeia_plan& plan, const ModelMeta& meta,
+                      ModelReader* reader, const char* model_path, LogFn log) {
+    switch (plan.ssd_tier_mode) {
+        case DESIREEIA_SSD_TIER_OFF:
+            return false;
+        case DESIREEIA_SSD_TIER_ALWAYS:
+            return true;
+        default:
+            break;
+    }
+
+    const TierBudget b = plan_tier_budget(plan, meta, reader, model_path);
+    if (b.model_bytes == 0 || b.budget == 0) {
+        // Unknown size or no budget: assume it fits rather than forcing
+        // everyone onto the slower path over a stat() that failed.
+        return false;
+    }
+
+    // Reserves alone overrun the budget. Streaming the weights is the only
+    // way this load has a chance, so engage the tier and say plainly why —
+    // silently continuing on the RAM path here means thrashing later.
+    if (!b.feasible) {
+        if (log) {
+            char msg[224];
+            std::snprintf(msg, sizeof(msg),
+                          "ssd tier (auto): reserves %llu MiB exceed budget %llu MiB "
+                          "(system %llu + runtime %llu) -> streaming weights",
+                          (unsigned long long) ((b.system_reserve + b.runtime_reserve) / kMiB),
+                          (unsigned long long) (b.budget / kMiB),
+                          (unsigned long long) (b.system_reserve / kMiB),
+                          (unsigned long long) (b.runtime_reserve / kMiB));
+            log(4, msg);
+        }
+        return true;
+    }
+
+    const bool needs_tier = b.model_bytes > b.weight_ceiling;
+    if (log) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "ssd tier (auto): weights %llu MiB, budget %llu MiB "
+                      "(system %llu, runtime %llu, free for weights %llu) -> %s",
+                      (unsigned long long) (b.model_bytes / kMiB),
+                      (unsigned long long) (b.budget / kMiB),
+                      (unsigned long long) (b.system_reserve / kMiB),
+                      (unsigned long long) (b.runtime_reserve / kMiB),
+                      (unsigned long long) (b.weight_ceiling / kMiB),
+                      needs_tier ? "on" : "off");
+        log(5, msg);
+    }
+    return needs_tier;
 }
 
 }
@@ -188,6 +392,51 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
     ctx->st.experts->set_pin_enabled(ctx->st.plan.expert_pin_enabled != 0);
     ctx->st.experts->set_usage_file(ctx->st.usage_file);
     ctx->st.experts->load_usage();
+
+    // SSD tier: opt-in, and in AUTO mode only when the model actually needs
+    // it. When it stays off, nothing is constructed and nothing sits on the
+    // tensor read path — the RAM/CPU path is byte-for-byte what it was
+    // before this feature existed. That matters: the wrapper below adds a
+    // lookup to every read_tensor/read_tensor_raw call, which is cheap when
+    // the layer weight cache is on (one hit per layer at load) but is paid
+    // per token when the model is too big for that cache.
+    if (resolve_ssd_tier(ctx->st.plan, meta, reader, model_path, log)) {
+        HybridTierConfig hcfg;
+        hcfg.gguf_path = model_path ? model_path : "";
+        hcfg.usage_file = ctx->st.usage_file;
+        hcfg.ram_capacity = tier_cache_slots(ctx->st.plan, meta, reader, model_path, log);
+        hcfg.prefetch_enabled = ctx->st.plan.expert_prefetch_enabled != 0;
+        hcfg.prefetch_depth = ctx->st.plan.expert_prefetch_depth;
+
+        const char* mirror_env = std::getenv("DESIREEIA_MODEL_MIRROR");
+        if (mirror_env && mirror_env[0] != '\0') {
+            hcfg.mirror_path = mirror_env;
+        }
+
+        ctx->st.hybrid = new HybridTier(hcfg, log);
+        // The tier reads misses through the real reader rather than parsing
+        // the model file itself, so its view of the file is identical to the
+        // engine's by construction.
+        ctx->st.hybrid->set_source(reader);
+        ctx->st.experts->set_hybrid_tier(ctx->st.hybrid);
+
+        // Wrap the reader so every tensor read goes through the tier
+        // (read_tensor, read_tensor_raw, read_expert). The wrapper calls the
+        // tier first; the tier falls back to `reader` on a miss. No recursion:
+        // the tier holds the inner reader, not the wrapper.
+        if (ctx->st.hybrid->gguf_available()) {
+            auto* hybrid_reader = new HybridModelReader(reader, ctx->st.hybrid);
+            ctx->st.reader = hybrid_reader;
+            // Point ExpertStore at the wrapped reader too, so MoE expert
+            // fetches are served by the same tier.
+            ctx->st.experts->set_reader(hybrid_reader);
+            if (log) log(5, "ssd tier: enabled, tensor reads served through SSD tier");
+        } else if (log) {
+            log(4, "ssd tier: requested but model file not readable, staying on RAM path");
+        }
+    } else if (log) {
+        log(5, "ssd tier: off, weights served from the RAM/CPU path");
+    }
 
     VocabData vocab;
     if (reader->read_vocab(vocab)) {
@@ -283,10 +532,15 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
 void engine_destroy(desireeia_ctx* ctx) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return;
+    if (c->st.experts) c->st.experts->save_usage();
+    if (c->st.hybrid) c->st.hybrid->save_usage();
     delete c->gf;
     delete c->bert;
     delete c->st.kv;
     delete c->st.experts;
+    delete c->st.hybrid;
+    // If HybridModelReader wraps the original reader, it's deleted via
+    // HybridModelReader. Otherwise delete the bare reader.
     delete c->st.reader;
     delete c;
 }

@@ -4,7 +4,7 @@ A local large language model inference engine for the .NET ecosystem: a native C
 <img src="images/DesireeIA.jpg" />
 ## What it does
 
-DesireeIA loads quantized language models from disk and runs them entirely on local hardware — no network calls, no external services. It targets practical CPU throughput (the reference benchmark model sustains 19+ tokens/second on decode) while auto-adapting its execution plan to the hardware it's running on.
+DesireeIA loads quantized language models from disk and runs them entirely on local hardware — no network calls, no external services. It targets practical CPU throughput while auto-adapting its execution plan to the hardware it's running on.
 
 ## Background
 
@@ -67,6 +67,55 @@ At load time the engine:
    - KV cache compression.
 
 Every part of the plan can be overridden by the caller.
+
+### Storage tier
+
+Models larger than the RAM budget can be served straight from disk instead of
+being loaded whole. The tier is configurable per load:
+
+| Mode | Behaviour |
+| --- | --- |
+| `Off` | Weights are served from RAM only. |
+| `Auto` (default) | The tier engages only when the weights do not fit the budget. |
+| `Always` | Weights are always streamed, even when they would fit. |
+
+`Auto` decides from a real budget rather than a flat percentage: a system
+reserve is left to the operating system, a runtime reserve covers the KV cache,
+activations and per-layer dequantization scratch, and the weights are compared
+against what remains. A model that fits stays entirely on the RAM path, and the
+tier is not constructed at all — nothing sits on the tensor read path and
+throughput is unchanged.
+
+The tier never parses the model file itself; it serves misses through the same
+reader the rest of the engine uses, so both paths see identical bytes.
+
+```csharp
+var plan = new ExecutionPlan
+{
+    SsdTier = SsdTierMode.Always,
+    SsdTierCacheMb = 2048
+};
+```
+
+`DESIREEIA_SSD_TIER=off|auto|always` overrides the mode for a single run.
+
+### Weight requantization
+
+Decode is bandwidth-bound: every weight is read once per token and the
+arithmetic per byte is small, so time spent tracks bytes moved. Q6_K tensors
+can optionally be rewritten as Q4_K while loading, which moves about 31% fewer
+bytes for those tensors.
+
+This is off by default. It is a quality trade, not a free win, and one the
+model's author already weighed — a Q4_K_M file keeps the output projection at
+Q6_K precisely because it is the tensor most sensitive to 4-bit. Enable it with
+`DESIREEIA_REQUANT_Q6K=1` and measure on your own model.
+
+The quantizer fits each sub-block by minimizing squared reconstruction error
+(alternating nearest-level assignment with the closed-form least-squares
+regression of the values on their levels, over several starting ranges) rather
+than simply spanning min to max, and applies the same treatment to the shared
+6-bit scales. The self-test asserts it beats a plain min/max fit.
 
 ## Hardware backends
 

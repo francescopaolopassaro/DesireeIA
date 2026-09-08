@@ -257,6 +257,58 @@ static void matvec_shared(const MatVec& m, size_t r, size_t c, const float* x,
     }
 }
 
+// One entry of a group of matvecs that share the same input activation.
+struct SharedMatvec {
+    const MatVec* m;
+    size_t r;
+    size_t c;
+    float* y;
+};
+
+static bool fused_job_for(const SharedMatvec& it,
+                          const std::vector<int8_t>& xq, const std::vector<float>& xscale,
+                          const std::vector<int32_t>& xsum, FusedPqJob& job) {
+    if (it.m->format == MatVecFormat::Q4_K)      job.format = FusedPqFormat::Q4_K;
+    else if (it.m->format == MatVecFormat::Q6_K) job.format = FusedPqFormat::Q6_K;
+    else return false;
+    job.data   = it.m->raw.data();
+    job.rows   = it.r;
+    job.cols   = it.c;
+    job.xq     = xq.data();
+    job.xscale = xscale.data();
+    job.xsum   = xsum.data();
+    job.y      = it.y;
+    return true;
+}
+
+// Runs a group of shared-activation matvecs in a single parallel dispatch.
+//
+// Q/K/V read the output of attn_norm and write to three separate buffers;
+// gate/up do the same with ffn_norm. Nothing about them needs three (or two)
+// separate parallel regions, and each region costs a barrier where every
+// thread waits for the slowest one. On a busy machine that wait is the single
+// most variable part of decode.
+//
+// Falls back to running them one at a time whenever any matrix is in a format
+// the fused kernel doesn't cover — which is exactly the previous behaviour, so
+// an unusual quantization mix loses nothing.
+static void matvec_shared_group(const SharedMatvec* items, size_t n, const float* x,
+                                const std::vector<int8_t>& xq, const std::vector<float>& xscale,
+                                const std::vector<int32_t>& xsum) {
+    FusedPqJob jobs[4];
+    bool fusable = (n >= 2 && n <= 4);
+    for (size_t i = 0; fusable && i < n; ++i) {
+        fusable = fused_job_for(items[i], xq, xscale, xsum, jobs[i]);
+    }
+    if (fusable && fused_pq_supported(jobs, n) &&
+        matmul_fused_pq(jobs, n) == DESIREEIA_OK) {
+        return;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        matvec_shared(*items[i].m, items[i].r, items[i].c, x, xq, xscale, xsum, items[i].y);
+    }
+}
+
 static void add_bias(float* y, const float* b, size_t n) {
     if (b == nullptr) return;
     for (size_t i = 0; i < n; ++i) y[i] += b[i];
@@ -690,6 +742,66 @@ static bool quant_format_for(int quant_type, uint32_t cols, MatVecFormat& fmt) {
     return false;
 }
 
+// Opt-in: rewrite Q6_K tensors as Q4_K while loading them.
+//
+// Decode is bandwidth-bound — every weight is read once per token and the
+// arithmetic per byte is tiny — so time spent is close to proportional to
+// bytes moved. Q6_K costs 6.5625 bits per weight against Q4_K's 4.5, so a
+// tensor that moves to Q4_K takes about 31% less time to stream.
+//
+// This is OFF by default because it is a real quality trade, not a free win,
+// and one the model's author already considered: a Q4_K_M file deliberately
+// keeps the output projection and some FFN tensors at Q6_K precisely because
+// they are the ones that suffer most from 4-bit. Turning this on trades some
+// of that back for speed. It exists so the trade can be measured on a real
+// model rather than argued about.
+//
+// DESIREEIA_REQUANT_Q6K=1 to enable.
+static bool requantize_q6k_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("DESIREEIA_REQUANT_Q6K");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+// Q6_K bytes in, Q4_K bytes out, one row at a time. Returns false and leaves
+// `raw` untouched on any shape it cannot handle, so the caller keeps the
+// original tensor rather than a half-converted one.
+static bool requantize_q6k_to_q4k(std::vector<uint8_t>& raw, uint32_t rows, uint32_t cols) {
+    if (cols == 0 || cols % QK_K != 0 || rows == 0) return false;
+    const size_t n_super   = cols / QK_K;
+    const size_t src_row   = n_super * sizeof(block_q6_K);
+    const size_t dst_row   = n_super * sizeof(block_q4_K);
+    if (raw.size() != src_row * rows) return false;
+
+    std::vector<uint8_t> out(dst_row * rows);
+    std::atomic<bool> ok{true};
+
+    // Parallel across rows: the least-squares fit costs real work per weight,
+    // and the tensor this matters for is the output projection — 671M weights
+    // on the model this was built against. Serially that is seconds of extra
+    // load time; spread over the pool it is a fraction of one. Rows are
+    // independent and write to disjoint output, so there is nothing to guard.
+    parallel_rows(rows, [&](size_t r0, size_t r1) {
+        std::vector<float> row((size_t) cols);
+        for (size_t r = r0; r < r1; ++r) {
+            if (desireeia_dequantize_row(DESIREEIA_QTYPE_Q6_K, raw.data() + r * src_row,
+                                         row.data(), (int64_t) cols) != DESIREEIA_OK) {
+                ok.store(false, std::memory_order_relaxed);
+                return;
+            }
+            quantize_row_q4_K(row.data(),
+                              reinterpret_cast<block_q4_K*>(out.data() + r * dst_row),
+                              (int64_t) cols);
+        }
+    });
+
+    if (!ok.load(std::memory_order_relaxed)) return false;
+    raw.swap(out);
+    return true;
+}
+
 bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out) {
     out.raw.clear();
     out.f.clear();
@@ -702,6 +814,10 @@ bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_
         ne0 == cols && tensor_rows == rows) {
         MatVecFormat fmt;
         if (quant_format_for(quant_type, cols, fmt)) {
+            if (fmt == MatVecFormat::Q6_K && requantize_q6k_enabled() &&
+                requantize_q6k_to_q4k(raw, rows, cols)) {
+                fmt = MatVecFormat::Q4_K;
+            }
             out.raw = std::move(raw);
             out.format = fmt;
             return true;
@@ -1570,9 +1686,12 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 attn_in = xnp_attn.data();
             }
             quantize_shared_q8k(attn_in, n_embd, qk_xq, qk_dscale, qk_xsum);
-            matvec_shared(lw->wq, q_dim, n_embd, attn_in, qk_xq, qk_dscale, qk_xsum, q.data());
-            matvec_shared(lw->wk, kv_dim, n_embd, attn_in, qk_xq, qk_dscale, qk_xsum, k.data());
-            matvec_shared(lw->wv, kv_dim, n_embd, attn_in, qk_xq, qk_dscale, qk_xsum, v.data());
+            const SharedMatvec qkv[3] = {
+                {&lw->wq, q_dim,  n_embd, q.data()},
+                {&lw->wk, kv_dim, n_embd, k.data()},
+                {&lw->wv, kv_dim, n_embd, v.data()},
+            };
+            matvec_shared_group(qkv, 3, attn_in, qk_xq, qk_dscale, qk_xsum);
             if (quirks_.qkv_bias) {
                 add_bias(q.data(), lw->bq.empty() ? nullptr : lw->bq.data(), q_dim);
                 add_bias(k.data(), lw->bk.empty() ? nullptr : lw->bk.data(), kv_dim);
@@ -1752,8 +1871,11 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 fout = expert_out;
             } else if (quirks_.ffn_gated) {
                 quantize_shared_q8k(xnp, n_embd, qk_xq, qk_dscale, qk_xsum);
-                matvec_shared(lw->wff_up, cfg_.n_ff, n_embd, xnp, qk_xq, qk_dscale, qk_xsum, ffn.data());
-                matvec_shared(lw->wff_gate, cfg_.n_ff, n_embd, xnp, qk_xq, qk_dscale, qk_xsum, ffn_gate.data());
+                const SharedMatvec gu[2] = {
+                    {&lw->wff_up,   cfg_.n_ff, n_embd, ffn.data()},
+                    {&lw->wff_gate, cfg_.n_ff, n_embd, ffn_gate.data()},
+                };
+                matvec_shared_group(gu, 2, xnp, qk_xq, qk_dscale, qk_xsum);
                 { ScopedTimer t(profile_counters().ns_ser_act);
                 if (quirks_.gelu_tanh) {
                     geglu_inplace(ffn.data(), ffn_gate.data(), cfg_.n_ff);

@@ -266,6 +266,223 @@ void dequantize_row_q4_K(const block_q4_K * DESIREEIA_RESTRICT x, float * DESIRE
     }
 }
 
+// Packs the eight 6-bit scales and eight 6-bit mins into the 12 bytes that
+// get_scale_min_k4 reads back. Written as the exact inverse of that function,
+// byte by byte, rather than from a description of the layout:
+//
+//   bytes 0-3   low 6 bits: scale[i]      top 2 bits: scale[i+4] >> 4
+//   bytes 4-7   low 6 bits: min[i]        top 2 bits: min[i+4]   >> 4
+//   bytes 8-11  low nibble: scale[i+4]    high nibble: min[i+4]
+//
+// with i = 0..3. The high two bits of the second group of four live in the
+// spare bits of the first group, which is what makes 8 scales + 8 mins fit in
+// 12 bytes instead of 16.
+static void pack_scales_min_k4(const uint8_t* sc, const uint8_t* mn, uint8_t* out) {
+    for (int i = 0; i < 4; ++i) {
+        out[i]     = (uint8_t) ((sc[i] & 63) | ((sc[i + 4] >> 4) << 6));
+        out[i + 4] = (uint8_t) ((mn[i] & 63) | ((mn[i + 4] >> 4) << 6));
+        out[i + 8] = (uint8_t) ((sc[i + 4] & 0xF) | ((mn[i + 4] & 0xF) << 4));
+    }
+}
+
+// Fits the affine map `x ~= a*q + c`, q an integer in [0,15], that minimizes
+// the SUM OF SQUARED ERRORS over one sub-block.
+//
+// The obvious fit — a = (max-min)/15, c = min — is not the best one, it is
+// just the one that clips nothing. It hands the whole range to the extremes,
+// so a single outlier coarsens the step for the other 31 values that actually
+// carry the signal. The least-squares fit will happily clip that outlier when
+// the trade pays.
+//
+// Two ingredients, alternated:
+//   1. Given a and c, each value takes its nearest level: q = round((x-c)/a).
+//   2. Given those q, the best a and c are the ordinary least-squares
+//      regression of x on q — a closed form, not a search.
+// Each step can only lower the error, so the pair converges. It converges to a
+// LOCAL optimum though, and which one depends on where it starts, so several
+// starting ranges are tried and the best result kept. That is what makes this
+// a real minimization rather than one pass of polish over min/max.
+//
+// Constraints from the format: a >= 0, and c <= 0 because the stored form is
+// `a*q - b` with b unsigned.
+static void fit_affine_4bit(const float* DESIREEIA_RESTRICT x, int n, float* out_a, float* out_c) {
+    float lo = x[0], hi = x[0];
+    for (int i = 1; i < n; ++i) {
+        if (x[i] < lo) lo = x[i];
+        if (x[i] > hi) hi = x[i];
+    }
+    if (lo > 0.0f) lo = 0.0f;
+    if (hi < 0.0f) hi = 0.0f;
+
+    if (hi <= lo) { *out_a = 0.0f; *out_c = 0.0f; return; }
+
+    auto sse_of = [&](float a, float c) -> double {
+        if (a <= 0.0f) return DBL_MAX;
+        const float inv = 1.0f / a;
+        double s = 0.0;
+        for (int i = 0; i < n; ++i) {
+            int q = (int) lroundf((x[i] - c) * inv);
+            if (q < 0) q = 0; if (q > 15) q = 15;
+            const double e = (double) (a * (float) q + c) - x[i];
+            s += e * e;
+        }
+        return s;
+    };
+
+    float best_a = (hi - lo) / 15.0f;
+    float best_c = lo;
+    double best_sse = sse_of(best_a, best_c);
+
+    // Starting ranges from the full span down to 60% of it. Shrinking trades
+    // clipping the tails for a finer step through the bulk; which one wins
+    // depends on the distribution, so both ends get tried.
+    for (int cand = 0; cand < 9; ++cand) {
+        const float shrink = 1.0f - 0.05f * (float) cand;
+        float a = (hi - lo) * shrink / 15.0f;
+        float c = lo * shrink;
+        if (a <= 0.0f) continue;
+
+        for (int pass = 0; pass < 2; ++pass) {
+            // Assign, then regress.
+            const float inv = 1.0f / a;
+            double sq = 0.0, sqq = 0.0, sx = 0.0, sqx = 0.0;
+            for (int i = 0; i < n; ++i) {
+                int qi = (int) lroundf((x[i] - c) * inv);
+                if (qi < 0) qi = 0; if (qi > 15) qi = 15;
+                const double q = (double) qi;
+                sq  += q;
+                sqq += q * q;
+                sx  += x[i];
+                sqx += q * x[i];
+            }
+            const double det = (double) n * sqq - sq * sq;
+            if (det <= 0.0) break;   // Every value landed on the same level.
+
+            double na = ((double) n * sqx - sq * sx) / det;
+            double nc = (sx - na * sq) / (double) n;
+            if (na < 0.0) na = 0.0;
+            if (nc > 0.0) nc = 0.0;
+            if (na <= 0.0) break;
+
+            a = (float) na;
+            c = (float) nc;
+        }
+
+        const double s = sse_of(a, c);
+        if (s < best_sse) { best_sse = s; best_a = a; best_c = c; }
+    }
+
+    *out_a = best_a;
+    *out_c = best_c;
+}
+
+// Picks the shared fp16 factor for eight 6-bit values.
+//
+// `max/63` is the choice that clips nothing, and for the same reason as above
+// it is not the best one: one large entry drags the step size up for the other
+// seven. Clipping it costs less than coarsening them whenever the large entry
+// is an outlier, so a few smaller factors are tried and the one with the least
+// squared error over the eight wins. Eight values and six candidates, so this
+// is a handful of operations per super-block.
+static float fit_shared_scale(const float* v, int n) {
+    float vmax = 0.0f;
+    for (int i = 0; i < n; ++i) if (v[i] > vmax) vmax = v[i];
+    if (vmax <= 0.0f) return 0.0f;
+
+    float best_d = vmax / 63.0f;
+    double best_sse = DBL_MAX;
+    for (int cand = 0; cand < 6; ++cand) {
+        const float d = (vmax / 63.0f) * (1.0f - 0.03f * (float) cand);
+        if (d <= 0.0f) continue;
+        const float inv = 1.0f / d;
+        double s = 0.0;
+        for (int i = 0; i < n; ++i) {
+            int q = (int) lroundf(v[i] * inv);
+            if (q < 0) q = 0; if (q > 63) q = 63;
+            const double e = (double) (d * (float) q) - v[i];
+            s += e * e;
+        }
+        if (s < best_sse) { best_sse = s; best_d = d; }
+    }
+    return best_d;
+}
+
+// Quantizes a row of floats into Q4_K.
+//
+// Q4_K stores each weight as `d*scale*q - dmin*min`, with q a 4-bit value and
+// one 6-bit scale plus one 6-bit min per 32 weights, all sharing two fp16
+// factors per 256-weight super-block. Fitting it is therefore two nested
+// quantizations: first each sub-block's affine range, then those ranges
+// themselves down to 6 bits. Both levels minimize squared error rather than
+// just covering the range — see fit_affine_4bit and fit_shared_scale.
+//
+// The weights are quantized against the ALREADY-ROUNDED scale and min, not
+// against the exact ones. Rounding the range first and then fitting the values
+// to what was actually stored keeps the two errors from stacking; doing it the
+// other way round measurably widens the reconstruction error for free.
+void quantize_row_q4_K(const float * DESIREEIA_RESTRICT x, block_q4_K * DESIREEIA_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int nb = (int) (k / QK_K);
+
+    for (int i = 0; i < nb; ++i) {
+        const float* xb = x + (size_t) i * QK_K;
+
+        // Per sub-block affine fit: value ~= a*q + c, with c = -b.
+        float a[QK_K / 32];
+        float b[QK_K / 32];   // Stored as a positive magnitude: c = -b.
+        for (int j = 0; j < QK_K / 32; ++j) {
+            float aj = 0.0f, cj = 0.0f;
+            fit_affine_4bit(xb + j * 32, 32, &aj, &cj);
+            a[j] = aj;
+            b[j] = -cj;       // c <= 0 by construction, so b >= 0.
+        }
+
+        const float d    = fit_shared_scale(a, QK_K / 32);
+        const float dmin = fit_shared_scale(b, QK_K / 32);
+        const float inv_d    = d    > 0.0f ? 1.0f / d    : 0.0f;
+        const float inv_dmin = dmin > 0.0f ? 1.0f / dmin : 0.0f;
+
+        uint8_t sc[QK_K / 32];
+        uint8_t mn[QK_K / 32];
+        for (int j = 0; j < QK_K / 32; ++j) {
+            int s = (int) lroundf(a[j] * inv_d);
+            int m = (int) lroundf(b[j] * inv_dmin);
+            if (s < 0) s = 0; if (s > 63) s = 63;
+            if (m < 0) m = 0; if (m > 63) m = 63;
+            sc[j] = (uint8_t) s;
+            mn[j] = (uint8_t) m;
+        }
+
+        y[i].d    = desireeia_fp32_to_fp16(d);
+        y[i].dmin = desireeia_fp32_to_fp16(dmin);
+        pack_scales_min_k4(sc, mn, y[i].scales);
+
+        // Re-read d/dmin through fp16 so the values are fitted to exactly what
+        // the dequantizer will see, not to the float32 originals.
+        const float dq    = DESIREEIA_FP16_TO_FP32(y[i].d);
+        const float dminq = DESIREEIA_FP16_TO_FP32(y[i].dmin);
+
+        uint8_t* qs = y[i].qs;
+        for (int j = 0; j < QK_K / 32; j += 2) {
+            const float a1 = dq * sc[j];
+            const float m1 = dminq * mn[j];
+            const float a2 = dq * sc[j + 1];
+            const float m2 = dminq * mn[j + 1];
+            const float inv_a1 = a1 > 0.0f ? 1.0f / a1 : 0.0f;
+            const float inv_a2 = a2 > 0.0f ? 1.0f / a2 : 0.0f;
+
+            for (int l = 0; l < 32; ++l) {
+                int q1 = (int) lroundf((xb[j * 32 + l] + m1) * inv_a1);
+                int q2 = (int) lroundf((xb[(j + 1) * 32 + l] + m2) * inv_a2);
+                if (q1 < 0) q1 = 0; if (q1 > 15) q1 = 15;
+                if (q2 < 0) q2 = 0; if (q2 > 15) q2 = 15;
+                qs[l] = (uint8_t) (q1 | (q2 << 4));
+            }
+            qs += 32;
+        }
+    }
+}
+
 void dequantize_row_q5_K(const block_q5_K * DESIREEIA_RESTRICT x, float * DESIREEIA_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;

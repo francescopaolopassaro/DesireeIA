@@ -40,6 +40,19 @@ internal static class NativeMethods
         public int ExpertPrefetchDepth;
         public int BatchUnionEnabled;
         public int DualSsdEnabled;
+        // Mirrors desireeia_plan.ssd_tier_mode / .ssd_tier_cache_mb. Field
+        // order and types must stay identical to the C struct in abi.h:
+        // this is a sequential-layout blit, not a marshalled conversion, so
+        // a mismatch here corrupts memory rather than failing loudly.
+        public int SsdTierMode;
+        public ulong SsdTierCacheMb;
+    }
+
+    internal enum SsdTierModeNative : int
+    {
+        Off = 0,
+        Auto = 1,
+        Always = 2
     }
 
     internal enum Backend : int

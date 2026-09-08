@@ -62,6 +62,26 @@ typedef struct desireeia_hw_info {
     int32_t axelera_device_count;
 } desireeia_hw_info;
 
+/* How the SSD storage tier participates in serving model weights.
+ *
+ * OFF keeps every weight in the RAM/CPU path, which is the fastest option
+ * whenever the model actually fits the RAM budget — the tier is not even
+ * constructed, so nothing sits on the tensor read path.
+ *
+ * AUTO decides per model: if the weights fit the planned RAM budget the
+ * behavior is identical to OFF; if they don't, the overflow is served from
+ * the model file on SSD instead of failing or thrashing.
+ *
+ * ALWAYS forces reads through the SSD tier even when the model would fit
+ * in RAM. This is slower by design and exists for two reasons: measuring
+ * the tier honestly, and running a model far larger than RAM on a machine
+ * where predictable streaming beats swapping. */
+typedef enum desireeia_ssd_tier_mode {
+    DESIREEIA_SSD_TIER_OFF    = 0,
+    DESIREEIA_SSD_TIER_AUTO   = 1,
+    DESIREEIA_SSD_TIER_ALWAYS = 2
+} desireeia_ssd_tier_mode;
+
 typedef struct desireeia_plan {
     desireeia_backend backend;
     desireeia_format format;
@@ -76,6 +96,11 @@ typedef struct desireeia_plan {
     int32_t expert_prefetch_depth;
     int32_t batch_union_enabled;
     int32_t dual_ssd_enabled;
+    /* desireeia_ssd_tier_mode. */
+    int32_t ssd_tier_mode;
+    /* RAM the SSD tier may use for its own hot-block cache, in MiB.
+     * 0 means "derive it from ram_budget_mb". Ignored when the mode is OFF. */
+    uint64_t ssd_tier_cache_mb;
 } desireeia_plan;
 
 typedef enum desireeia_error {

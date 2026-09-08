@@ -2,6 +2,7 @@
 #define DESIREEIA_ENGINE_H
 
 #include "desireeia/abi.h"
+#include "ssd_tier/hybrid_tier.h"
 #include "thread_pool.h"
 #include <algorithm>
 #include <functional>
@@ -52,6 +53,11 @@ using LogFn = std::function<void(int32_t, const char*)>;
 
 desireeia_error probe_hardware(desireeia_hw_info& out);
 desireeia_plan build_plan(const desireeia_hw_info& hw, const std::string& model_path);
+
+// Applies DESIREEIA_SSD_TIER=off|auto|always to `mode`, returning true when
+// the variable was set to something recognised. Lets a benchmark force the
+// tier either way without touching caller code.
+bool env_ssd_tier_override(int32_t& mode);
 
 struct ModelMeta {
     desireeia_format format = DESIREEIA_FORMAT_UNKNOWN;
@@ -148,6 +154,7 @@ public:
     // Il reader non e' posseduto: deve restare valido per tutta la vita
     // di ExpertStore (in ctx.cpp entrambi vivono dentro lo stesso EngineState).
     void set_reader(ModelReader* reader) { reader_ = reader; }
+    void set_hybrid_tier(HybridTier* tier) { hybrid_tier_ = tier; }
     bool fetch(uint32_t layer, uint32_t idx, ExpertPart part, std::vector<float>& out);
     void fetch_union(const std::vector<ExpertRequest>& reqs, std::vector<float>& out_buffer,
                      std::vector<const float*>& out_ptrs);
@@ -172,6 +179,7 @@ private:
     }
     bool load_data(uint64_t key, std::vector<float>& out);
     ModelReader* reader_ = nullptr;
+    HybridTier* hybrid_tier_ = nullptr;
     int32_t cache_count_;
     int32_t prefetch_depth_ = 1;
     bool pin_enabled_ = true;
@@ -185,11 +193,67 @@ private:
 DESIREEIA_INTERNAL ModelReader* make_gguf_reader();
 DESIREEIA_INTERNAL ModelReader* make_st_reader();
 
+// HybridModelReader wraps an existing ModelReader with HybridTier SSD caching.
+// All read_tensor/read_tensor_raw calls are intercepted: if the tensor is
+// already in the SSD-tier RAM cache, it is served from there; otherwise it
+// is read through the underlying reader AND cached for future reads.
+// Takes ownership of the inner reader (deletes it on destruction).
+class HybridModelReader : public ModelReader {
+public:
+    HybridModelReader(ModelReader* inner, HybridTier* tier)
+        : inner_(inner), tier_(tier) {}
+    ~HybridModelReader() override { delete inner_; }
+
+    bool open(const std::string& path, ModelMeta& meta) override {
+        return inner_->open(path, meta);
+    }
+
+    bool read_tensor(const std::string& name, std::vector<float>& out) override {
+        if (tier_ && tier_->gguf_available()) {
+            if (tier_->read_tensor(name, out)) return true;
+        }
+        return inner_->read_tensor(name, out);
+    }
+
+    bool read_expert(uint32_t layer, uint32_t idx, ExpertPart part,
+                     std::vector<float>& out) override {
+        if (tier_ && tier_->gguf_available()) {
+            return tier_->read_expert(layer, idx, static_cast<uint32_t>(part), out);
+        }
+        return inner_->read_expert(layer, idx, part, out);
+    }
+
+    bool meta_u32(const std::string& key, uint32_t& out) override {
+        return inner_->meta_u32(key, out);
+    }
+    bool meta_f32(const std::string& key, float& out) override {
+        return inner_->meta_f32(key, out);
+    }
+    bool meta_str(const std::string& key, std::string& out) override {
+        return inner_->meta_str(key, out);
+    }
+    bool read_vocab(VocabData& out) override {
+        return inner_->read_vocab(out);
+    }
+    bool read_tensor_raw(const std::string& name, std::vector<uint8_t>& raw,
+                          int& quant_type, uint64_t& ne0, uint64_t& rows) override {
+        if (tier_ && tier_->gguf_available()) {
+            if (tier_->read_tensor_raw(name, raw, quant_type, ne0, rows)) return true;
+        }
+        return inner_->read_tensor_raw(name, raw, quant_type, ne0, rows);
+    }
+
+private:
+    ModelReader* inner_;
+    HybridTier* tier_;
+};
+
 struct EngineState {
     ModelMeta meta;
     std::vector<int32_t> tokens;
     KvCache* kv = nullptr;
     ExpertStore* experts = nullptr;
+    HybridTier* hybrid = nullptr;
     ModelReader* reader = nullptr;
     desireeia_plan plan;
     LogFn log;
@@ -330,6 +394,32 @@ DESIREEIA_INTERNAL void quantize_act_q8k_rep(const float* x, size_t cols, std::v
 // interno. xsum (solo per Q4_K, che ha il termine "min") e' la somma
 // delle attivazioni quantizzate per sotto-blocco da 32, calcolabile con
 // lo stesso schema gia' usato in matmul_q4_k.
+// One matrix in a fused group (see matmul_fused_pq). All jobs in a group share
+// the same pre-quantized activation and write to disjoint outputs.
+enum class FusedPqFormat { Q4_K, Q6_K };
+
+struct FusedPqJob {
+    FusedPqFormat  format = FusedPqFormat::Q4_K;
+    const uint8_t* data   = nullptr;
+    size_t         rows   = 0;
+    size_t         cols   = 0;
+    const int8_t*  xq     = nullptr;
+    const float*   xscale = nullptr;
+    const int32_t* xsum   = nullptr;  // Q4_K only; ignored for Q6_K.
+    float*         y      = nullptr;
+};
+
+// True when every job is a shape and format the fused path can handle, and
+// there are at least two of them (one job has nothing to fuse with).
+DESIREEIA_INTERNAL bool fused_pq_supported(const FusedPqJob* jobs, size_t n_jobs);
+
+// Computes all the jobs in a SINGLE parallel dispatch instead of one each.
+// Independent matrices that read the same activation — Q/K/V, or FFN gate/up —
+// have no reason to be separate parallel regions, and every region ends with a
+// barrier where all threads wait for the slowest. Fewer regions means fewer
+// chances for a descheduled worker to stall the rest.
+DESIREEIA_INTERNAL int matmul_fused_pq(const FusedPqJob* jobs, size_t n_jobs);
+
 DESIREEIA_INTERNAL int matmul_q4_k_pq(const uint8_t* q4k_data, size_t rows, size_t cols,
                                     const int8_t* xq, const float* dscale, const int32_t* xsum, float* y);
 DESIREEIA_INTERNAL int matmul_q6_k_pq(const uint8_t* q6k_data, size_t rows, size_t cols,

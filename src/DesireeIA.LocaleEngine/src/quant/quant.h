@@ -479,6 +479,11 @@ DESIREEIA_INTERNAL int    desireeia_blck_size(int type);
 DESIREEIA_INTERNAL size_t desireeia_row_size(int type, int64_t ne0);
 DESIREEIA_INTERNAL int desireeia_dequantize_row(int type, const void* DESIREEIA_RESTRICT x, float* DESIREEIA_RESTRICT y, int64_t n);
 
+// Quantizes floats into Q4_K. n must be a multiple of QK_K (256).
+// The inverse of dequantize_row_q4_K; see the notes on the definition.
+DESIREEIA_INTERNAL void quantize_row_q4_K(const float* DESIREEIA_RESTRICT x,
+                                          block_q4_K* DESIREEIA_RESTRICT y, int64_t n);
+
 #endif
 
 

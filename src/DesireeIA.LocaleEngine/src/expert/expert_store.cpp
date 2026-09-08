@@ -1,4 +1,5 @@
 #include "../core/engine.h"
+#include "../ssd_tier/hybrid_tier.h"
 #include <algorithm>
 #include <fstream>
 #include <sstream>
@@ -14,16 +15,23 @@ ExpertStore::ExpertStore(int32_t cache_count, LogFn log)
 }
 
 bool ExpertStore::load_data(uint64_t key, std::vector<float>& out) {
-    if (!reader_) {
-        // Nessun reader collegato (es. test unitari su ExpertStore isolato):
-        // comportamento stub preservato per non rompere quel path.
-        out.assign(1, 0.0f);
-        return true;
-    }
     const uint32_t layer = static_cast<uint32_t>(key >> 48);
     const uint32_t idx = static_cast<uint32_t>((key >> 8) & 0xFFFFFFFFu);
     const ExpertPart part = static_cast<ExpertPart>(key & 0xFFu);
-    return reader_->read_expert(layer, idx, part, out);
+
+    // If a ModelReader is available, use it (existing path).
+    if (reader_) {
+        return reader_->read_expert(layer, idx, part, out);
+    }
+
+    // Fallback: use HybridTier for SSD-backed reads.
+    if (hybrid_tier_) {
+        return hybrid_tier_->read_expert(layer, idx, static_cast<uint32_t>(part), out);
+    }
+
+    // Stub path (e.g. isolated ExpertStore unit tests).
+    out.assign(1, 0.0f);
+    return true;
 }
 
 bool ExpertStore::fetch(uint32_t layer, uint32_t idx, ExpertPart part, std::vector<float>& out) {

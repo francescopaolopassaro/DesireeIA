@@ -39,6 +39,12 @@ struct ProfileCounters {
     std::atomic<int64_t> calls_legacy{0};
     std::atomic<int64_t> calls_kquant2{0};
     std::atomic<int64_t> calls_f32{0};
+    // Matrici calcolate in dispatch fuso (Q/K/V insieme, gate/up insieme).
+    // Contate a parte e non dentro q4k/q6k: un gruppo fuso puo' mescolare i
+    // due formati, e sommarlo all'uno o all'altro renderebbe il profilo
+    // bugiardo proprio sulla voce che si sta cercando di ottimizzare.
+    std::atomic<int64_t> ns_fused_compute{0};
+    std::atomic<int64_t> calls_fused{0};
 
     // --- Transizioni seriale/parallelo (thread pool) ---
     // Il decode alterna in continuazione regioni parallele (le matmul) e
@@ -91,6 +97,7 @@ inline std::string profile_dump_string() {
     std::snprintf(buf, sizeof(buf),
         "quantize_act=%.2fms  q4k=%.2fms(%lldc)  q5k=%.2fms(%lldc)  q6k=%.2fms(%lldc)  "
         "q4_0=%.2fms(%lldc)  q8_0=%.2fms(%lldc)  legacy=%.2fms(%lldc)  kquant2=%.2fms(%lldc)  f32_fallback=%.2fms(%lldc)"
+        "\n  fuso=%.2fms(%lldc)"
         "\n  dispatch=%lld  in_dispatch=%.2fms  barriera=%.2fms  seriale_fra_dispatch=%.2fms"
         "\n  seriale: norm=%.2fms  rope=%.2fms  attn=%.2fms  act=%.2fms",
         ms(pc.ns_quantize_act.load(std::memory_order_relaxed)),
@@ -102,6 +109,7 @@ inline std::string profile_dump_string() {
         ms(pc.ns_legacy_compute.load(std::memory_order_relaxed)), (long long) pc.calls_legacy.load(std::memory_order_relaxed),
         ms(pc.ns_kquant2_compute.load(std::memory_order_relaxed)), (long long) pc.calls_kquant2.load(std::memory_order_relaxed),
         ms(pc.ns_f32_compute.load(std::memory_order_relaxed)), (long long) pc.calls_f32.load(std::memory_order_relaxed),
+        ms(pc.ns_fused_compute.load(std::memory_order_relaxed)), (long long) pc.calls_fused.load(std::memory_order_relaxed),
         (long long) pc.n_dispatch.load(std::memory_order_relaxed),
         ms(pc.ns_dispatch_total.load(std::memory_order_relaxed)),
         ms(pc.ns_dispatch_wait.load(std::memory_order_relaxed)),
@@ -120,6 +128,7 @@ inline void profile_reset() {
     pc.ns_f32_compute = 0;
     pc.calls_q4k = 0; pc.calls_q6k = 0; pc.calls_q5k = 0; pc.calls_q40 = 0; pc.calls_q80 = 0;
     pc.calls_legacy = 0; pc.calls_kquant2 = 0; pc.calls_f32 = 0;
+    pc.ns_fused_compute = 0; pc.calls_fused = 0;
     pc.n_dispatch = 0; pc.ns_serial_gap = 0; pc.ns_dispatch_wait = 0; pc.ns_dispatch_total = 0;
     pc.ns_ser_norm = 0; pc.ns_ser_rope = 0; pc.ns_ser_attn = 0; pc.ns_ser_act = 0;
 }

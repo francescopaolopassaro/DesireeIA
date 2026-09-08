@@ -30,6 +30,10 @@ add_library(DesireeIALocaleEngine SHARED
     src/safetensors/st_reader.cpp
     src/kv/kv_cache.cpp
     src/expert/expert_store.cpp
+    src/ssd_tier/ssd_tier.cpp
+    src/ssd_tier/mirror_manager.cpp
+    src/ssd_tier/tiered_expert_store.cpp
+    src/ssd_tier/hybrid_tier.cpp
 )
 
 target_include_directories(DesireeIALocaleEngine PUBLIC include)
@@ -41,6 +45,7 @@ if(MSVC)
 else()
     target_compile_options(DesireeIALocaleEngine PRIVATE -O3 -march=native)
     set_target_properties(DesireeIALocaleEngine PROPERTIES OUTPUT_NAME "DesireeIALocaleEngine" PREFIX "")
+    target_link_options(DesireeIALocaleEngine PRIVATE -Wl,--export-all-symbols)
 
     if(MINGW)
         get_filename_component(MINGW_BIN_DIR "${CMAKE_CXX_COMPILER}" DIRECTORY)

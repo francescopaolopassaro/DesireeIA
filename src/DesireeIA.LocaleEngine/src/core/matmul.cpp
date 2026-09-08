@@ -1521,8 +1521,13 @@ namespace {
 // bench/kernel_bench.cpp. When a microbenchmark and the real engine
 // disagree, trust the engine.
 
+// row_lo/row_hi select a slice of rows to compute on the CALLING thread,
+// without dispatching to the pool. row_hi == 0 keeps the original behaviour
+// (compute every row, in parallel). The slice mode is what lets several
+// independent matrices share a single dispatch — see matmul_fused_pq.
 int matmul_q4_k_core(const uint8_t* q4k_data, size_t rows, size_t cols,
-                      const int8_t* xq, const float* xscale, const int32_t* xsum, float* y) {
+                      const int8_t* xq, const float* xscale, const int32_t* xsum, float* y,
+                      size_t row_lo = 0, size_t row_hi = 0) {
     const size_t n_super = cols / QK_K;
     const size_t row_bytes = n_super * sizeof(block_q4_K);
 
@@ -1685,6 +1690,11 @@ int matmul_q4_k_core(const uint8_t* q4k_data, size_t rows, size_t cols,
             y[r] = acc;
         }
     };
+    if (row_hi > row_lo) {
+        // Slice mode: the caller already owns a parallel region.
+        compute_fn(row_lo, row_hi);
+        return DESIREEIA_OK;
+    }
     {
         ScopedTimer t(profile_counters().ns_q4k_compute);
         parallel_rows(rows, compute_fn);
@@ -2054,8 +2064,11 @@ static inline int32_t q6k_group128_neon(const uint8_t* ql, const uint8_t* qh,
 }
 #endif
 
+// row_lo/row_hi as in matmul_q4_k_core: a non-empty range computes that
+// slice inline instead of dispatching.
 int matmul_q6_k_core(const uint8_t* q6k_data, size_t rows, size_t cols,
-                      const int8_t* xq, const float* xscale, float* y) {
+                      const int8_t* xq, const float* xscale, float* y,
+                      size_t row_lo = 0, size_t row_hi = 0) {
     const size_t n_super = cols / QK_K;
     const size_t row_bytes = n_super * sizeof(block_q6_K);
 
@@ -2215,6 +2228,11 @@ int matmul_q6_k_core(const uint8_t* q6k_data, size_t rows, size_t cols,
             y[r] = acc;
         }
     };
+    if (row_hi > row_lo) {
+        // Slice mode: the caller already owns a parallel region.
+        compute_fn(row_lo, row_hi);
+        return DESIREEIA_OK;
+    }
     {
         ScopedTimer t(profile_counters().ns_q6k_compute);
         parallel_rows(rows, compute_fn);
@@ -2242,6 +2260,61 @@ int matmul_q6_k_pq(const uint8_t* q6k_data, size_t rows, size_t cols,
                     const int8_t* xq, const float* xscale, float* y) {
     if (cols == 0 || cols % QK_K != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
     return matmul_q6_k_core(q6k_data, rows, cols, xq, xscale, y);
+}
+
+bool fused_pq_supported(const FusedPqJob* jobs, size_t n_jobs) {
+    if (jobs == nullptr || n_jobs < 2) return false;
+    for (size_t i = 0; i < n_jobs; ++i) {
+        const FusedPqJob& j = jobs[i];
+        if (j.cols == 0 || j.cols % QK_K != 0 || j.rows == 0) return false;
+        if (j.format != FusedPqFormat::Q4_K && j.format != FusedPqFormat::Q6_K) return false;
+    }
+    return true;
+}
+
+// Computes several independent matrices in ONE dispatch.
+//
+// Q, K and V all read the same activation and write to separate outputs, so
+// nothing forces them to be three separate parallel regions — but that is what
+// they were, and each region ends with every thread waiting for the slowest.
+// Measured on this machine, that wait ranged from 244 ms to 3075 ms over the
+// same 64-token run depending only on how the OS happened to schedule: with 20
+// threads and 273 dispatches per token, one descheduled worker stalls the other
+// nineteen, and the exposure is per dispatch. Merging the three into a single
+// row space cuts the number of times we take that risk, and gives the dynamic
+// chunker a bigger pool of rows to balance across.
+//
+// The rows of all jobs form one index space: global row g belongs to the job
+// whose cumulative row count contains it.
+int matmul_fused_pq(const FusedPqJob* jobs, size_t n_jobs) {
+    if (!fused_pq_supported(jobs, n_jobs)) return DESIREEIA_ERR_NOT_SUPPORTED;
+
+    size_t total_rows = 0;
+    for (size_t i = 0; i < n_jobs; ++i) total_rows += jobs[i].rows;
+
+    ScopedTimer t(profile_counters().ns_fused_compute);
+    parallel_rows(total_rows, [&](size_t g0, size_t g1) {
+        // Walk the jobs, computing the part of [g0,g1) that falls in each.
+        size_t base = 0;
+        for (size_t i = 0; i < n_jobs; ++i) {
+            const FusedPqJob& j = jobs[i];
+            const size_t lo = base;
+            const size_t hi = base + j.rows;
+            base = hi;
+            if (g1 <= lo || g0 >= hi) continue;
+
+            const size_t r0 = (g0 > lo ? g0 : lo) - lo;
+            const size_t r1 = (g1 < hi ? g1 : hi) - lo;
+            if (j.format == FusedPqFormat::Q4_K) {
+                matmul_q4_k_core(j.data, j.rows, j.cols, j.xq, j.xscale, j.xsum, j.y, r0, r1);
+            } else {
+                matmul_q6_k_core(j.data, j.rows, j.cols, j.xq, j.xscale, j.y, r0, r1);
+            }
+        }
+    });
+
+    profile_counters().calls_fused.fetch_add(1, std::memory_order_relaxed);
+    return DESIREEIA_OK;
 }
 
 }
