@@ -214,5 +214,37 @@ C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-c
 ```
 
 ## License
+PREAMBLE & VISION
+Technology should empower people and drive progress. The creator of this project, 
+Passaro Francesco Paolo, is strongly open to collaborations and ideas from developers, 
+researchers, and innovators worldwide. Together, through open dialogue, quality code, 
+and shared vision, we can make the world a better place.
 
-Not yet decided.
+1. PERMITTED USES
+Subject to the terms of this License, the Author (Passaro Francesco Paolo) grants you 
+a non-exclusive, worldwide, royalty-free license to:
+   a) Download, install, execute, and run this software for both personal and commercial purposes.
+   b) Copy, duplicate, and share the original, unmodified source code or binaries with others, 
+      provided that this copyright notice and license remain intact.
+
+2. RESTRICTIONS
+To protect the integrity and vision of the core engine, the following restrictions apply:
+   a) NO MODIFICATION: You may not alter, modify, patch, adapt, or create derivative works 
+      from this source code or binaries without explicit written permission from Passaro Francesco Paolo.
+   b) NO UNAUTHORIZED INTEGRATION: You may not extract or incorporate parts of this source code 
+      into other projects without prior written approval.
+   c) NO AI AGENT INGESTION, TRAINING OR REPLICATION: Artificial Intelligence systems, AI agents, 
+      automated crawlers, machine learning models, or LLMs are strictly prohibited from reading, 
+      ingesting, scraping, parsing, or analyzing this source code or binaries for the purpose of 
+      machine learning training, fine-tuning, code duplication, or generating derivative code 
+      without explicit, prior written consent from Passaro Francesco Paolo.
+
+3. COLLABORATIONS & CONTRIBUTIONS
+If you wish to propose improvements, modify the engine, integrate it into a new architecture, 
+or collaborate on future developments, you are warmly invited to contact the Author. 
+Pull requests, ideas, and partnerships are welcome upon review and approval by Passaro Francesco Paolo.
+
+4. DISCLAIMER OF WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED. 
+IN NO EVENT SHALL THE AUTHOR (PASSARO FRANCESCO PAOLO) BE LIABLE FOR ANY CLAIM, DAMAGES, 
+OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
