@@ -26,6 +26,14 @@ public sealed class GgufReader
 
     private readonly Dictionary<string, object> _kv = new();
 
+    /// <summary>
+    /// Raw metadata key/value pairs as parsed, for diagnostics (e.g. checking
+    /// which architecture-specific keys a given GGUF file actually carries).
+    /// Array values appear as an <see cref="ArrayMarker"/> placeholder, not
+    /// their elements.
+    /// </summary>
+    public IReadOnlyDictionary<string, object> RawKeyValues => _kv;
+
     public ModelMetadata Open(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,

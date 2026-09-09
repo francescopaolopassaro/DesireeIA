@@ -1656,6 +1656,60 @@ int main(int argc, char** argv) {
     // runs. Requantizing a tensor is a lossy trade made to move fewer bytes,
     // so the loss has to be a measured number sitting next to the speed
     // number — otherwise the trade is being made blind.
+    // MoE expert addressing. A stacked *_exps tensor holds every expert of a
+    // layer as consecutive row blocks, and reading expert i means landing on
+    // exactly the right block. Get that offset wrong and nothing fails: the
+    // bytes still decode into finite, plausible-looking weights, just the
+    // wrong ones — the model then degenerates in a way that looks like a
+    // maths bug anywhere else in the stack. This pins the addressing down by
+    // reading the same expert two independent ways.
+    std::printf("\n--- MoE expert addressing ---\n");
+    {
+        const std::string moe_path =
+            "C:\\Users\\fpassaro\\AppData\\Local\\Kodinn\\deepseek-v2-lite-q4_k_m.gguf";
+        std::ifstream moe_f(moe_path, std::ios::binary);
+        if (!moe_f) {
+            std::printf("  (MoE model not present, skipping)\n");
+        } else {
+            moe_f.close();
+            desireeia::ModelReader* rd = desireeia::make_gguf_reader();
+            desireeia::ModelMeta mm;
+            if (rd && rd->open(moe_path, mm)) {
+                // The whole stacked tensor, dequantized in one go.
+                std::vector<float> whole;
+                const bool whole_ok = rd->read_tensor("blk.1.ffn_gate_exps.weight", whole);
+
+                bool all_match = whole_ok;
+                size_t checked = 0;
+                // Every expert must equal its own slice of the stacked tensor.
+                for (uint32_t e = 0; e < 64 && all_match; e += 21) {
+                    std::vector<float> one;
+                    if (!rd->read_expert(1, e, desireeia::ExpertPart::Gate, one)) { all_match = false; break; }
+                    const size_t stride = one.size();
+                    if (stride == 0 || (e + 1) * stride > whole.size()) { all_match = false; break; }
+                    if (std::memcmp(one.data(), whole.data() + (size_t) e * stride,
+                                    stride * sizeof(float)) != 0) {
+                        std::printf("  expert %u does NOT match its slice of the stacked tensor\n", e);
+                        all_match = false;
+                        break;
+                    }
+                    checked++;
+                }
+                if (all_match && checked > 0) {
+                    std::printf("  read_expert matches the stacked tensor slice (%zu experts checked)\n", checked);
+                    passed++;
+                } else {
+                    std::printf("  MoE expert addressing FAIL (whole_ok=%d checked=%zu)\n",
+                                (int) whole_ok, checked);
+                    failed++;
+                }
+            } else {
+                std::printf("  (MoE model failed to open, skipping)\n");
+            }
+            delete rd;
+        }
+    }
+
     std::printf("\n--- quantize_row_q4_K ---\n");
     {
         const int64_t n = 256 * 32;
@@ -1867,6 +1921,45 @@ int main(int argc, char** argv) {
                 } else {
                     std::printf("  hybrid_tier second read did NOT hit the cache\n");
                     failed++;
+                }
+
+                // The RAW path is the one the matmul kernels take, so it is
+                // the one whose caching actually decides throughput. It went
+                // uncached for a long time while the float path next to it was
+                // cached, and nothing noticed because the float path is never
+                // taken on a K-quant model. This checks the raw path both
+                // matches the reader and is served from RAM the second time.
+                {
+                    const std::string probe_raw_name = "blk.0.attn_q.weight";
+                    std::vector<uint8_t> tr, rr;
+                    int tq = 0, rq = 0;
+                    uint64_t tne = 0, ttr = 0, rne = 0, rtr = 0;
+                    const bool t_ok = tier.read_tensor_raw(probe_raw_name, tr, tq, tne, ttr);
+                    const bool r_ok = src->read_tensor_raw(probe_raw_name, rr, rq, rne, rtr);
+                    if (t_ok && r_ok && tr == rr && tq == rq && tne == rne && ttr == rtr) {
+                        std::printf("  hybrid_tier raw read matches reader (%zu bytes, type %d)\n",
+                                    tr.size(), tq);
+                        passed++;
+                    } else {
+                        std::printf("  hybrid_tier raw read MISMATCH (tier=%d reader=%d %zu vs %zu)\n",
+                                    (int) t_ok, (int) r_ok, tr.size(), rr.size());
+                        failed++;
+                    }
+
+                    if (t_ok) {
+                        const desireeia::HybridTier::Stats b4 = tier.stats();
+                        std::vector<uint8_t> again;
+                        int aq = 0; uint64_t ane = 0, atr = 0;
+                        tier.read_tensor_raw(probe_raw_name, again, aq, ane, atr);
+                        const desireeia::HybridTier::Stats af = tier.stats();
+                        if (af.ram_hits > b4.ram_hits && again == tr) {
+                            std::printf("  hybrid_tier raw second read served from RAM cache\n");
+                            passed++;
+                        } else {
+                            std::printf("  hybrid_tier raw second read did NOT hit the cache\n");
+                            failed++;
+                        }
+                    }
                 }
 
                 // Read expert from layer 0, expert 0, gate part.

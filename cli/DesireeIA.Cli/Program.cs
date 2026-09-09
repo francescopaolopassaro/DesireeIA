@@ -84,7 +84,13 @@ static (LocalModel model, ExecutionPlan plan) Open(string modelPath, int? thread
     }
     var overrides = threads is int t ? new ExecutionPlan { ThreadCount = t } : null;
     var plan = DesireeIAEngine.BuildPlan(modelPath, overrides);
-    var model = LocalModel.Load(modelPath, plan);
+    // DESIREEIA_VERBOSE=1 attiva il logger nativo su stderr: utile per capire
+    // PERCHE' un load/predict fallisce (l'ABI restituisce solo un codice
+    // errore generico), senza dover ricompilare o attaccare un debugger.
+    Action<string>? logger = Environment.GetEnvironmentVariable("DESIREEIA_VERBOSE") == "1"
+        ? (msg => Console.Error.WriteLine($"[native] {msg}"))
+        : null;
+    var model = LocalModel.Load(modelPath, plan, logger);
     return (model, plan);
 }
 

@@ -191,6 +191,23 @@ struct LayerWeights {
     MatVec router; // DenseConfig::n_expert>0, shape [n_expert, n_embd] (ffn_gate_inp)
     std::vector<float> router_bias; // DenseQuirks::moe_has_sel_bias, dim n_expert, optional
 
+    // MoE experts, stacked. GGUF keeps every expert of a layer in one tensor
+    // (blk.N.ffn_{gate,up,down}_exps.weight) with the experts laid out as
+    // contiguous row ranges, so a single expert is a byte slice of it and
+    // needs no read of its own.
+    //
+    // Kept here still quantized, for the same reason every other weight is:
+    // the matmul kernels consume quantized bytes directly. The older path
+    // fetched one expert at a time through ExpertStore, which reopened the
+    // model file and dequantized the expert to float on every fetch — per
+    // expert, per layer, per token, then ran the scalar float matmul on the
+    // result. These stay empty when the stacked tensors aren't present, and
+    // that older path still runs.
+    MatVec wexp_gate;
+    MatVec wexp_up;
+    MatVec wexp_down;
+    bool   exps_stacked = false;
+
     // MLA (DenseQuirks::mla).
     std::vector<float> attn_q_a_norm;  // dim q_lora_rank, only if q_lora_rank>0
     std::vector<float> attn_kv_a_norm; // dim kv_lora_rank
@@ -249,7 +266,17 @@ public:
     }
     bool weight_cache_enabled() const override { return cache_enabled_; }
 
+    // Diagnostic only: which tensor/check made the last load_layer_data or
+    // step() call fail. The ABI reports failures as a bare error code with no
+    // detail, and finding the actual cause meant reading through native stdio
+    // that doesn't reliably reach a caller across the DLL boundary (a mingw
+    // CRT inside the DLL does not necessarily share the host process's
+    // stdio buffering/handles) — this is the channel that does: the engine
+    // already logs it through the caller-supplied LogFn on failure.
+    const std::string& last_fail() const override { return last_fail_; }
+
 private:
+    mutable std::string last_fail_;
     bool load_embd(ModelReader& rd);
     bool load_norms(ModelReader& rd);
     bool load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w);
@@ -257,6 +284,23 @@ private:
     bool load_qkv_fused(ModelReader& rd, const std::string& name,
                          uint32_t q_dim, uint32_t kv_dim, uint32_t cols,
                          MatVec& wq, MatVec& wk, MatVec& wv);
+    // Runs one MoE expert's gated FFN for the activation `xin`, writing the
+    // expert's contribution (unweighted) into `out`.
+    //
+    // Prefers the stacked quantized tensors, where the expert is a byte slice
+    // and the quantized kernels apply. Falls back to ExpertStore's
+    // dequantized per-expert copies when a layer has no stacked tensors, so
+    // checkpoints laid out differently keep working.
+    //
+    // ffn/ffn_gate are scratch of n_ff_expert; egate/eup/edown are scratch for
+    // the fallback only. They are passed in rather than allocated here because
+    // this runs once per selected expert per layer per token.
+    bool expert_ffn(const LayerWeights& lw, uint32_t layer, uint32_t eidx,
+                    const float* xin, bool gelu_act,
+                    std::vector<float>& ffn, std::vector<float>& ffn_gate,
+                    std::vector<float>& out,
+                    std::vector<float>& egate, std::vector<float>& eup,
+                    std::vector<float>& edown);
     const LayerWeights* get_layer(ModelReader& rd, uint32_t il);
     void grow_cache(size_t needed);
 
@@ -279,6 +323,18 @@ private:
     DenseQuirks quirks_;
     ExpertStore* experts_ = nullptr; // not owned, see ctx.cpp
     MatVec tok_embd_;
+
+    // The output head, when the model ships one of its own ("output.weight").
+    //
+    // Plenty of architectures tie it to the input embedding and store no such
+    // tensor, and this used to assume that was always the case — projecting
+    // the logits through tok_embd_ unconditionally. For a model that does
+    // carry a separate head that is silently the wrong matrix: the logits
+    // come out finite and normally distributed, so nothing fails, and the
+    // model simply predicts confident nonsense. Empty means tied, and then
+    // tok_embd_ really is the right matrix.
+    MatVec out_head_;
+
     std::vector<float> out_norm_;
     std::vector<float> out_norm_b_; // DenseQuirks::layer_norm, optional
 
@@ -302,6 +358,11 @@ private:
     // scratch_ on every step, slower but with constant memory usage
     // independent of layer count).
     bool cache_enabled_ = false;
+    // Whether MoE layers keep their experts stacked and quantized inside the
+    // layer (fast, but only sound while layers stay resident) or go one
+    // expert at a time through ExpertStore. Decided at load, from whether the
+    // layer cache can hold the model — see the note where it is set.
+    bool stack_experts_ = false;
     std::vector<LayerWeights> layer_cache_;
     LayerWeights scratch_;
 

@@ -1,6 +1,7 @@
 #include "moe_route.h"
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace desireeia {
 
@@ -31,6 +32,18 @@ std::vector<std::pair<uint32_t, float>> moe_route_ex(
     std::vector<float> sel_probs = probs;
     if (sel_bias && sel_bias->size() == n) {
         for (size_t i = 0; i < n; ++i) sel_probs[i] += (*sel_bias)[i];
+    }
+
+    // A NaN here is not just a bad routing decision, it is undefined
+    // behaviour: `a > b` is false in both directions for NaN, which breaks
+    // the strict weak ordering std::partial_sort requires, and the standard
+    // library is then free to walk off the end of the range — an access
+    // violation, observed for real on a model whose forward pass produced
+    // NaN upstream. Sorting must stay safe no matter what the network hands
+    // it, so NaNs are pushed to the bottom instead of being compared.
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isnan(sel_probs[i])) sel_probs[i] = -std::numeric_limits<float>::infinity();
+        if (std::isnan(probs[i])) probs[i] = 0.0f;
     }
 
     std::vector<uint32_t> idx(n);

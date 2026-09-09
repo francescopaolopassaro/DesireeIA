@@ -3,6 +3,7 @@
 
 #include "core/engine.h"
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace desireeia {
@@ -24,6 +25,16 @@ public:
                        std::vector<float>& last_logits, std::vector<float>* all_logits = nullptr) = 0;
     virtual uint64_t kv_bytes() const = 0;
     virtual bool weight_cache_enabled() const = 0;
+
+    // Diagnostic only: which tensor/check made the last step() call fail, if
+    // it did. The ABI reports a bare error code with no detail, and this is
+    // the cheapest way to get one without plumbing a full logger through
+    // every load path. Default empty — not every engine needs this level of
+    // detail yet.
+    virtual const std::string& last_fail() const {
+        static const std::string none;
+        return none;
+    }
 };
 
 }

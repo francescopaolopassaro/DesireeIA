@@ -198,6 +198,39 @@ static void matvec(const MatVec& m, size_t r, size_t c, const float* x, float* y
     }
 }
 
+// Same dispatch as matvec above, but over a bare pointer instead of a MatVec.
+//
+// Needed to compute one expert out of a stacked *_exps tensor: the experts sit
+// in it as contiguous row ranges and no quantization block ever straddles a
+// row, so an expert is just an offset into the quantized bytes. Copying it out
+// into its own MatVec first would defeat the point.
+static void matvec_raw(MatVecFormat fmt, const uint8_t* data, size_t r, size_t c,
+                       const float* x, float* y) {
+    switch (fmt) {
+        case MatVecFormat::Q4_0: matmul_q4_0(data, r, c, x, y); break;
+        case MatVecFormat::Q4_1: matmul_q4_1(data, r, c, x, y); break;
+        case MatVecFormat::Q5_0: matmul_q5_0(data, r, c, x, y); break;
+        case MatVecFormat::Q5_1: matmul_q5_1(data, r, c, x, y); break;
+        case MatVecFormat::Q2_K: matmul_q2_k(data, r, c, x, y); break;
+        case MatVecFormat::Q3_K: matmul_q3_k(data, r, c, x, y); break;
+        case MatVecFormat::Q4_K: matmul_q4_k(data, r, c, x, y); break;
+        case MatVecFormat::Q5_K: matmul_q5_k(data, r, c, x, y); break;
+        case MatVecFormat::Q6_K: matmul_q6_k(data, r, c, x, y); break;
+        case MatVecFormat::Q8_0: matmul_q8_0(data, r, c, x, y); break;
+        case MatVecFormat::Q8_K: matmul_q8_k(data, r, c, x, y); break;
+        default: break;   // Float has no raw form; callers check first.
+    }
+}
+
+// Bytes one row of `m` occupies, given how many rows it holds in total.
+// Uniform across rows for every quantized format here, which is what makes
+// slicing an expert out of a stacked tensor a plain offset.
+static size_t row_bytes_of(const MatVec& m, size_t total_rows) {
+    if (total_rows == 0 || m.raw.empty()) return 0;
+    if (m.raw.size() % total_rows != 0) return 0;
+    return m.raw.size() / total_rows;
+}
+
 // Come matvec ma per n_tok colonne di attivazione in una sola chiamata
 // (Fase 8): x e y sono n_tok blocchi contigui da c/r elementi. Per il
 // fallback Float (raro: solo tensori non quantizzati) non esiste ancora
@@ -372,6 +405,79 @@ static void rope_neox_cached(float* v, size_t n_rot, const float* cache) {
     }
 }
 
+// Same rotation as rope_neox_cached, but pairing CONSECUTIVE dimensions
+// (2j, 2j+1) on input instead of split halves (j, j+half) — MLA's own RoPE
+// convention for its rope-carrying slice (DeepSeek2 and siblings), distinct
+// from the split-half convention every other architecture here declares.
+// Output is still split-half: v[j] gets the "cos" component, v[j+half] gets
+// the "sin" component, matching what mla_attn_layer reads back from qcur and
+// from the K cache row afterward.
+//
+// NOT safe to do in place directly: consecutive-pair reads and split-half
+// writes hit overlapping indices partway through (e.g. n_rot=8: the write at
+// j=0 lands on v[4], which the read at j=2 needs) — a later iteration would
+// read a value an earlier one already overwrote. The read side goes through
+// a small copy so every read sees the original input regardless of order.
+// Numeric tracing, off unless DESIREEIA_TRACE names a file. Writes the range
+// of a vector so a NaN or a blow-up can be located by stage instead of
+// guessed at; native stdout/stderr from this DLL does not reliably reach the
+// host process, so it goes to a file.
+static void trace_msg(const char* msg) {
+    static const char* path = std::getenv("DESIREEIA_TRACE");
+    if (!path) return;
+    std::FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    std::fprintf(f, "%s\n", msg);
+    std::fclose(f);
+}
+
+static void trace_vec(const char* tag, uint32_t l, uint32_t pos, const float* v, size_t n) {
+    static const char* path = std::getenv("DESIREEIA_TRACE");
+    if (!path || n == 0) return;
+    float lo = v[0], hi = v[0];
+    size_t nan_count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isnan(v[i]) || std::isinf(v[i])) { nan_count++; continue; }
+        if (v[i] < lo || std::isnan(lo)) lo = v[i];
+        if (v[i] > hi || std::isnan(hi)) hi = v[i];
+    }
+    std::FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    std::fprintf(f, "l=%u pos=%u %-14s n=%zu min=%.5g max=%.5g bad=%zu\n",
+                 l, pos, tag, n, (double) lo, (double) hi, nan_count);
+    std::fclose(f);
+}
+
+// Which pairing MLA's rope slice uses. The two conventions differ in which
+// dimensions get rotated together, and a model only works with the one it was
+// trained (and converted) for — with the wrong one every value stays finite
+// and plausible while the output is quietly wrong, so this is worth being
+// able to flip while establishing which a given file wants.
+static bool mla_rope_split_half() {
+    static const bool v = std::getenv("DESIREEIA_MLA_ROPE_NEOX") != nullptr;
+    return v;
+}
+
+static void rope_mla_cached(float* v, size_t n_rot, const float* cache) {
+    if (mla_rope_split_half()) { rope_neox_cached(v, n_rot, cache); return; }
+    // n_rot is qk_rope_head_dim: 64 on every MLA checkpoint seen so far. 256
+    // leaves headroom for a future variant without needing a heap allocation
+    // on this per-head, per-token path; a config past that is refused rather
+    // than silently truncated.
+    if (n_rot == 0 || n_rot > 256) return;
+    const size_t half = n_rot / 2;
+    float in[256];
+    std::memcpy(in, v, n_rot * sizeof(float));
+    for (size_t j = 0; j < half; ++j) {
+        const float cos_t = cache[2 * j + 0];
+        const float sin_t = cache[2 * j + 1];
+        const float a = in[2 * j + 0];
+        const float b = in[2 * j + 1];
+        v[j]        = a * cos_t - b * sin_t;
+        v[j + half] = b * cos_t + a * sin_t;
+    }
+}
+
 // Prodotto scalare su vettori contigui (usato per i punteggi QK
 // dell'attenzione, dove head_dim e' un multiplo di 8).
 static inline float dot_f32(const float* a, const float* b, size_t n) {
@@ -514,7 +620,25 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
         if (rd.meta_u32(kp + "expert_used_count", v32)) cfg_.n_expert_used = v32;
         cfg_.n_ff_expert = cfg_.n_ff;
         if (rd.meta_u32(kp + "expert_feed_forward_length", v32)) cfg_.n_ff_expert = v32;
-        cfg_.moe_norm_w = (arch_tag != "qwen2moe"); // this family skips renormalization
+        // Whether the top-k routing weights get renormalized to sum to 1.
+        //
+        // Wrong either way is not a crash, it is a silent scale error on the
+        // whole MoE branch: with 6 of 64 experts the selected softmax weights
+        // sum to well under 1, so renormalizing when the model did not
+        // inflates every expert's contribution several-fold, and the model
+        // degenerates into repetition while every intermediate value still
+        // looks perfectly reasonable.
+        //
+        // Newer files state it outright; older ones don't carry the key at
+        // all, so the default has to follow the family. The MLA family's
+        // first generation does NOT renormalize (and neither does one other
+        // family here); the later generation does, and those files are
+        // exactly the ones that ship the key.
+        cfg_.moe_norm_w = (arch_tag != "qwen2moe") && !quirks_.mla;
+        uint32_t norm_w_meta = 0;
+        if (rd.meta_u32(kp + "expert_weights_norm", norm_w_meta)) {
+            cfg_.moe_norm_w = (norm_w_meta != 0);
+        }
         cfg_.moe_w_scale = 1.0f;
         if (rd.meta_f32(kp + "expert_weights_scale", f32)) cfg_.moe_w_scale = f32;
     }
@@ -527,7 +651,14 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
         if (rd.meta_u32(kp + "attention.kv_lora_rank", v32)) cfg_.kv_lora_rank = v32;
         uint32_t k_mla = cfg_.head_dim; // fallback: attention.key_length gia' letta sopra
         rd.meta_u32(kp + "attention.key_length_mla", k_mla);
+        // v_head_dim genuinely differs from k_head_dim for MLA (nope+rope vs
+        // just v), so it needs its own source, not a copy of k_mla. Some
+        // GGUF exports use the "_mla"-suffixed key; the ones actually seen in
+        // real files use the plain "attention.value_length" instead — read
+        // there first, `_mla` as an override if a file does carry it, k_mla
+        // only as a last resort if neither is present.
         uint32_t v_mla = k_mla;
+        rd.meta_u32(kp + "attention.value_length", v_mla);
         rd.meta_u32(kp + "attention.value_length_mla", v_mla);
         cfg_.n_embd_head_v_mla = v_mla;
         cfg_.n_embd_head_qk_rope = cfg_.n_rot; // rope.dimension_count, gia' letta sopra
@@ -622,11 +753,19 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
     }
 
     // Per i layer MoE non si carica wff_gate/up/down (sostituiti dal
-    // router, piccolo: n_expert*n_embd) e i pesi esperto vivono nella
-    // cache LRU separata di ExpertStore, non in layer_cache_: non li si
-    // conta qui.
+    // A MoE layer has no dense wff_gate/up/down: it has the router (small,
+    // n_expert*n_embd) plus every expert of the layer, held stacked and
+    // quantized in the layer itself.
+    //
+    // Those experts have to be counted. They dominate a MoE layer — on a 64
+    // expert model they are hundreds of MiB against a router of a few — and
+    // they used to live in ExpertStore's own LRU, outside this cache, which is
+    // why the old term ignored them. Leaving that term in place after moving
+    // them here would have the cache believe a layer costs a rounding error
+    // and happily hold every one of them.
     const uint64_t ffn_term = cfg_.n_expert > 0
         ? (uint64_t) cfg_.n_expert * cfg_.n_embd
+          + (uint64_t) cfg_.n_expert * (uint64_t) cfg_.n_ff_expert * cfg_.n_embd * 3
         : (uint64_t) cfg_.n_ff * cfg_.n_embd * 3;
     const uint64_t per_layer_weights =
         (uint64_t) q_dim * cfg_.n_embd                 // wq
@@ -638,6 +777,17 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
         ((uint64_t) (per_layer_weights * bytes_per_weight) + norm_floats * sizeof(float));
     const uint64_t budget_bytes = ram_budget_mb * 1024ULL * 1024ULL;
     cache_enabled_ = budget_bytes > 0 && total_bytes <= (budget_bytes * 6 / 10);
+
+    // Stacking the experts into the layer is the fast arrangement, but only
+    // while the layer stays resident. Without the layer cache, a MoE layer is
+    // rebuilt on every token, and rebuilding it means re-reading ALL of its
+    // experts — hundreds of MiB — to use six of them. The per-expert path is
+    // slower per expert but only ever touches the experts actually routed to,
+    // so it is the right one when the layers cannot stay in memory.
+    stack_experts_ = cfg_.n_expert > 0 && cache_enabled_;
+    // Diagnostic escape hatch, see the note on this member in the header.
+    if (std::getenv("DESIREEIA_NO_STACK_EXPERTS")) stack_experts_ = false;
+
     layer_cache_.clear();
     if (cache_enabled_) layer_cache_.resize(cfg_.n_layers);
 
@@ -653,6 +803,20 @@ void DenseForward::reset_cache() {
 
 bool DenseForward::load_embd(ModelReader& rd) {
     if (!load_matrix(rd, "token_embd.weight", cfg_.n_vocab, cfg_.n_embd, tok_embd_)) return false;
+
+    // A separate output head, if this model has one. Read defensively: most
+    // architectures here tie it to the embedding and ship no such tensor, and
+    // those must keep using tok_embd_ exactly as before. See the note on
+    // out_head_ for why getting this wrong is invisible rather than fatal.
+    out_head_ = MatVec{};
+    {
+        MatVec head;
+        const std::string err_before = last_fail_;
+        if (load_matrix(rd, "output.weight", cfg_.n_vocab, cfg_.n_embd, head) && !head.empty()) {
+            out_head_ = std::move(head);
+        }
+        last_fail_ = err_before; // absence is normal, not a failure worth reporting
+    }
 
     // Posizione assoluta (gpt2, mpt opzionale): letta in modo difensivo,
     // vuota se il tensore non c'e' (nessun impatto sulle altre architetture).
@@ -802,6 +966,71 @@ static bool requantize_q6k_to_q4k(std::vector<uint8_t>& raw, uint32_t rows, uint
     return true;
 }
 
+bool DenseForward::expert_ffn(const LayerWeights& lw, uint32_t layer, uint32_t eidx,
+                              const float* xin, bool gelu_act,
+                              std::vector<float>& ffn, std::vector<float>& ffn_gate,
+                              std::vector<float>& out,
+                              std::vector<float>& egate, std::vector<float>& eup,
+                              std::vector<float>& edown) {
+    const uint32_t n_embd = cfg_.n_embd;
+    const uint32_t n_ff_e = cfg_.n_ff_expert;
+
+    auto activate = [&]() {
+        if (gelu_act) {
+            for (uint32_t i = 0; i < n_ff_e; ++i) ffn[i] = gelu_tanh(ffn_gate[i]) * ffn[i];
+        } else {
+            for (uint32_t i = 0; i < n_ff_e; ++i) ffn[i] = silu(ffn_gate[i]) * ffn[i];
+        }
+    };
+
+    if (lw.exps_stacked) {
+        const size_t gu_rows = (size_t) n_ff_e * cfg_.n_expert;
+        const size_t d_rows  = (size_t) n_embd * cfg_.n_expert;
+        const size_t rb_gate = row_bytes_of(lw.wexp_gate, gu_rows);
+        const size_t rb_up   = row_bytes_of(lw.wexp_up,   gu_rows);
+        const size_t rb_down = row_bytes_of(lw.wexp_down, d_rows);
+
+        if (rb_gate != 0 && rb_up != 0 && rb_down != 0 && eidx < cfg_.n_expert) {
+            const size_t off_gu = (size_t) eidx * n_ff_e;
+            const size_t off_d  = (size_t) eidx * n_embd;
+            matvec_raw(lw.wexp_up.format,   lw.wexp_up.raw.data()   + off_gu * rb_up,
+                       n_ff_e, n_embd, xin, ffn.data());
+            matvec_raw(lw.wexp_gate.format, lw.wexp_gate.raw.data() + off_gu * rb_gate,
+                       n_ff_e, n_embd, xin, ffn_gate.data());
+            activate();
+            matvec_raw(lw.wexp_down.format, lw.wexp_down.raw.data() + off_d * rb_down,
+                       n_embd, n_ff_e, ffn.data(), out.data());
+            return true;
+        }
+    }
+
+    // Fallback: one dequantized expert at a time, through ExpertStore.
+    if (!experts_) return false;
+    if (!experts_->fetch(layer, eidx, ExpertPart::Gate, egate)) return false;
+    if (!experts_->fetch(layer, eidx, ExpertPart::Up,   eup))   return false;
+    if (!experts_->fetch(layer, eidx, ExpertPart::Down, edown)) return false;
+    if (egate.size() != (size_t) n_ff_e * n_embd ||
+        eup.size()   != (size_t) n_ff_e * n_embd ||
+        edown.size() != (size_t) n_embd * n_ff_e) {
+        return false;
+    }
+
+    trace_vec("exp_gate_w", layer, eidx, egate.data(), egate.size());
+    trace_vec("exp_up_w", layer, eidx, eup.data(), eup.size());
+    trace_vec("exp_down_w", layer, eidx, edown.data(), edown.size());
+
+    matmul_f32(eup.data(),   n_ff_e, n_embd, xin, ffn.data());
+    matmul_f32(egate.data(), n_ff_e, n_embd, xin, ffn_gate.data());
+    trace_vec("exp_xin", layer, eidx, xin, n_embd);
+    trace_vec("exp_up", layer, eidx, ffn.data(), n_ff_e);
+    trace_vec("exp_gate", layer, eidx, ffn_gate.data(), n_ff_e);
+    activate();
+    trace_vec("exp_act", layer, eidx, ffn.data(), n_ff_e);
+    matmul_f32(edown.data(), n_embd, n_ff_e, ffn.data(), out.data());
+    trace_vec("exp_out", layer, eidx, out.data(), n_embd);
+    return true;
+}
+
 bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out) {
     out.raw.clear();
     out.f.clear();
@@ -827,6 +1056,24 @@ bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_
     // Formato non gestito da un kernel diretto (o read_tensor_raw non
     // supportato dal reader): fallback sul path dequantizzato in float,
     // sempre corretto per qualunque formato quant letto dal reader.
+    //
+    // The float check below only compares the TOTAL element count, so a
+    // tensor stored with rows and columns the other way round slips through
+    // it and then gets read as if it were the expected shape — every value
+    // finite, every result wrong. The raw path above does check the shape, so
+    // whenever a tensor lands here for a reason OTHER than an unsupported
+    // quantization, that is worth reporting rather than silently accepting.
+    if (rd.read_tensor_raw(name, raw, quant_type, ne0, tensor_rows) &&
+        (ne0 != cols || tensor_rows != rows)) {
+        char msg[224];
+        std::snprintf(msg, sizeof(msg),
+                      "shape mismatch on %s: file has ne0=%llu rows=%llu, expected cols=%u rows=%u",
+                      name.c_str(), (unsigned long long) ne0, (unsigned long long) tensor_rows,
+                      cols, rows);
+        last_fail_ = msg;
+        trace_msg(msg);
+    }
+
     if (!rd.read_tensor(name, out.f) || out.f.size() != (size_t) rows * cols) return false;
     return true;
 }
@@ -888,8 +1135,8 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
         if (!rd.read_tensor(p + "attn_norm.weight", w.attn_norm) || w.attn_norm.size() != cfg_.n_embd) return false;
         w.ffn_norm.clear();
     } else {
-        if (!rd.read_tensor(p + "attn_norm.weight", w.attn_norm) || w.attn_norm.size() != cfg_.n_embd) return false;
-        if (!rd.read_tensor(p + "ffn_norm.weight", w.ffn_norm) || w.ffn_norm.size() != cfg_.n_embd) return false;
+        if (!rd.read_tensor(p + "attn_norm.weight", w.attn_norm) || w.attn_norm.size() != cfg_.n_embd) { last_fail_ = "attn_norm.weight il=" + std::to_string(il); return false; }
+        if (!rd.read_tensor(p + "ffn_norm.weight", w.ffn_norm) || w.ffn_norm.size() != cfg_.n_embd) { last_fail_ = "ffn_norm.weight il=" + std::to_string(il); return false; }
     }
 
     // Bias della norma: solo le architetture LayerNorm (stablelm, orion,
@@ -918,40 +1165,100 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
         w.bq.clear(); w.bk.clear(); w.bv.clear(); w.bo.clear();
 
         if (cfg_.q_lora_rank > 0) {
-            if (!load_matrix(rd, p + "attn_q_a.weight", cfg_.q_lora_rank, cfg_.n_embd, w.wq_a)) return false;
-            if (!rd.read_tensor(p + "attn_q_a_norm.weight", w.attn_q_a_norm) || w.attn_q_a_norm.size() != cfg_.q_lora_rank) return false;
-            if (!load_matrix(rd, p + "attn_q_b.weight", cfg_.n_head * (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope), cfg_.q_lora_rank, w.wq_b)) return false;
+            if (!load_matrix(rd, p + "attn_q_a.weight", cfg_.q_lora_rank, cfg_.n_embd, w.wq_a)) { last_fail_ = "attn_q_a.weight il=" + std::to_string(il); return false; }
+            if (!rd.read_tensor(p + "attn_q_a_norm.weight", w.attn_q_a_norm) || w.attn_q_a_norm.size() != cfg_.q_lora_rank) { last_fail_ = "attn_q_a_norm.weight il=" + std::to_string(il) + " got=" + std::to_string(w.attn_q_a_norm.size()) + " want=" + std::to_string(cfg_.q_lora_rank); return false; }
+            if (!load_matrix(rd, p + "attn_q_b.weight", cfg_.n_head * (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope), cfg_.q_lora_rank, w.wq_b)) { last_fail_ = "attn_q_b.weight il=" + std::to_string(il); return false; }
             w.wq_lite = MatVec{};
         } else {
-            if (!load_matrix(rd, p + "attn_q.weight", cfg_.n_head * (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope), cfg_.n_embd, w.wq_lite)) return false;
+            if (!load_matrix(rd, p + "attn_q.weight", cfg_.n_head * (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope), cfg_.n_embd, w.wq_lite)) { last_fail_ = "attn_q.weight(lite) il=" + std::to_string(il); return false; }
             w.wq_a = MatVec{}; w.wq_b = MatVec{};
             w.attn_q_a_norm.clear();
         }
 
-        if (!load_matrix(rd, p + "attn_kv_a_mqa.weight", cfg_.kv_lora_rank + cfg_.n_embd_head_qk_rope, cfg_.n_embd, w.wkv_a_mqa)) return false;
-        if (!rd.read_tensor(p + "attn_kv_a_norm.weight", w.attn_kv_a_norm) || w.attn_kv_a_norm.size() != cfg_.kv_lora_rank) return false;
+        if (!load_matrix(rd, p + "attn_kv_a_mqa.weight", cfg_.kv_lora_rank + cfg_.n_embd_head_qk_rope, cfg_.n_embd, w.wkv_a_mqa)) { last_fail_ = "attn_kv_a_mqa.weight il=" + std::to_string(il); return false; }
+        if (!rd.read_tensor(p + "attn_kv_a_norm.weight", w.attn_kv_a_norm) || w.attn_kv_a_norm.size() != cfg_.kv_lora_rank) { last_fail_ = "attn_kv_a_norm.weight il=" + std::to_string(il) + " got=" + std::to_string(w.attn_kv_a_norm.size()) + " want=" + std::to_string(cfg_.kv_lora_rank); return false; }
 
-        // wk_b/wv_b: un blocco contiguo per testa (vedi la nota sul layout
-        // in dense_forward.h). Letti come float piatto e poi suddivisi:
-        // niente kernel quantizzato dedicato per queste matrici, sempre
-        // corrette (fallback float), dimensione modesta rispetto al resto.
+        // wk_b/wv_b: derived from the compressed KV up-projection, per head.
+        // Never quantized here (float fallback): modest size next to the
+        // rest, and the "absorbed" MLA trick needs the K half transposed
+        // relative to how the projection is naturally stored, which a raw
+        // quantized kernel can't do for us.
+        //
+        // Two GGUF conventions exist for this projection, tried in order:
+        //
+        //  1. Split (attn_k_b.weight / attn_v_b.weight): each already in the
+        //     exact per-head shape this engine wants. No transform needed.
+        //
+        //  2. Combined (attn_kv_b.weight, shape [kv_lora_rank, n_head *
+        //     (qk_nope_head_dim + v_head_dim)] on disk): the up-projection as
+        //     the model actually learned it, before any splitting for
+        //     inference convenience. Row r belongs to head r / (nope+v); the
+        //     first nope_head_dim rows of that block are the K half, the
+        //     remaining v_head_dim are the V half.
+        //
+        //     The V half copies straight across: mla_attn_layer wants
+        //     wv_b_h[h] as [v_head_dim rows x kv_lora_rank cols], which is
+        //     exactly what those rows already are.
+        //
+        //     The K half needs transposing: mla_attn_layer wants wk_b_h[h] as
+        //     [kv_lora_rank rows x nope_head_dim cols] (it right-multiplies a
+        //     q_nope vector to fold the K up-projection into the query — the
+        //     "absorption" the format is named for), but on disk those rows
+        //     are [nope_head_dim rows x kv_lora_rank cols]. Same 65536
+        //     floats, transposed layout.
+        const uint32_t nope_dim = cfg_.n_embd_head_qk_nope;
+        const uint32_t v_dim    = cfg_.n_embd_head_v_mla;
+        const uint32_t kv_lora  = cfg_.kv_lora_rank;
+
+        std::vector<float> wk_b_flat, wv_b_flat;
+        const bool have_split =
+            rd.read_tensor(p + "attn_k_b.weight", wk_b_flat) &&
+            wk_b_flat.size() == (size_t) nope_dim * kv_lora * cfg_.n_head &&
+            rd.read_tensor(p + "attn_v_b.weight", wv_b_flat) &&
+            wv_b_flat.size() == (size_t) kv_lora * v_dim * cfg_.n_head;
+
+        if (!have_split) {
+            std::vector<float> combined;
+            const size_t want = (size_t) kv_lora * cfg_.n_head * (nope_dim + v_dim);
+            if (!rd.read_tensor(p + "attn_kv_b.weight", combined) || combined.size() != want) {
+                last_fail_ = "attn_kv_b.weight il=" + std::to_string(il) + " got=" + std::to_string(combined.size()) +
+                            " want=" + std::to_string(want) + " nope=" + std::to_string(nope_dim) +
+                            " v=" + std::to_string(v_dim) + " kv_lora=" + std::to_string(kv_lora) +
+                            " n_head=" + std::to_string(cfg_.n_head);
+                return false;
+            }
+            const size_t block = (size_t) (nope_dim + v_dim) * kv_lora; // one head's rows, on disk
+            wk_b_flat.assign((size_t) nope_dim * kv_lora * cfg_.n_head, 0.0f);
+            wv_b_flat.assign((size_t) kv_lora * v_dim * cfg_.n_head, 0.0f);
+            for (uint32_t h = 0; h < cfg_.n_head; ++h) {
+                const float* head_base = combined.data() + (size_t) h * block;
+                // K half: transpose [nope_dim rows x kv_lora cols] -> the
+                // [kv_lora rows x nope_dim cols] this engine expects.
+                float* kdst = wk_b_flat.data() + (size_t) h * nope_dim * kv_lora;
+                for (uint32_t i = 0; i < nope_dim; ++i) {
+                    const float* row = head_base + (size_t) i * kv_lora;
+                    for (uint32_t j = 0; j < kv_lora; ++j) {
+                        kdst[(size_t) j * nope_dim + i] = row[j];
+                    }
+                }
+                // V half: already [v_dim rows x kv_lora cols] — a straight copy.
+                const float* vsrc = head_base + (size_t) nope_dim * kv_lora;
+                float* vdst = wv_b_flat.data() + (size_t) h * v_dim * kv_lora;
+                std::memcpy(vdst, vsrc, (size_t) v_dim * kv_lora * sizeof(float));
+            }
+        }
+
         {
-            std::vector<float> wk_b_flat;
-            if (!rd.read_tensor(p + "attn_k_b.weight", wk_b_flat) ||
-                wk_b_flat.size() != (size_t) cfg_.n_embd_head_qk_nope * cfg_.kv_lora_rank * cfg_.n_head) return false;
             w.wk_b_h.assign(cfg_.n_head, MatVec{});
-            const size_t chunk = (size_t) cfg_.n_embd_head_qk_nope * cfg_.kv_lora_rank;
+            const size_t chunk = (size_t) nope_dim * kv_lora;
             for (uint32_t h = 0; h < cfg_.n_head; ++h) {
                 w.wk_b_h[h].f.assign(wk_b_flat.begin() + h * chunk, wk_b_flat.begin() + (h + 1) * chunk);
                 w.wk_b_h[h].format = MatVecFormat::Float;
             }
         }
         {
-            std::vector<float> wv_b_flat;
-            if (!rd.read_tensor(p + "attn_v_b.weight", wv_b_flat) ||
-                wv_b_flat.size() != (size_t) cfg_.kv_lora_rank * cfg_.n_embd_head_v_mla * cfg_.n_head) return false;
             w.wv_b_h.assign(cfg_.n_head, MatVec{});
-            const size_t chunk = (size_t) cfg_.kv_lora_rank * cfg_.n_embd_head_v_mla;
+            const size_t chunk = (size_t) kv_lora * v_dim;
             for (uint32_t h = 0; h < cfg_.n_head; ++h) {
                 w.wv_b_h[h].f.assign(wv_b_flat.begin() + h * chunk, wv_b_flat.begin() + (h + 1) * chunk);
                 w.wv_b_h[h].format = MatVecFormat::Float;
@@ -959,7 +1266,7 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
         }
 
         const uint32_t mla_out_dim = cfg_.n_head * cfg_.n_embd_head_v_mla;
-        if (!load_matrix(rd, p + "attn_output.weight", cfg_.n_embd, mla_out_dim, w.wo)) return false;
+        if (!load_matrix(rd, p + "attn_output.weight", cfg_.n_embd, mla_out_dim, w.wo)) { last_fail_ = "attn_output.weight(mla) il=" + std::to_string(il); return false; }
     } else if (quirks_.fused_qkv) {
         if (!load_qkv_fused(rd, p + "attn_qkv.weight", q_dim, kv_dim, cfg_.n_embd, w.wq, w.wk, w.wv)) return false;
         if (!load_matrix(rd, p + "attn_output.weight", cfg_.n_embd, q_dim, w.wo)) return false;
@@ -1026,7 +1333,30 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
         // vengono presi da ExpertStore per-token in step() (dipendono dal
         // routing, non caricabili qui una volta per layer).
         w.wff_gate = MatVec{}; w.wff_up = MatVec{}; w.wff_down = MatVec{};
-        if (!load_matrix(rd, p + "ffn_gate_inp.weight", cfg_.n_expert, cfg_.n_embd, w.router)) return false;
+        if (!load_matrix(rd, p + "ffn_gate_inp.weight", cfg_.n_expert, cfg_.n_embd, w.router)) { last_fail_ = "ffn_gate_inp.weight il=" + std::to_string(il); return false; }
+
+        // Every expert of this layer in one quantized tensor, loaded once,
+        // instead of one dequantized expert per token through ExpertStore.
+        // The three have to arrive together: a half-stacked layer would mean
+        // deciding per matrix which path to take, for no benefit.
+        w.wexp_gate = MatVec{}; w.wexp_up = MatVec{}; w.wexp_down = MatVec{};
+        w.exps_stacked = false;
+        if (stack_experts_ && cfg_.n_ff_expert > 0) {
+            const uint32_t stacked_rows = cfg_.n_ff_expert * cfg_.n_expert;
+            const uint32_t down_rows    = cfg_.n_embd * cfg_.n_expert;
+            if (load_matrix(rd, p + "ffn_gate_exps.weight", stacked_rows, cfg_.n_embd, w.wexp_gate) &&
+                load_matrix(rd, p + "ffn_up_exps.weight",   stacked_rows, cfg_.n_embd, w.wexp_up) &&
+                load_matrix(rd, p + "ffn_down_exps.weight", down_rows, cfg_.n_ff_expert, w.wexp_down) &&
+                w.wexp_gate.format != MatVecFormat::Float &&
+                w.wexp_up.format   != MatVecFormat::Float &&
+                w.wexp_down.format != MatVecFormat::Float) {
+                w.exps_stacked = true;
+            } else {
+                // Anything unexpected: drop it all and let the per-expert
+                // path run, rather than carrying a partial state into decode.
+                w.wexp_gate = MatVec{}; w.wexp_up = MatVec{}; w.wexp_down = MatVec{};
+            }
+        }
         w.router_bias.clear();
         if (quirks_.mla) {
             rd.read_tensor(p + "exp_probs_b.bias", w.router_bias);
@@ -1035,21 +1365,21 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
         w.ffn_gate_shexp = MatVec{}; w.ffn_up_shexp = MatVec{}; w.ffn_down_shexp = MatVec{};
         if (quirks_.mla && cfg_.n_expert_shared > 0) {
             const uint32_t n_ff_sh = cfg_.n_ff_expert * cfg_.n_expert_shared;
-            if (!load_matrix(rd, p + "ffn_gate_shexp.weight", n_ff_sh, cfg_.n_embd, w.ffn_gate_shexp)) return false;
-            if (!load_matrix(rd, p + "ffn_up_shexp.weight", n_ff_sh, cfg_.n_embd, w.ffn_up_shexp)) return false;
-            if (!load_matrix(rd, p + "ffn_down_shexp.weight", cfg_.n_embd, n_ff_sh, w.ffn_down_shexp)) return false;
+            if (!load_matrix(rd, p + "ffn_gate_shexp.weight", n_ff_sh, cfg_.n_embd, w.ffn_gate_shexp)) { last_fail_ = "ffn_gate_shexp.weight il=" + std::to_string(il); return false; }
+            if (!load_matrix(rd, p + "ffn_up_shexp.weight", n_ff_sh, cfg_.n_embd, w.ffn_up_shexp)) { last_fail_ = "ffn_up_shexp.weight il=" + std::to_string(il); return false; }
+            if (!load_matrix(rd, p + "ffn_down_shexp.weight", cfg_.n_embd, n_ff_sh, w.ffn_down_shexp)) { last_fail_ = "ffn_down_shexp.weight il=" + std::to_string(il); return false; }
         }
     } else {
         w.router = MatVec{};
         w.router_bias.clear();
         w.ffn_gate_shexp = MatVec{}; w.ffn_up_shexp = MatVec{}; w.ffn_down_shexp = MatVec{};
         if (quirks_.ffn_gated) {
-            if (!load_matrix(rd, p + "ffn_gate.weight", cfg_.n_ff, cfg_.n_embd, w.wff_gate)) return false;
+            if (!load_matrix(rd, p + "ffn_gate.weight", cfg_.n_ff, cfg_.n_embd, w.wff_gate)) { last_fail_ = "ffn_gate.weight(dense-lead) il=" + std::to_string(il) + " n_ff=" + std::to_string(cfg_.n_ff); return false; }
         } else {
             w.wff_gate = MatVec{};
         }
-        if (!load_matrix(rd, p + "ffn_up.weight", cfg_.n_ff, cfg_.n_embd, w.wff_up)) return false;
-        if (!load_matrix(rd, p + "ffn_down.weight", cfg_.n_embd, cfg_.n_ff, w.wff_down)) return false;
+        if (!load_matrix(rd, p + "ffn_up.weight", cfg_.n_ff, cfg_.n_embd, w.wff_up)) { last_fail_ = "ffn_up.weight(dense-lead) il=" + std::to_string(il) + " n_ff=" + std::to_string(cfg_.n_ff); return false; }
+        if (!load_matrix(rd, p + "ffn_down.weight", cfg_.n_embd, cfg_.n_ff, w.wff_down)) { last_fail_ = "ffn_down.weight(dense-lead) il=" + std::to_string(il) + " n_ff=" + std::to_string(cfg_.n_ff); return false; }
 
         w.ffn_up_b.clear();
         w.ffn_down_b.clear();
@@ -1153,6 +1483,8 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
     const uint32_t comp_w = kv_lora + rope_w; // larghezza "compressa" condivisa da Q e K
     const uint32_t k_mla = nope_w + rope_w;
 
+    trace_vec("enter/xnp", l, pos, xnp, n_embd);
+
     // --- Q: proiezione (LoRA o diretta) -> [n_head * k_mla] ---
     std::vector<float> q(n_head * (size_t) k_mla);
     if (cfg_.q_lora_rank > 0) {
@@ -1168,13 +1500,18 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
     std::vector<float> kv_cmpr_pe(kv_lora + rope_w);
     matvec(lw->wkv_a_mqa, kv_lora + rope_w, n_embd, xnp, kv_cmpr_pe.data());
 
+    trace_vec("xnp", l, pos, xnp, n_embd);
+    trace_vec("q", l, pos, q.data(), q.size());
+    trace_vec("kv_cmpr_pe", l, pos, kv_cmpr_pe.data(), kv_cmpr_pe.size());
+
     float* cache_row = k_cache_.data() + ((size_t) l * cache_capacity_ + pos) * comp_w;
     rms_norm_vec(kv_cmpr_pe.data(), lw->attn_kv_a_norm.data(), cache_row, kv_lora, cfg_.rms_eps);
+    trace_vec("latent", l, pos, cache_row, kv_lora);
 
     std::vector<float> rope_cache_kv(rope_w);
     rope_cache_init(rope_cache_kv, rope_w, pos, rope_th, rope_sc, ext_factor, attn_factor, corr_lo, corr_hi);
     std::memcpy(cache_row + kv_lora, kv_cmpr_pe.data() + kv_lora, rope_w * sizeof(float));
-    rope_neox_cached(cache_row + kv_lora, rope_w, rope_cache_kv.data());
+    rope_mla_cached(cache_row + kv_lora, rope_w, rope_cache_kv.data());
 
     // --- per-testa: assorbimento di q_nope, RoPE su q_pe, punteggi, softmax, de-assorbimento ---
     std::vector<float> attn_concat((size_t) n_head * v_mla);
@@ -1188,12 +1525,14 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
         // su LayerWeights::wk_b_h in dense_forward.h.
         matvec(lw->wk_b_h[h], kv_lora, nope_w, qh, qcur.data());
         std::memcpy(qcur.data() + kv_lora, qh + nope_w, rope_w * sizeof(float));
-        rope_neox_cached(qcur.data() + kv_lora, rope_w, rope_cache_kv.data());
+        rope_mla_cached(qcur.data() + kv_lora, rope_w, rope_cache_kv.data());
+        if (h == 0) trace_vec("qcur", l, pos, qcur.data(), comp_w);
 
         const float* cache_base = k_cache_.data() + (size_t) l * cache_capacity_ * comp_w;
         for (uint32_t cc = 0; cc <= pos; ++cc) {
             scores[cc] = dot_f32(qcur.data(), cache_base + (size_t) cc * comp_w, comp_w) * kq_scale;
         }
+        if (h == 0) trace_vec("scores_raw", l, pos, scores.data(), (size_t) pos + 1);
         softmax_inplace(scores.data(), (size_t) pos + 1);
 
         std::fill(attn_raw.begin(), attn_raw.end(), 0.0f);
@@ -1202,15 +1541,19 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
         }
         // De-assorbimento: out[j] = sum_i wv_b[i,j,h] * attn_raw[i], j in [0,v_mla).
         matvec(lw->wv_b_h[h], v_mla, kv_lora, attn_raw.data(), attn_concat.data() + (size_t) h * v_mla);
+        if (h == 0) trace_vec("attn_raw", l, pos, attn_raw.data(), kv_lora);
     }
+    trace_vec("attn_concat", l, pos, attn_concat.data(), attn_concat.size());
 
     matvec(lw->wo, n_embd, (size_t) n_head * v_mla, attn_concat.data(), proj_out);
+    trace_vec("proj_out", l, pos, proj_out, n_embd);
 }
 
 bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         std::vector<float>& last_logits, std::vector<float>* all_logits) {
-    if (n_tokens == 0 || tokens == nullptr) return false;
-    if (tok_embd_.empty()) return false;
+    last_fail_.clear();
+    if (n_tokens == 0 || tokens == nullptr) { last_fail_ = "bad args to step"; return false; }
+    if (tok_embd_.empty()) { last_fail_ = "tok_embd_ empty"; return false; }
 
     const uint32_t n_embd  = cfg_.n_embd;
     const uint32_t n_layers = cfg_.n_layers;
@@ -1230,8 +1573,8 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
     std::vector<float> x((size_t) n_tokens * n_embd);
     for (size_t p = 0; p < n_tokens; ++p) {
         const int32_t t = tokens[p];
-        if (t < 0 || (uint32_t) t >= cfg_.n_vocab) return false;
-        if (!embed_row((uint32_t) t, x.data() + p * n_embd)) return false;
+        if (t < 0 || (uint32_t) t >= cfg_.n_vocab) { last_fail_ = "token out of range t=" + std::to_string(t) + " n_vocab=" + std::to_string(cfg_.n_vocab); return false; }
+        if (!embed_row((uint32_t) t, x.data() + p * n_embd)) { last_fail_ = "embed_row failed t=" + std::to_string(t); return false; }
         if (quirks_.embd_scale_sqrt) {
             const float s = sqrtf((float) n_embd);
             float* xp = x.data() + p * n_embd;
@@ -1308,6 +1651,19 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
         const float attn_factor_org = cfg_.rope_attn_factor * (1.0f + 0.1f * logf(1.0f / cfg_.rope_freq_scale));
         const float mscale = attn_factor_org * (1.0f + 0.1f * cfg_.rope_yarn_log_mul * logf(1.0f / cfg_.rope_freq_scale));
         mla_kq_scale = mscale * mscale / sqrtf((float) (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope));
+        // Diagnostic escape hatch: isolate the YaRN scale/ramp contribution
+        // from the base absorbed-attention math while tracking down a
+        // real-model MLA bug. Not a normal user knob.
+        if (std::getenv("DESIREEIA_MLA_NO_YARN")) {
+            mla_kq_scale = 1.0f / sqrtf((float) (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope));
+            cfg_.rope_ext_factor = 0.0f;
+            cfg_.rope_attn_factor = 1.0f;
+            // freq_scale has to go back to 1 as well: leaving it at 1/factor
+            // is not "YaRN off", it is plain RoPE rotating `factor` times too
+            // slowly — a different corruption, which made an earlier run of
+            // this same experiment worthless.
+            cfg_.rope_freq_scale = 1.0f;
+        }
     }
 
     // Buffer per il path batched (Fase 8, usato solo quando n_tokens > 1,
@@ -1339,7 +1695,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
 
     for (uint32_t l = 0; l < n_layers; ++l) {
         const LayerWeights* lw = get_layer(rd, l);
-        if (!lw) return false;
+        if (!lw) { if (last_fail_.empty()) last_fail_ = "get_layer null l=" + std::to_string(l); return false; }
 
         // RoPE per-layer: i layer locali (sliding window) e quelli globali
         // usano base/scala diverse — vedi la nota in DenseConfig.
@@ -1364,6 +1720,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                                mla_kq_scale, mla_proj.data());
 
                 for (uint32_t i = 0; i < n_embd; ++i) mla_proj[i] += xp[i];
+                if (p == 0) trace_vec("resid_attn", l, pos, mla_proj.data(), n_embd);
                 norm_vec(false, mla_proj.data(), lw->ffn_norm.data(), nullptr, mla_fnorm.data(), n_embd, rms_eps);
 
                 const bool layer_is_moe = cfg_.n_expert > 0 && l >= cfg_.n_layer_dense_lead;
@@ -1373,23 +1730,28 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                                                   cfg_.moe_sigmoid_gate ? MoeGatingFunc::Sigmoid : MoeGatingFunc::Softmax,
                                                   lw->router_bias.empty() ? nullptr : &lw->router_bias);
                     std::fill(expert_out.begin(), expert_out.end(), 0.0f);
+                    static const bool skip_routed = std::getenv("DESIREEIA_MOE_SHARED_ONLY") != nullptr;
+                    if (!skip_routed)
                     for (const auto& sel : selected) {
                         const uint32_t eidx = sel.first;
                         const float weight = sel.second;
-                        if (!experts_->fetch(l, eidx, ExpertPart::Gate, egate)) continue;
-                        if (!experts_->fetch(l, eidx, ExpertPart::Up, eup)) continue;
-                        if (!experts_->fetch(l, eidx, ExpertPart::Down, edown)) continue;
-                        if (egate.size() != (size_t) cfg_.n_ff_expert * n_embd ||
-                            eup.size() != (size_t) cfg_.n_ff_expert * n_embd ||
-                            edown.size() != (size_t) n_embd * cfg_.n_ff_expert) continue;
-
-                        matmul_f32(eup.data(), cfg_.n_ff_expert, n_embd, mla_fnorm.data(), ffn.data());
-                        matmul_f32(egate.data(), cfg_.n_ff_expert, n_embd, mla_fnorm.data(), ffn_gate.data());
-                        for (uint32_t i = 0; i < cfg_.n_ff_expert; ++i) ffn[i] = silu(ffn_gate[i]) * ffn[i];
-                        matmul_f32(edown.data(), n_embd, cfg_.n_ff_expert, ffn.data(), mla_fout.data());
+                        if (!expert_ffn(*lw, l, eidx, mla_fnorm.data(), /*gelu_act=*/false,
+                                        ffn, ffn_gate, mla_fout, egate, eup, edown)) {
+                            continue;
+                        }
                         for (uint32_t i = 0; i < n_embd; ++i) expert_out[i] += weight * mla_fout[i];
                     }
                     mla_fout = expert_out;
+                    if (p == 0) {
+                        trace_vec("moe_routed", l, pos, expert_out.data(), n_embd);
+                        trace_vec("moe_fnorm", l, pos, mla_fnorm.data(), n_embd);
+                        char m2[160];
+                        std::snprintf(m2, sizeof(m2), "l=%u pos=%u sel=%zu w0=%.5g w1=%.5g",
+                                      l, pos, selected.size(),
+                                      selected.empty() ? 0.0 : (double) selected[0].second,
+                                      selected.size() > 1 ? (double) selected[1].second : 0.0);
+                        trace_msg(m2);
+                    }
 
                     // Shared expert: every token ALSO passes through this
                     // fixed block, whose output is ADDED (not averaged)
@@ -1401,6 +1763,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         for (uint32_t i = 0; i < n_ff_sh; ++i) mla_shexp_up[i] = silu(mla_shexp_gate[i]) * mla_shexp_up[i];
                         std::vector<float> shexp_out(n_embd);
                         matvec(lw->ffn_down_shexp, n_embd, n_ff_sh, mla_shexp_up.data(), shexp_out.data());
+                        if (p == 0) trace_vec("moe_shared", l, pos, shexp_out.data(), n_embd);
                         for (uint32_t i = 0; i < n_embd; ++i) mla_fout[i] += shexp_out[i];
                     }
                 } else {
@@ -1408,12 +1771,21 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     // tensori/formula gia' usati dalle altre architetture.
                     matvec(lw->wff_up, cfg_.n_ff, n_embd, mla_fnorm.data(), ffn.data());
                     matvec(lw->wff_gate, cfg_.n_ff, n_embd, mla_fnorm.data(), ffn_gate.data());
+                    if (p == 0) {
+                        trace_vec("dense_xin", l, pos, mla_fnorm.data(), n_embd);
+                        trace_vec("dense_up", l, pos, ffn.data(), cfg_.n_ff);
+                        trace_vec("dense_gate", l, pos, ffn_gate.data(), cfg_.n_ff);
+                    }
                     for (uint32_t i = 0; i < cfg_.n_ff; ++i) ffn[i] = silu(ffn_gate[i]) * ffn[i];
                     matvec(lw->wff_down, n_embd, cfg_.n_ff, ffn.data(), mla_fout.data());
                 }
 
                 float* xdst = x.data() + p * n_embd;
                 for (uint32_t i = 0; i < n_embd; ++i) xdst[i] = mla_fout[i] + mla_proj[i];
+                if (p == 0) {
+                    trace_vec("ffn_out", l, pos, mla_fout.data(), n_embd);
+                    trace_vec("resid_end", l, pos, xdst, n_embd);
+                }
             }
             continue;
         }
@@ -1577,20 +1949,10 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     for (const auto& sel : selected) {
                         const uint32_t eidx = sel.first;
                         const float weight = sel.second;
-                        if (!experts_->fetch(l, eidx, ExpertPart::Gate, egate)) continue;
-                        if (!experts_->fetch(l, eidx, ExpertPart::Up, eup)) continue;
-                        if (!experts_->fetch(l, eidx, ExpertPart::Down, edown)) continue;
-                        if (egate.size() != (size_t) cfg_.n_ff_expert * n_embd ||
-                            eup.size() != (size_t) cfg_.n_ff_expert * n_embd ||
-                            edown.size() != (size_t) n_embd * cfg_.n_ff_expert) continue;
-                        matmul_f32(eup.data(), cfg_.n_ff_expert, n_embd, xnp, ffn.data());
-                        matmul_f32(egate.data(), cfg_.n_ff_expert, n_embd, xnp, ffn_gate.data());
-                        if (quirks_.gelu_tanh) {
-                            for (uint32_t i = 0; i < cfg_.n_ff_expert; ++i) ffn[i] = gelu_tanh(ffn_gate[i]) * ffn[i];
-                        } else {
-                            for (uint32_t i = 0; i < cfg_.n_ff_expert; ++i) ffn[i] = silu(ffn_gate[i]) * ffn[i];
+                        if (!expert_ffn(*lw, l, eidx, xnp, quirks_.gelu_tanh,
+                                        ffn, ffn_gate, fout, egate, eup, edown)) {
+                            continue;
                         }
-                        matmul_f32(edown.data(), n_embd, cfg_.n_ff_expert, ffn.data(), fout.data());
                         for (uint32_t i = 0; i < n_embd; ++i) expert_out[i] += weight * fout[i];
                     }
                     if (quirks_.sandwich_norm) {
@@ -1851,21 +2213,10 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 for (const auto& sel : selected) {
                     const uint32_t eidx = sel.first;
                     const float weight = sel.second;
-                    if (!experts_->fetch(l, eidx, ExpertPart::Gate, egate)) continue;
-                    if (!experts_->fetch(l, eidx, ExpertPart::Up, eup)) continue;
-                    if (!experts_->fetch(l, eidx, ExpertPart::Down, edown)) continue;
-                    if (egate.size() != (size_t) cfg_.n_ff_expert * n_embd ||
-                        eup.size() != (size_t) cfg_.n_ff_expert * n_embd ||
-                        edown.size() != (size_t) n_embd * cfg_.n_ff_expert) continue;
-
-                    matmul_f32(eup.data(), cfg_.n_ff_expert, n_embd, xnp, ffn.data());
-                    matmul_f32(egate.data(), cfg_.n_ff_expert, n_embd, xnp, ffn_gate.data());
-                    if (quirks_.gelu_tanh) {
-                        for (uint32_t i = 0; i < cfg_.n_ff_expert; ++i) ffn[i] = gelu_tanh(ffn_gate[i]) * ffn[i];
-                    } else {
-                        for (uint32_t i = 0; i < cfg_.n_ff_expert; ++i) ffn[i] = silu(ffn_gate[i]) * ffn[i];
+                    if (!expert_ffn(*lw, l, eidx, xnp, quirks_.gelu_tanh,
+                                    ffn, ffn_gate, fout, egate, eup, edown)) {
+                        continue;
                     }
-                    matmul_f32(edown.data(), n_embd, cfg_.n_ff_expert, ffn.data(), fout.data());
                     for (uint32_t i = 0; i < n_embd; ++i) expert_out[i] += weight * fout[i];
                 }
                 fout = expert_out;
@@ -1929,8 +2280,12 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             out_norm_b_.empty() ? nullptr : out_norm_b_.data(),
             hn.data(), n_embd, rms_eps);
 
+    // The model's own output head when it has one, the tied embedding when it
+    // does not — see the note on out_head_.
+    const MatVec& head = out_head_.empty() ? tok_embd_ : out_head_;
+
     last_logits.assign(cfg_.n_vocab, 0.0f);
-    matvec(tok_embd_, cfg_.n_vocab, n_embd, hn.data(), last_logits.data());
+    matvec(head, cfg_.n_vocab, n_embd, hn.data(), last_logits.data());
 
     if (all_logits) {
         if (n_tokens == 1) {
@@ -1943,7 +2298,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         hn_all.data() + p * n_embd, n_embd, rms_eps);
             }
             all_logits->assign((size_t) n_tokens * cfg_.n_vocab, 0.0f);
-            matvec_batch(tok_embd_, cfg_.n_vocab, n_embd, hn_all.data(), n_tokens, all_logits->data());
+            matvec_batch(head, cfg_.n_vocab, n_embd, hn_all.data(), n_tokens, all_logits->data());
             // L'ultima posizione e' identica a last_logits gia' calcolato
             // sopra (stesso hn): copio invece di ricalcolare per coerenza
             // bit-esatta col path a singola colonna gia' validato.

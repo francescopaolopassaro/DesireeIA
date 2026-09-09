@@ -22,6 +22,11 @@ struct HybridTierConfig {
     // -- RAM tier --
     // Maximum number of expert entries to keep in RAM.
     int32_t ram_capacity = 256;
+    // Budget in BYTES for the raw quantized tensor cache — the one on the
+    // path the matmul kernels actually take. Counted in bytes rather than
+    // entries because tensors in one model span from a few KiB to hundreds of
+    // MiB, so an entry count says nothing about memory used. 0 disables it.
+    uint64_t ram_bytes_max = 1024ull * 1024ull * 1024ull;
     // Minimum access count before an expert is eligible for pinning in RAM.
     uint32_t ram_pin_threshold = 4;
 

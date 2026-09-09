@@ -23,6 +23,14 @@ Console.WriteLine($"embedding tensor type: {meta.EmbeddingType}");
 Console.WriteLine($"metadata entries: {meta.KeyValueCount}");
 Console.WriteLine($"tensor count: {meta.TensorCount}");
 
+if (args.Contains("--kv"))
+{
+    foreach (var kvp in reader.RawKeyValues.OrderBy(k => k.Key))
+    {
+        Console.WriteLine($"  {kvp.Key} = {kvp.Value}");
+    }
+}
+
 if (showTensors)
 {
     var byType = meta.Tensors
@@ -32,8 +40,14 @@ if (showTensors)
     Console.WriteLine("tensors by type:");
     Console.WriteLine(string.Join(Environment.NewLine, byType));
 
-    Console.WriteLine("first 20 tensors:");
-    foreach (var t in meta.Tensors.Take(20))
+    // Optional substring filter after --tensors, so a specific layer or
+    // tensor family can be inspected without dumping hundreds of lines.
+    var idx = Array.IndexOf(args, "--tensors");
+    var filter = (idx >= 0 && idx + 1 < args.Length && !args[idx + 1].StartsWith("--"))
+        ? args[idx + 1] : null;
+    var shown = meta.Tensors.Where(t => filter is null || t.Name.Contains(filter));
+    Console.WriteLine(filter is null ? "first 20 tensors:" : $"tensors matching '{filter}':");
+    foreach (var t in (filter is null ? shown.Take(20) : shown))
     {
         Console.WriteLine($"  {t.Name} [{t.Type}] shape={string.Join('x', t.Shape)} offset={t.Offset}");
     }

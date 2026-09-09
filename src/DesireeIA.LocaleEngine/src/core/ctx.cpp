@@ -253,6 +253,32 @@ TierBudget plan_tier_budget(const desireeia_plan& plan, const ModelMeta& meta,
     return b;
 }
 
+// How many BYTES of raw quantized weights the tier may hold in RAM.
+//
+// This is the tier's real working set. An explicit ssd_tier_cache_mb wins;
+// otherwise it gets what the budget leaves for weights after the system and
+// runtime reserves, which is by construction the amount that can be held
+// without pushing the machine into paging.
+uint64_t tier_cache_bytes(const desireeia_plan& plan, const ModelMeta& meta,
+                          ModelReader* reader, const char* model_path, LogFn log) {
+    uint64_t bytes = plan.ssd_tier_cache_mb * kMiB;
+    if (bytes == 0) {
+        const TierBudget b = plan_tier_budget(plan, meta, reader, model_path);
+        bytes = b.weight_ceiling;
+    }
+    // Small enough and the tier re-reads the same layer every token, which is
+    // worse than not caching at all because it also pays the bookkeeping.
+    if (bytes < 64 * kMiB) bytes = 64 * kMiB;
+
+    if (log) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg), "ssd tier: raw weight cache %llu MiB",
+                      (unsigned long long) (bytes / kMiB));
+        log(5, msg);
+    }
+    return bytes;
+}
+
 // How many tensor slots the tier may hold in RAM.
 //
 // The tier's cache is counted in entries, not bytes, so the byte budget has
@@ -405,6 +431,7 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         hcfg.gguf_path = model_path ? model_path : "";
         hcfg.usage_file = ctx->st.usage_file;
         hcfg.ram_capacity = tier_cache_slots(ctx->st.plan, meta, reader, model_path, log);
+        hcfg.ram_bytes_max = tier_cache_bytes(ctx->st.plan, meta, reader, model_path, log);
         hcfg.prefetch_enabled = ctx->st.plan.expert_prefetch_enabled != 0;
         hcfg.prefetch_depth = ctx->st.plan.expert_prefetch_depth;
 
@@ -567,6 +594,8 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     std::vector<float> logits;
     if (!c->gf->step(*c->st.reader, tokens, n_tokens, logits)) {
         c->st.last_error = "dense forward: prefill failed";
+        if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
+        if (c->st.log) c->st.log(3, c->st.last_error.c_str());
         return false;
     }
     // La storia per le penalita' di ripetizione e' il prompt stesso: il
@@ -609,6 +638,8 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     std::vector<float> logits;
     if (!c->gf->step(*c->st.reader, &tk, 1, logits)) {
         c->st.last_error = "dense forward: decode failed";
+        if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
+        if (c->st.log) c->st.log(3, c->st.last_error.c_str());
         return false;
     }
     // `tk` (il token appena consumato) entra nella storia PRIMA di

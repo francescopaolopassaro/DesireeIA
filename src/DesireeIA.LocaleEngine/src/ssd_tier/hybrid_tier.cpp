@@ -440,8 +440,51 @@ bool HybridTier::read_tensor(const std::string& name, std::vector<float>& out) {
 bool HybridTier::read_tensor_raw(const std::string& name, std::vector<uint8_t>& raw,
                                   int& quant_type, uint64_t& ne0, uint64_t& rows) {
     std::lock_guard<std::mutex> lock(impl_->mtx);
+
+    auto it = impl_->raw_map.find(name);
+    if (it != impl_->raw_map.end()) {
+        impl_->raw_lru.splice(impl_->raw_lru.begin(), impl_->raw_lru, it->second);
+        it->second->hits++;
+        impl_->ram_hits++;
+        raw        = it->second->raw;
+        quant_type = it->second->quant_type;
+        ne0        = it->second->ne0;
+        rows       = it->second->rows;
+        return true;
+    }
+
+    impl_->ram_misses++;
+    impl_->tensor_usage[name]++;
+
     if (!impl_->gguf_opened) return false;
-    return impl_->read_tensor_raw_from_ssd(name, raw, quant_type, ne0, rows);
+    if (!impl_->read_tensor_raw_from_ssd(name, raw, quant_type, ne0, rows)) return false;
+
+    const uint64_t budget = impl_->config.ram_bytes_max;
+    const uint64_t size   = raw.size();
+
+    // A tensor that cannot fit the budget on its own is served but not
+    // cached: admitting it would evict everything else to hold something
+    // that will itself be evicted by the next read.
+    if (budget == 0 || size > budget) return true;
+
+    while (impl_->raw_bytes + size > budget) {
+        if (!impl_->evict_raw()) break;
+    }
+    if (impl_->raw_bytes + size > budget) return true;   // All pinned.
+
+    Impl::RawEntry entry;
+    entry.name       = name;
+    entry.raw        = raw;
+    entry.quant_type = quant_type;
+    entry.ne0        = ne0;
+    entry.rows       = rows;
+    entry.hits       = 1;
+    entry.pinned     = (impl_->tensor_usage[name] >= impl_->config.ram_pin_threshold);
+
+    impl_->raw_bytes += size;
+    impl_->raw_lru.push_front(std::move(entry));
+    impl_->raw_map[name] = impl_->raw_lru.begin();
+    return true;
 }
 
 bool HybridTier::write_tensor(const std::string& name, const std::vector<float>& data) {
