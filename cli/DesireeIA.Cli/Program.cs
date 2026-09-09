@@ -66,7 +66,7 @@ try
         "info" => CmdInfo(rest),
         "tokenize" => CmdTokenize(rest),
         "embed" => CmdEmbed(rest),
-        "generate" => CmdGenerate(rest),
+        "generate" => await CmdGenerate(rest),
         "bench" => CmdBench(rest),
         "chat" => CmdChat(rest),
         "hw" => CmdHw(),
@@ -105,11 +105,19 @@ static void PrintUsage()
           desireeia-cli generate <modello.gguf> "<testo>" [--max-tokens N] [--chat]
                      [--temp T] [--top-k K] [--top-p P]
                      [--repeat-penalty R] [--repeat-last-n N] [--seed S]
+                     [--stop "<s>"]...  (ripetibile: ferma la generazione alla prima occorrenza,
+                                         esclusa dall'output - vedi GenerateOptions.StopSequences)
+                     [--json [--schema "<json-schema>"]]  (best-effort: istruisce il modello a
+                                         rispondere solo con JSON e ne estrae il blocco valido;
+                                         non e' grammar-constrained decoding)
           desireeia-cli bench <modello.gguf> [--tokens N] [--warmup N] [--prompt "<testo>"] [--threads N]
           desireeia-cli chat <modello.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]
 
         Chat session:
           desireeia-cli chat <modello.gguf>  (interactive multi-turn conversation)
+          /image <path>   load image file and inject into context (base64)
+          /save <path>    save last assistant response to file
+          /saveb64 <path> decode last base64 block and save as binary file
 
         Campionamento: senza --temp la generazione e' greedy (deterministica).
         --temp 0.8 --repeat-penalty 1.1 e' un punto di partenza ragionevole;
@@ -227,23 +235,28 @@ static int CmdEmbed(string[] rest)
     return 0;
 }
 
-static int CmdGenerate(string[] rest)
+static async Task<int> CmdGenerate(string[] rest)
 {
     if (rest.Length < 2)
     {
-        Console.Error.WriteLine("uso: desireeia-cli generate <modello.gguf> \"<testo>\" [--max-tokens N] [--chat]");
+        Console.Error.WriteLine("uso: desireeia-cli generate <modello.gguf> \"<testo>\" [--max-tokens N] [--chat] " +
+                                 "[--stop <s>]... [--json [--schema <json-schema>]]");
         return 1;
     }
 
     var maxTokens = GetIntOption(rest, "--max-tokens", 32);
     var useChat = HasFlag(rest, "--chat");
+    var stopSequences = GetStringListOption(rest, "--stop");
+    var jsonMode = HasFlag(rest, "--json");
+    var jsonSchema = GetStringOption(rest, "--schema", null);
     var (model, _) = Open(rest[0]);
     using (model)
     {
         ApplySamplingOptions(model, rest);
+        var userText = jsonMode ? rest[1] + "\n\n" + StructuredOutput.BuildJsonInstruction(jsonSchema) : rest[1];
         var promptText = useChat
-            ? model.ApplyChatTemplate(new[] { ("user", rest[1]) })
-            : rest[1];
+            ? model.ApplyChatTemplate(new[] { ("user", userText) })
+            : userText;
         var ids = model.Tokenize(promptText);
         if (ids is null || ids.Length == 0)
         {
@@ -252,23 +265,25 @@ static int CmdGenerate(string[] rest)
         }
 
         Console.Write(rest[1]);
-        var next = model.Predict(ids);
-        bool stopped = model.IsEndOfGeneration(next);
-        if (!stopped)
+        var options = new GenerateOptions { MaxTokens = maxTokens, StopSequences = stopSequences };
+        var sb = new System.Text.StringBuilder();
+        await foreach (var piece in model.StreamAsync(ids, options))
         {
-            Console.Write(model.TokenPiece(next) ?? "");
-            for (int i = 1; i < maxTokens; i++)
-            {
-                next = model.NextToken();
-                if (model.IsEndOfGeneration(next)) { stopped = true; break; }
-                Console.Write(model.TokenPiece(next) ?? "");
-            }
+            Console.Write(piece);
+            sb.Append(piece);
         }
         Console.WriteLine();
         Console.WriteLine();
-        if (!stopped)
+        if (stopSequences is { Count: > 0 })
         {
-            Console.WriteLine($"[generazione fermata da --max-tokens ({maxTokens}), non da un token di fine]");
+            Console.WriteLine($"[stop sequences attive: {string.Join(", ", stopSequences.Select(s => $"\"{s}\""))} - non incluse nell'output se raggiunte]");
+        }
+        if (jsonMode)
+        {
+            var extracted = StructuredOutput.TryExtractJson(sb.ToString());
+            Console.WriteLine(extracted is not null
+                ? $"[json mode: blocco JSON estratto correttamente ({extracted.Length} caratteri)]"
+                : "[json mode: NESSUN blocco JSON valido trovato nella risposta - il modello non ha seguito l'istruzione]");
         }
         var s = model.GetSampling();
         Console.WriteLine(s.Temperature > 0
@@ -353,14 +368,29 @@ static int CmdChat(string[] rest)
         var hasSystem = !string.IsNullOrEmpty(systemPrompt);
 
         var history = new List<(string Role, string Content)>();
+        var lastAssistantResponse = "";
         if (hasSystem)
         {
             history.Add(("system", systemPrompt));
         }
 
         Console.WriteLine();
-        Console.WriteLine("Chat started. Type /exit to quit, /clear to reset conversation.");
+        Console.WriteLine("Chat started. Commands:");
+        Console.WriteLine("  /exit, /quit   - quit chat");
+        Console.WriteLine("  /clear         - reset conversation");
+        Console.WriteLine("  /image <path> [question] - attach an image to the next reply");
+        Console.WriteLine("                  (encoded via the model's vision encoder when");
+        Console.WriteLine("                  available, base64 text otherwise)");
+        Console.WriteLine("  /save <path>   - save last assistant response to file");
+        Console.WriteLine("  /saveb64 <path>- decode last base64 block and save as binary file");
         Console.WriteLine();
+
+        // Multimodal state: set by /image for vision models, consumed by the
+        // next turn (PredictWithImage). Cleared after the turn completes so
+        // later turns never re-tokenize dangling placeholders.
+        float[]? pendingVisionEmbd = null;
+        string pendingImageText = "";
+        int pendingVisionIndex = -1;
 
         while (true)
         {
@@ -380,8 +410,150 @@ static int CmdChat(string[] rest)
                 Console.WriteLine();
                 continue;
             }
+            if (cmd.StartsWith("/image "))
+            {
+                var rest2 = input.Substring(7).Trim();
+                var sp = rest2.IndexOfAny(new[] { ' ', '\t' });
+                var imgPath = sp < 0 ? rest2 : rest2.Substring(0, sp);
+                var question = sp < 0 ? "" : rest2.Substring(sp + 1).Trim();
 
-            history.Add(("user", input));
+                if (model.HasVision)
+                {
+                    // Real multimodal path: encode the image through the
+                    // model's vision encoder and inject the embeddings at the
+                    // placeholder tokens. history gets a message made of
+                    // "<image>" repeated once per vision embedding; the turn
+                    // block that follows will call PredictWithImage.
+                    try
+                    {
+                        using var img = LocalModel.LoadImage(imgPath, 3);
+                        var embd = model.EncodeImage(img, out var embdDim);
+                        if (embd is null || embd.Length == 0)
+                        {
+                            Console.Error.WriteLine("[vision encode failed: no encoder or empty output]");
+                        }
+                        else
+                        {
+                            var nTok = Math.Max(model.VisionTokenCount, 1);
+                            var userMsg = string.Concat(Enumerable.Repeat("<image>", nTok));
+                            if (question.Length > 0) userMsg += "\n" + question;
+                            history.Add(("user", userMsg));
+
+                            pendingVisionEmbd = embd;
+                            pendingImageText = question;
+                            pendingVisionIndex = history.Count - 1;
+
+                            Console.WriteLine($"[image {Path.GetFileName(imgPath)} encoded -> {nTok} vision tokens x {embdDim} dims]");
+                            // Fall through: this turn is the image turn.
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.Error.WriteLine($"[error encoding image: {ex.Message}]");
+                    }
+                    if (pendingVisionEmbd is null)
+                    {
+                        Console.WriteLine();
+                        continue;
+                    }
+                }
+                else
+                {
+                    if (!File.Exists(imgPath))
+                    {
+                        Console.Error.WriteLine($"[error: file not found: {imgPath}]");
+                        Console.WriteLine();
+                        continue;
+                    }
+                    var imgBytes = File.ReadAllBytes(imgPath);
+                    var b64 = Convert.ToBase64String(imgBytes);
+                    var ext = Path.GetExtension(imgPath).ToLowerInvariant();
+                    var mime = ext switch
+                    {
+                        ".png"  => "image/png",
+                        ".jpg"  => "image/jpeg",
+                        ".jpeg" => "image/jpeg",
+                        ".gif"  => "image/gif",
+                        ".bmp"  => "image/bmp",
+                        ".webp" => "image/webp",
+                        _       => "application/octet-stream"
+                    };
+                    var imgMsg = $"[image file: {Path.GetFileName(imgPath)}, {imgBytes.Length} bytes, {mime}]\n[base64: {b64}]";
+                    if (question.Length > 0) imgMsg += "\n" + question;
+                    history.Add(("user", imgMsg));
+                    Console.WriteLine($"[loaded {Path.GetFileName(imgPath)}: {imgBytes.Length} bytes, {b64.Length} chars base64]");
+                    Console.WriteLine();
+                    continue;
+                }
+            }
+            if (cmd.StartsWith("/save "))
+            {
+                var savePath = input.Substring(6).Trim();
+                if (string.IsNullOrEmpty(savePath))
+                {
+                    Console.WriteLine("[usage: /save <path>]");
+                }
+                else if (string.IsNullOrEmpty(lastAssistantResponse))
+                {
+                    Console.WriteLine("[no assistant response to save]");
+                }
+                else
+                {
+                    try
+                    {
+                        File.WriteAllText(savePath, lastAssistantResponse);
+                        Console.WriteLine($"[saved {lastAssistantResponse.Length} chars to {savePath}]");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[error saving file: {ex.Message}]");
+                    }
+                }
+                Console.WriteLine();
+                continue;
+            }
+            if (cmd.StartsWith("/saveb64 "))
+            {
+                var savePath = input.Substring(9).Trim();
+                if (string.IsNullOrEmpty(savePath))
+                {
+                    Console.WriteLine("[usage: /saveb64 <path>]");
+                }
+                else if (string.IsNullOrEmpty(lastAssistantResponse))
+                {
+                    Console.WriteLine("[no assistant response to decode]");
+                }
+                else
+                {
+                    try
+                    {
+                        var b64Start = lastAssistantResponse.LastIndexOf("base64: ");
+                        if (b64Start < 0)
+                        {
+                            Console.WriteLine("[no base64 block found in last response]");
+                        }
+                        else
+                        {
+                            b64Start += 8;
+                            var b64End = lastAssistantResponse.IndexOf(']', b64Start);
+                            if (b64End < 0) b64End = lastAssistantResponse.Length;
+                            var b64Data = lastAssistantResponse.Substring(b64Start, b64End - b64Start).Trim();
+                            var bytes = Convert.FromBase64String(b64Data);
+                            File.WriteAllBytes(savePath, bytes);
+                            Console.WriteLine($"[saved {bytes.Length} bytes to {savePath}]");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[error saving file: {ex.Message}]");
+                    }
+                }
+                Console.WriteLine();
+                continue;
+            }
+
+            bool imageTurn = pendingVisionEmbd != null;
+            if (!imageTurn) history.Add(("user", input));
 
             var messages = history.ToList();
             var promptText = model.ApplyChatTemplate(messages, addAssistant: true);
@@ -399,14 +571,32 @@ static int CmdChat(string[] rest)
             if (ids is null || ids.Length == 0)
             {
                 Console.Error.WriteLine("tokenization failed.");
-                history.RemoveAt(history.Count - 1);
+                if (imageTurn && pendingVisionIndex >= 0) history.RemoveAt(pendingVisionIndex);
+                else history.RemoveAt(history.Count - 1);
+                pendingVisionEmbd = null;
+                pendingVisionIndex = -1;
                 Console.WriteLine();
                 continue;
             }
 
             Console.Write("assistant> ");
             var sb = new System.Text.StringBuilder();
-            var next = model.Predict(ids);
+            int next;
+            try
+            {
+                next = imageTurn
+                    ? model.PredictWithImage(ids, pendingVisionEmbd!, imageToken: -1)
+                    : model.Predict(ids);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[error: {ex.Message}]");
+                if (pendingVisionIndex >= 0) history.RemoveAt(pendingVisionIndex);
+                pendingVisionEmbd = null;
+                pendingVisionIndex = -1;
+                Console.WriteLine();
+                continue;
+            }
             var stopped = model.IsEndOfGeneration(next);
             if (!stopped)
             {
@@ -425,7 +615,22 @@ static int CmdChat(string[] rest)
             Console.WriteLine();
             Console.WriteLine();
 
-            history.Add(("assistant", sb.ToString()));
+            lastAssistantResponse = sb.ToString();
+            history.Add(("assistant", lastAssistantResponse));
+
+            // Multimodal cleanup: replace the "<image>..." placeholder message
+            // with a short text remnant so subsequent turns never re-tokenize
+            // dangling placeholders without their embeddings, and clear the
+            // pending vision state.
+            if (imageTurn && pendingVisionIndex >= 0)
+            {
+                pendingVisionEmbd = null;
+                var remnant = "[image attached]";
+                if (pendingImageText.Length > 0) remnant += " " + pendingImageText;
+                history[pendingVisionIndex] = ("user", remnant);
+                pendingVisionIndex = -1;
+                pendingImageText = "";
+            }
         }
     }
     return 0;
@@ -479,3 +684,18 @@ static string? GetStringOption(string[] args, string name, string? def)
 }
 
 static bool HasFlag(string[] args, string name) => Array.IndexOf(args, name) >= 0;
+
+// Raccoglie TUTTE le occorrenze di un'opzione ripetibile (es. piu' --stop),
+// a differenza di GetStringOption che si ferma alla prima. Null se assente.
+static List<string>? GetStringListOption(string[] args, string name)
+{
+    List<string>? result = null;
+    for (int i = 0; i < args.Length - 1; i++)
+    {
+        if (args[i] == name)
+        {
+            (result ??= new List<string>()).Add(args[i + 1]);
+        }
+    }
+    return result;
+}

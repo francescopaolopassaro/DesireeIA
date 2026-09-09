@@ -90,12 +90,12 @@ clean: CMakeFiles/desireeia_kernel_bench.dir/clean
 CMakeFiles/DesireeIALocaleEngine.dir/all:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29 "Built target DesireeIALocaleEngine"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32 "Built target DesireeIALocaleEngine"
 .PHONY : CMakeFiles/DesireeIALocaleEngine.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/DesireeIALocaleEngine.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 29
+	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 32
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 CMakeFiles/DesireeIALocaleEngine.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 0
 .PHONY : CMakeFiles/DesireeIALocaleEngine.dir/rule
@@ -107,7 +107,7 @@ DesireeIALocaleEngine: CMakeFiles/DesireeIALocaleEngine.dir/rule
 # codegen rule for target.
 CMakeFiles/DesireeIALocaleEngine.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29 "Finished codegen for target DesireeIALocaleEngine"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32 "Finished codegen for target DesireeIALocaleEngine"
 .PHONY : CMakeFiles/DesireeIALocaleEngine.dir/codegen
 
 # clean rule for target.
@@ -122,12 +122,12 @@ CMakeFiles/DesireeIALocaleEngine.dir/clean:
 CMakeFiles/desireeia_selftest.dir/all: CMakeFiles/DesireeIALocaleEngine.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_selftest.dir\build.make CMakeFiles/desireeia_selftest.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_selftest.dir\build.make CMakeFiles/desireeia_selftest.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=32,33 "Built target desireeia_selftest"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=35,36 "Built target desireeia_selftest"
 .PHONY : CMakeFiles/desireeia_selftest.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/desireeia_selftest.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 31
+	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 34
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 CMakeFiles/desireeia_selftest.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 0
 .PHONY : CMakeFiles/desireeia_selftest.dir/rule
@@ -139,7 +139,7 @@ desireeia_selftest: CMakeFiles/desireeia_selftest.dir/rule
 # codegen rule for target.
 CMakeFiles/desireeia_selftest.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_selftest.dir\build.make CMakeFiles/desireeia_selftest.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=32,33 "Finished codegen for target desireeia_selftest"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=35,36 "Finished codegen for target desireeia_selftest"
 .PHONY : CMakeFiles/desireeia_selftest.dir/codegen
 
 # clean rule for target.
@@ -154,12 +154,12 @@ CMakeFiles/desireeia_selftest.dir/clean:
 CMakeFiles/desireeia_kernel_bench.dir/all: CMakeFiles/DesireeIALocaleEngine.dir/all
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_kernel_bench.dir\build.make CMakeFiles/desireeia_kernel_bench.dir/depend
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_kernel_bench.dir\build.make CMakeFiles/desireeia_kernel_bench.dir/build
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=30,31 "Built target desireeia_kernel_bench"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=33,34 "Built target desireeia_kernel_bench"
 .PHONY : CMakeFiles/desireeia_kernel_bench.dir/all
 
 # Build rule for subdir invocation for target.
 CMakeFiles/desireeia_kernel_bench.dir/rule: cmake_check_build_system
-	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 31
+	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 34
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 CMakeFiles/desireeia_kernel_bench.dir/all
 	$(CMAKE_COMMAND) -E cmake_progress_start C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles 0
 .PHONY : CMakeFiles/desireeia_kernel_bench.dir/rule
@@ -171,7 +171,7 @@ desireeia_kernel_bench: CMakeFiles/desireeia_kernel_bench.dir/rule
 # codegen rule for target.
 CMakeFiles/desireeia_kernel_bench.dir/codegen:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_kernel_bench.dir\build.make CMakeFiles/desireeia_kernel_bench.dir/codegen
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=30,31 "Finished codegen for target desireeia_kernel_bench"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=33,34 "Finished codegen for target desireeia_kernel_bench"
 .PHONY : CMakeFiles/desireeia_kernel_bench.dir/codegen
 
 # clean rule for target.

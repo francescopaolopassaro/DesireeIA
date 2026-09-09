@@ -260,6 +260,20 @@ public:
     void truncate_cache(size_t new_cols) { if (new_cols <= cache_cols_) cache_cols_ = new_cols; }
     size_t cache_len() const { return cache_cols_; }
 
+    // Vision/multimodal support: overrides the embedding lookup for one
+    // special token (the image placeholder). When step() encounters a token
+    // equal to image_token, it consumes the next `embd_dim` floats from
+    // embds instead of reading the model's own embedding row. The caller is
+    // responsible for placing image_token in the token stream once per
+    // vision embedding vector (consecutive or not — each occurrence
+    // consumes one vector, in order).
+    // Call with an empty embds to clear any previous override.
+    void set_embedding_override(const std::vector<float>& embds, int32_t image_token) {
+        embd_override_ = embds;
+        embd_override_token_ = image_token;
+        embd_override_cursor_ = 0;
+    }
+
     // Bytes used by the resident K/V cache (tokens already processed, not
     // allocated capacity): used by engine_context_size.
     uint64_t kv_bytes() const override {
@@ -409,6 +423,14 @@ private:
     // Bytes one kv-head's quantized row occupies (kv_quant_row_bytes(head_dim)),
     // cached at open() time so the hot path never recomputes it.
     size_t kv_q_row_bytes_ = 0;
+
+    // Vision/multimodal: embedding override installed by
+    // set_embedding_override(). When a token equal to embd_override_token_
+    // is embedded, the cursor advances by n_embd and its floats are used
+    // verbatim (never fetched from tok_embd_). Empty override = feature off.
+    std::vector<float> embd_override_;
+    int32_t embd_override_token_ = -1;
+    size_t embd_override_cursor_ = 0;
 };
 
 }

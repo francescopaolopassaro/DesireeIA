@@ -17,6 +17,8 @@ public:
     bool load(const VocabData& vocab);
     std::vector<int32_t> encode(const std::string& text, bool add_bos) const;
     bool piece(int32_t id, std::string& out) const;
+    // Exact token lookup (raw piece bytes, e.g. "<image>"), -1 if absent.
+    int32_t token_to_id(const std::string& piece) const;
     bool ready() const { return kind_ != TokenizerKind::Unknown; }
 
 private:

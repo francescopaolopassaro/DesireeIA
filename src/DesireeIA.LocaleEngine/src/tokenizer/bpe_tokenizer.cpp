@@ -213,6 +213,14 @@ bool BpeTokenizer::load(const VocabData& vocab) {
     return true;
 }
 
+int32_t BpeTokenizer::token_to_id(const std::string& piece) const {
+    for (const auto& st : special_tokens_) {
+        if (st.first == piece) return st.second;
+    }
+    auto it = piece_to_id_.find(piece);
+    return it == piece_to_id_.end() ? -1 : it->second;
+}
+
 bool BpeTokenizer::piece(int32_t id, std::string& out) const {
     if (id < 0 || (size_t) id >= id_to_piece_.size()) return false;
     // Detokenizzazione: inversa della mappa byte->unicode "visibile" di

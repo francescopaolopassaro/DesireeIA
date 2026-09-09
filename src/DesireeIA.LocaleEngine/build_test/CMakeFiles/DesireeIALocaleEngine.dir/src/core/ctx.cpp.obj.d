@@ -233,6 +233,10 @@ CMakeFiles/DesireeIALocaleEngine.dir/src/core/ctx.cpp.obj: \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/forward_iface.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/ssm_forward.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/bert_forward.h \
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_gguf.h \
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_clip.h \
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_image.h \
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_image.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/tokenizer/tokenizer.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/tokenizer/spm_tokenizer.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/tokenizer/bpe_tokenizer.h \

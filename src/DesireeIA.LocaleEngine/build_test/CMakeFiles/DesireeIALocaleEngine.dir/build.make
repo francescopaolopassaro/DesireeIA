@@ -491,6 +491,51 @@ CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.s"
 	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\ssd_tier\hybrid_tier.cpp -o CMakeFiles\DesireeIALocaleEngine.dir\src\ssd_tier\hybrid_tier.cpp.s
 
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/flags.make
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/includes_CXX.rsp
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj: C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_image.cpp
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=$(CMAKE_PROGRESS_29) "Building CXX object CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj -MF CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_image.cpp.obj.d -o CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_image.cpp.obj -c C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_image.cpp
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.i"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_image.cpp > CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_image.cpp.i
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.s"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_image.cpp -o CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_image.cpp.s
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/flags.make
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/includes_CXX.rsp
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj: C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_clip.cpp
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=$(CMAKE_PROGRESS_30) "Building CXX object CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj -MF CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_clip.cpp.obj.d -o CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_clip.cpp.obj -c C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_clip.cpp
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.i"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_clip.cpp > CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_clip.cpp.i
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.s"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_clip.cpp -o CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_clip.cpp.s
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/flags.make
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/includes_CXX.rsp
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj: C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_gguf.cpp
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj: CMakeFiles/DesireeIALocaleEngine.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=$(CMAKE_PROGRESS_31) "Building CXX object CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj -MF CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_gguf.cpp.obj.d -o CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_gguf.cpp.obj -c C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_gguf.cpp
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.i"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_gguf.cpp > CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_gguf.cpp.i
+
+CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.s"
+	C:\Users\fpassaro\AppData\Local\Microsoft\WinGet\Packages\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\mingw64\bin\c++.exe $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision\vision_gguf.cpp -o CMakeFiles\DesireeIALocaleEngine.dir\src\vision\vision_gguf.cpp.s
+
 # Object files for target DesireeIALocaleEngine
 DesireeIALocaleEngine_OBJECTS = \
 "CMakeFiles/DesireeIALocaleEngine.dir/src/abi.cpp.obj" \
@@ -520,7 +565,10 @@ DesireeIALocaleEngine_OBJECTS = \
 "CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/ssd_tier.cpp.obj" \
 "CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/mirror_manager.cpp.obj" \
 "CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/tiered_expert_store.cpp.obj" \
-"CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.obj"
+"CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.obj" \
+"CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj" \
+"CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj" \
+"CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj"
 
 # External object files for target DesireeIALocaleEngine
 DesireeIALocaleEngine_EXTERNAL_OBJECTS =
@@ -553,11 +601,14 @@ DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/ssd
 DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/mirror_manager.cpp.obj
 DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/tiered_expert_store.cpp.obj
 DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.obj
+DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj
+DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj
+DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj
 DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/build.make
 DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/linkLibs.rsp
 DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/objects1.rsp
 DesireeIALocaleEngine.dll: CMakeFiles/DesireeIALocaleEngine.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=$(CMAKE_PROGRESS_29) "Linking CXX shared library DesireeIALocaleEngine.dll"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\build_test\CMakeFiles --progress-num=$(CMAKE_PROGRESS_32) "Linking CXX shared library DesireeIALocaleEngine.dll"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles\DesireeIALocaleEngine.dir\link.txt --verbose=$(VERBOSE)
 	"C:\Program Files\CMake\bin\cmake.exe" -E copy_if_different C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/libstdc++-6.dll C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/libgcc_s_seh-1.dll C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/libwinpthread-1.dll C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/build_test
 

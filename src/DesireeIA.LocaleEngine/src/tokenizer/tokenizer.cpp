@@ -32,4 +32,12 @@ bool Tokenizer::piece(int32_t id, std::string& out) const {
     }
 }
 
+int32_t Tokenizer::token_to_id(const std::string& piece) const {
+    switch (kind_) {
+        case TokenizerKind::SpmUnigram: return spm_.token_to_id(piece);
+        case TokenizerKind::Bpe:        return bpe_.token_to_id(piece);
+        default:                        return -1;
+    }
+}
+
 }

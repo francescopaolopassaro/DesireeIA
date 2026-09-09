@@ -1,4 +1,5 @@
-﻿using System.Runtime.InteropServices;
+﻿using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using DesireeIA.Native;
 
 namespace DesireeIA;
@@ -324,6 +325,278 @@ public sealed class LocalModel : IDisposable
             PenaltyLastN     = n.PenaltyLastN,
             Seed             = n.Seed
         };
+    }
+
+    // ============================================================
+    // Streaming generation (async, con stop sequences)
+    // ============================================================
+
+    /// <summary>
+    /// Genera in streaming a partire da un prompt gia' tokenizzato,
+    /// restituendo i pezzi di testo non appena decodificati e fermandosi a
+    /// EOS/end-of-turn, al limite <see cref="GenerateOptions.MaxTokens"/>, o
+    /// alla prima occorrenza di una delle <see cref="GenerateOptions.StopSequences"/>
+    /// (che non viene incluse nell'output, come nelle API stile Ollama/OpenAI).
+    /// Le chiamate al motore nativo sono sincrone (un mutex per ctx le
+    /// serializza comunque): lo await Task.Yield() fra un token e il
+    /// successivo serve a lasciare il chiamante libero di intercalare altro
+    /// lavoro asincrono e osservare la cancellazione token per token, non a
+    /// far girare l'inferenza su un altro thread.
+    /// </summary>
+    public async IAsyncEnumerable<string> StreamAsync(int[] promptTokens, GenerateOptions? options = null,
+        [EnumeratorCancellation] CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        options ??= new GenerateOptions();
+        var scanner = new StopSequenceScanner(options.StopSequences);
+
+        var token = Predict(promptTokens);
+        for (int i = 0; i < options.MaxTokens; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (IsEndOfGeneration(token)) break;
+
+            var piece = TokenPiece(token) ?? "";
+            var (emit, stopped) = scanner.Feed(piece);
+            if (emit.Length > 0) yield return emit;
+            if (stopped) yield break;
+
+            await Task.Yield();
+            token = NextToken();
+        }
+
+        var tail = scanner.Flush();
+        if (tail.Length > 0) yield return tail;
+    }
+
+    /// <summary>
+    /// Come <see cref="StreamAsync"/> ma a partire da una conversazione
+    /// (role, content): applica il chat template del modello e tokenizza il
+    /// prompt risultante prima di generare.
+    /// </summary>
+    public IAsyncEnumerable<string> ChatStreamAsync(IReadOnlyList<(string Role, string Content)> messages,
+        GenerateOptions? options = null, bool addAssistant = true, CancellationToken ct = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var prompt = ApplyChatTemplate(messages, addAssistant);
+        var ids = Tokenize(prompt, addBos: true)
+            ?? throw new InvalidOperationException("Model has no recognized tokenizer");
+        return StreamAsync(ids, options, ct);
+    }
+
+    // ============================================================
+    // Vision Module - Image/Video/File Stream Support
+    // ============================================================
+
+    /// <summary>
+    /// Load an image from disk. Supports PNG, JPEG, BMP formats.
+    /// The caller must free the returned image with FreeImage() when done.
+    /// </summary>
+    public static VisionImageWrapper LoadImage(string path, int expectedChannels = 3)
+    {
+        var err = NativeMethods.desireeia_load_image(path, expectedChannels, out var img);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Failed to load image: {err}");
+        }
+        return new VisionImageWrapper(img);
+    }
+
+    /// <summary>
+    /// True se il modello caricato ha un encoder visivo (vision) integrato
+    /// nel GGUF (codec CLIP/SigLIP con clip.vision.*).
+    /// </summary>
+    public bool HasVision
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var err = NativeMethods.desireeia_has_vision(_context, out var has);
+            if (err != NativeMethods.Error.Ok) return false;
+            return has != 0;
+        }
+    }
+
+    /// <summary>
+    /// Encode an image into embedding vectors using the model's own vision
+    /// encoder. Returns null if the model has no vision encoder.
+    /// </summary>
+    public float[]? EncodeImage(VisionImageWrapper image, out uint embeddingDim)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        embeddingDim = 0;
+
+        var img = image.GetNative();
+        var err = NativeMethods.desireeia_vision_encode_ctx(_context, in img,
+            null, 0, out var len, out embeddingDim);
+        if (err == NativeMethods.Error.NotSupported) return null;
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Vision encode failed: {err}");
+        }
+
+        var embd = new float[len];
+        if (len > 0)
+        {
+            err = NativeMethods.desireeia_vision_encode_ctx(_context, in img,
+                embd, (nuint)embd.Length, out _, out embeddingDim);
+            if (err != NativeMethods.Error.Ok)
+            {
+                throw new InvalidOperationException($"Vision encode failed: {err}");
+            }
+        }
+        return embd;
+    }
+
+    /// <summary>Numero di vector di embedding visivo per immagine.</summary>
+    public int VisionTokenCount
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var err = NativeMethods.desireeia_vision_token_count(_context, out var n);
+            if (err != NativeMethods.Error.Ok) return 0;
+            return n;
+        }
+    }
+
+    /// <summary>Id del token placeholder immagine, o null se non risolvibile.</summary>
+    public int? VisionImageToken
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var err = NativeMethods.desireeia_vision_image_token(_context, out var id);
+            if (err != NativeMethods.Error.Ok || id < 0) return null;
+            return id;
+        }
+    }
+
+    /// <summary>
+    /// Prefill multimodale: identico a <see cref="Predict"/> ma il flusso
+    /// token deve contenere <see cref="VisionTokenCount"/> occorrenze del
+    /// token placeholder, e <paramref name="embd"/> deve essere il risultato
+    /// di <see cref="EncodeImage"/> (le embeddings visive, in ordine).
+    /// Passare imageToken = -1 per usare il placeholder auto-risolto.
+    /// </summary>
+    public int PredictWithImage(int[] tokens, float[] embd, int imageToken = -1)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!HasVision) throw new InvalidOperationException("Model has no vision encoder");
+        var err = NativeMethods.desireeia_predict_image(_context, tokens,
+            (nuint)tokens.Length, embd, (nuint)embd.Length, imageToken, out var token);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"PredictWithImage failed: {err}");
+        }
+        return token;
+    }
+
+    /// <summary>
+    /// Preprocess an image for vision encoder: resize to target_size,
+    /// normalize to [0,1], convert to RGB. Returns flat CHW array.
+    /// </summary>
+    public static float[] PreprocessImage(VisionImageWrapper image, int targetSize)
+    {
+        var img = image.GetNative();
+        var err = NativeMethods.desireeia_vision_preprocess(in img, targetSize,
+            null, 0, out var len);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Vision preprocess failed: {err}");
+        }
+
+        var pixels = new float[len];
+        if (len > 0)
+        {
+            err = NativeMethods.desireeia_vision_preprocess(in img, targetSize,
+                pixels, (nuint)pixels.Length, out _);
+            if (err != NativeMethods.Error.Ok)
+            {
+                throw new InvalidOperationException($"Vision preprocess failed: {err}");
+            }
+        }
+        return pixels;
+    }
+
+    /// <summary>
+    /// Create a message with image data for multimodal models.
+    /// The image is encoded as base64 and injected into the content.
+    /// This works with models that accept image tokens in the chat template.
+    /// </summary>
+    public static string CreateImageMessage(string role, VisionImageWrapper image,
+                                            string? textContent = null)
+    {
+        var img = image.GetNative();
+        var bytes = new byte[img.Width * img.Height * img.Channels];
+        if (img.Data != IntPtr.Zero && bytes.Length > 0)
+        {
+            System.Runtime.InteropServices.Marshal.Copy(img.Data, bytes, 0, bytes.Length);
+        }
+        var b64 = Convert.ToBase64String(bytes);
+        var ext = img.Channels == 4 ? "rgba" : "rgb";
+        var content = $"[image:{img.Width}x{img.Height}@{ext}:{b64}]";
+        if (!string.IsNullOrEmpty(textContent))
+        {
+            content += "\n" + textContent;
+        }
+        return content;
+    }
+
+    /// <summary>
+    /// Check if the last assistant response contains generated image data.
+    /// Returns the image bytes if found, null otherwise.
+    /// </summary>
+    public static byte[]? ExtractGeneratedImage(string response)
+    {
+        // Look for base64-encoded image data in the response
+        var b64Start = response.IndexOf("[generated_image:");
+        if (b64Start < 0) return null;
+        b64Start = response.IndexOf(':', b64Start) + 1;
+        var b64End = response.IndexOf(']', b64Start);
+        if (b64End < 0) return null;
+        var b64 = response.Substring(b64Start, b64End - b64Start);
+        return Convert.FromBase64String(b64);
+    }
+
+    /// <summary>
+    /// Check if the last assistant response contains generated file data.
+    /// Returns the file bytes and filename if found, null otherwise.
+    /// </summary>
+    public static (byte[] Data, string Filename)? ExtractGeneratedFile(string response)
+    {
+        var marker = "[generated_file:";
+        var b64Start = response.IndexOf(marker);
+        if (b64Start < 0) return null;
+        b64Start += marker.Length;
+        var colonPos = response.IndexOf(':', b64Start);
+        if (colonPos < 0) return null;
+        var filename = response.Substring(b64Start, colonPos - b64Start);
+        b64Start = colonPos + 1;
+        var b64End = response.IndexOf(']', b64Start);
+        if (b64End < 0) return null;
+        var b64 = response.Substring(b64Start, b64End - b64Start);
+        return (Convert.FromBase64String(b64), filename);
+    }
+
+    /// <summary>
+    /// Check if the last assistant response contains generated video data.
+    /// Returns the video bytes and format if found, null otherwise.
+    /// </summary>
+    public static (byte[] Data, string Format)? ExtractGeneratedVideo(string response)
+    {
+        var marker = "[generated_video:";
+        var b64Start = response.IndexOf(marker);
+        if (b64Start < 0) return null;
+        b64Start += marker.Length;
+        var colonPos = response.IndexOf(':', b64Start);
+        if (colonPos < 0) return null;
+        var format = response.Substring(b64Start, colonPos - b64Start);
+        b64Start = colonPos + 1;
+        var b64End = response.IndexOf(']', b64Start);
+        if (b64End < 0) return null;
+        var b64 = response.Substring(b64Start, b64End - b64Start);
+        return (Convert.FromBase64String(b64), format);
     }
 
     public void Dispose()

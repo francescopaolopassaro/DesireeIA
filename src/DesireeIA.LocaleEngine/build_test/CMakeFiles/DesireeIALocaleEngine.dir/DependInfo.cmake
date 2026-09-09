@@ -36,6 +36,9 @@ set(CMAKE_DEPENDS_DEPENDENCY_FILES
   "C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/tokenizer/bpe_tokenizer.cpp" "CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/bpe_tokenizer.cpp.obj" "gcc" "CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/bpe_tokenizer.cpp.obj.d"
   "C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/tokenizer/spm_tokenizer.cpp" "CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/spm_tokenizer.cpp.obj" "gcc" "CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/spm_tokenizer.cpp.obj.d"
   "C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/tokenizer/tokenizer.cpp" "CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/tokenizer.cpp.obj" "gcc" "CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/tokenizer.cpp.obj.d"
+  "C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_clip.cpp" "CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj" "gcc" "CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj.d"
+  "C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_gguf.cpp" "CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj" "gcc" "CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj.d"
+  "C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_image.cpp" "CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj" "gcc" "CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj.d"
   )
 
 # Targets to which this target links which contain Fortran sources.

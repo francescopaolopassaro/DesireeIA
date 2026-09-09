@@ -266,6 +266,131 @@ DESIREEIA_API desireeia_error desireeia_apply_chat_template(const desireeia_ctx*
 DESIREEIA_API void desireeia_profile_dump(char* out_buf, size_t buf_size);
 DESIREEIA_API void desireeia_profile_reset(void);
 
+/* ========================================================================
+ * DesireeAI Vision Module - Image processing and CLIP vision encoder
+ * ======================================================================== */
+
+/* Image representation: interleaved RGB/RGBA/grayscale pixel data.
+ * Pixel layout: data[y * width * channels + x * channels + c].
+ * Caller must free data pointer with desireeia_free_image(). */
+typedef struct DesireeAIImage {
+    uint32_t width;
+    uint32_t height;
+    uint32_t channels;  /* 1=grayscale, 3=RGB, 4=RGBA */
+    uint8_t* data;
+} DesireeAIImage;
+
+/* Vision encoder configuration, read from model metadata or set explicitly. */
+typedef struct DesireeAIVisionConfig {
+    int32_t embedding_dim;      /* Vision embedding dimension (e.g. 768, 1024) */
+    int32_t patch_size;         /* Patch size (e.g. 14, 16, 32) */
+    int32_t image_size;         /* Input image size (e.g. 224, 384) */
+    int32_t num_heads;          /* Number of attention heads */
+    int32_t num_layers;         /* Number of transformer layers */
+    int32_t projection_dim;     /* Output projection dimension */
+    int32_t has_encoder;        /* 1 if vision encoder is loaded, 0 otherwise */
+} DesireeAIVisionConfig;
+
+/* Vision context: holds the loaded CLIP vision encoder weights and state.
+ * Created by desireeia_vision_create(), destroyed by desireeia_vision_destroy(). */
+typedef struct DesireeAIVisionCtx DesireeAIVisionCtx;
+
+/* Load an image from disk. Supports PNG, JPEG, BMP via stb_image.
+ * Returns DESIREEIA_OK on success, caller must free with desireeia_free_image(). */
+DESIREEIA_API desireeia_error desireeia_load_image(const char* path,
+                                                   int32_t expected_channels,
+                                                   DesireeAIImage* out);
+
+/* Free image data allocated by desireeia_load_image(). */
+DESIREEIA_API void desireeia_free_image(DesireeAIImage* img);
+
+/* Create a vision encoder context from a model file path.
+ * The model must contain CLIP vision encoder weights.
+ * Returns NULL on failure. */
+DESIREEIA_API DesireeAIVisionCtx* desireeia_vision_create(const char* model_path,
+                                                          desireeia_log_cb cb,
+                                                          void* user);
+
+/* Destroy a vision encoder context. */
+DESIREEIA_API void desireeia_vision_destroy(DesireeAIVisionCtx* ctx);
+
+/* Get the vision encoder configuration. */
+DESIREEIA_API desireeia_error desireeia_vision_get_config(const DesireeAIVisionCtx* ctx,
+                                                          DesireeAIVisionConfig* out);
+
+/* Encode an image into embedding vectors.
+ * Input: image (must match config image_size, will be resized/cropped).
+ * Output: out_embd (caller-allocated buffer), out_len (number of floats),
+ *         out_dim (embedding dimension per vector).
+ * Returns DESIREEIA_OK on success. */
+DESIREEIA_API desireeia_error desireeia_vision_encode(DesireeAIVisionCtx* ctx,
+                                                      const DesireeAIImage* image,
+                                                      float* out_embd,
+                                                      size_t out_capacity,
+                                                      size_t* out_len,
+                                                      uint32_t* out_dim);
+
+/* Preprocess image for vision encoder: resize to target_size x target_size,
+ * normalize pixel values to [0, 1], convert to RGB if needed.
+ * out_pixels is caller-allocated with out_capacity floats.
+ * out_len receives the actual number of floats written.
+ * Returns DESIREEIA_OK on success. */
+DESIREEIA_API desireeia_error desireeia_vision_preprocess(const DesireeAIImage* input,
+                                                          int32_t target_size,
+                                                          float* out_pixels,
+                                                          size_t out_capacity,
+                                                          size_t* out_len);
+
+/* ========================================================================
+ * Multimodal model support (ctx-based, loaded from the model's own GGUF)
+ * ========================================================================
+ *
+ * Variants of the vision API that operate on a *loaded model context*
+ * (desireeia_ctx) instead of a standalone vision context. When the GGUF
+ * file carries clip.vision.* metadata the vision encoder is auto-loaded at
+ * desireeia_create() time and these functions work without extra setup. */
+
+/* Scrive 1 in *out_has se il modello caricato ha un encoder visivo
+ * (vision), 0 altrimenti. */
+DESIREEIA_API desireeia_error desireeia_has_vision(desireeia_ctx* ctx,
+                                                   int32_t* out_has);
+
+/* Numero di vector di embedding che l'encoder visivo produce per immagine
+ * (= numero di occorrenze del token placeholder da inserire nel prompt). */
+DESIREEIA_API desireeia_error desireeia_vision_token_count(desireeia_ctx* ctx,
+                                                           int32_t* out_count);
+
+/* Id del token placeholder immagine risolto sul vocabolario del modello
+ * (es. <image>), o -1 se non risolvibile. */
+DESIREEIA_API desireeia_error desireeia_vision_image_token(desireeia_ctx* ctx,
+                                                           int32_t* out_id);
+
+/* Codifica un'immagine con l'encoder visivo del modello caricato.
+ * Stessa convenzione query-size di desireeia_embed: out_embd=NULL con
+ * out_capacity=0 riempie solo *out_len. out_dim riceve la larghezza di
+ * ogni vector (dimensione embedding del modello di testo). */
+DESIREEIA_API desireeia_error desireeia_vision_encode_ctx(desireeia_ctx* ctx,
+                                                          const DesireeAIImage* image,
+                                                          float* out_embd,
+                                                          size_t out_capacity,
+                                                          size_t* out_len,
+                                                          uint32_t* out_dim);
+
+/* Prefill multimodale sul modello caricato: like desireeia_predict, ma il
+ * flusso token contiene N occorrenze del token placeholder immagine (N =
+ * desireeia_vision_token_count) e `embd` contiene i vector dell'encoder
+ * visivo (N * out_dim float, uno per occorrenza, in ordine). image_token
+ * puo' essere -1 per usare il placeholder risolto automaticamente.
+ * Ritorna DESIREEIA_ERR_NOT_SUPPORTED se il modello non ha vision o non e'
+ * un motore forward denso. */
+DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
+                                                      const int32_t* tokens,
+                                                      size_t n_tokens,
+                                                      const float* embd,
+                                                      size_t n_embd,
+                                                      int32_t image_token,
+                                                      int32_t* out_token);
+
 #ifdef __cplusplus
 }
 #endif

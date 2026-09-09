@@ -7,6 +7,7 @@
 #include "models/dense_forward.h"
 #include "models/ssm_forward.h"
 #include "models/bert_forward.h"
+#include "vision/vision_gguf.h"
 #include "ssd_tier/hybrid_tier.h"
 #include "tokenizer/tokenizer.h"
 #include <cstring>
@@ -554,6 +555,17 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         log(5, "model configured with tiered expert cache");
     }
 
+    // Vision encoder automatic detection: if the GGUF carries clip.vision.*
+    // metadata and vision tensors, load them into ctx->st.vision so the
+    // multimodal path (engine_predict_vision / desireeia_vision_encode) works
+    // without the caller having to do anything extra.
+    {
+        const auto ctxp = reinterpret_cast<desireeia_ctx*>(ctx);
+        if (engine_load_vision(ctxp) && log) {
+            if (log) log(5, "vision encoder loaded from model file");
+        }
+    }
+
     return reinterpret_cast<desireeia_ctx*>(ctx);
 }
 
@@ -747,6 +759,137 @@ bool engine_special_token_id(const desireeia_ctx* ctx, int which, int32_t& out_i
         case 3: out_id = c->pad_id; return true;
         default: return false;
     }
+}
+
+// ============================================================
+// Vision / Multimodal
+// ============================================================
+
+bool engine_load_vision(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || !c->st.reader) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+
+    if (c->st.vision) return true;  // Already loaded.
+
+    auto* vision = new vision::VisionGGUFContext;
+    if (!vision::vision_load_from_gguf(*vision, *c->st.reader)) {
+        delete vision;
+        return false;
+    }
+
+    // Resolve the image placeholder token id: the GGUF converter usually
+    // records the token STRING in clip.vision.image_token; fall back to
+    // the standard LLaVA/MiniCPM placeholders when the key is absent.
+    // Lookup is exact-string against the model's own vocabulary.
+    if (vision->image_token_id <= 0 && c->has_tok) {
+        std::string probe;
+        if (!c->st.reader->meta_str("clip.vision.image_token", probe) || probe.empty()) {
+            probe.clear();
+        }
+        const std::vector<std::string> candidates = probe.empty()
+            ? std::vector<std::string>{"<image>", "<image_pad>", "<img>", "<span>"}
+            : std::vector<std::string>{probe};
+        for (const std::string& cand : candidates) {
+            const int32_t id = c->tok.token_to_id(cand);
+            if (id >= 0) { vision->image_token_id = id; break; }
+        }
+    }
+
+    c->st.vision = vision;
+    return true;
+}
+
+bool engine_has_vision(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    return c->st.vision && c->st.vision->initialized;
+}
+
+int32_t engine_vision_token_count(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
+    if (!c || !c->st.vision) return 0;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    return vision::vision_get_token_count(*c->st.vision);
+}
+
+int32_t engine_vision_image_token(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
+    if (!c || !c->st.vision) return -1;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    return c->st.vision->image_token_id;
+}
+
+bool engine_encode_image(desireeia_ctx* ctx, const DesireeAIImage& image,
+                         std::vector<float>& out_embd, uint32_t& out_dim) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || !c->st.vision || !c->st.vision->initialized) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (!image.data || image.width == 0 || image.height == 0) return false;
+
+    if (!vision::vision_encode_image(*c->st.vision, image, out_embd)) return false;
+    out_dim = static_cast<uint32_t>(vision::vision_get_output_dim(*c->st.vision));
+    return true;
+}
+
+// Predict with multimodal input: the token stream contains the image
+// placeholder(s), and `embd`/`n_embd` are the vision encoder outputs
+// (one n_embd-sized vector per image placeholder occurrence, in order).
+// The forward engine replaces the placeholder token embedding with each
+// vector, so the model sees the image as if its patches were tokens.
+bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
+                           const float* embd, size_t n_embd, int32_t image_token,
+                           int32_t& out_token) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (!c->gf || !c->st.reader || n_tokens == 0) return false;
+    if (embd == nullptr || n_embd == 0) return false;
+
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    if (!df) {
+        c->st.last_error = "vision predict: model is not a dense forward engine";
+        return false;
+    }
+
+    // Size sanity: every image placeholder occurrence in the stream must
+    // consume exactly n_embd / (embedding dim) vectors. We check a simpler
+    // invariant: the override must not underflow.
+    const uint32_t n_embd_dim = df->config().n_embd;
+    if (n_embd_dim == 0 || n_embd % n_embd_dim != 0) {
+        c->st.last_error = "vision predict: embedding buffer misaligned";
+        return false;
+    }
+
+    // The caller may ask us to resolve the placeholder from the model's
+    // vision metadata/vocabulary (see engine_load_vision).
+    if (image_token < 0) {
+        if (c->st.vision && c->st.vision->image_token_id > 0) {
+            image_token = c->st.vision->image_token_id;
+        } else {
+            c->st.last_error = "vision predict: no image placeholder token known";
+            return false;
+        }
+    }
+
+    df->set_embedding_override(std::vector<float>(embd, embd + n_embd), image_token);
+
+    c->st.tokens.assign(tokens, tokens + n_tokens);
+    c->gf->reset_cache();
+    std::vector<float> logits;
+    if (!c->gf->step(*c->st.reader, tokens, n_tokens, logits)) {
+        c->st.last_error = "dense forward: vision prefill failed";
+        if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
+        if (c->st.log) c->st.log(3, c->st.last_error.c_str());
+        return false;
+    }
+    c->history.assign(tokens, tokens + n_tokens);
+    out_token = c->sampler.sample(logits, c->history);
+    c->last_token = out_token;
+    c->has_session = true;
+    c->pending.clear();
+    return true;
 }
 
 }

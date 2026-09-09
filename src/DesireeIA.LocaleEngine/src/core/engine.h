@@ -248,6 +248,8 @@ private:
     HybridTier* tier_;
 };
 
+namespace vision { struct VisionGGUFContext; }
+
 struct EngineState {
     ModelMeta meta;
     std::vector<int32_t> tokens;
@@ -259,6 +261,10 @@ struct EngineState {
     LogFn log;
     std::string last_error;
     std::string usage_file;
+
+    // Vision encoder for multimodal models (LLaVA, MiniCPM-V, etc.)
+    // Loaded from the same GGUF file when clip.vision.* metadata is present.
+    vision::VisionGGUFContext* vision = nullptr;
 };
 
 desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan, LogFn log);
@@ -424,6 +430,37 @@ DESIREEIA_INTERNAL int matmul_q4_k_pq(const uint8_t* q4k_data, size_t rows, size
                                     const int8_t* xq, const float* dscale, const int32_t* xsum, float* y);
 DESIREEIA_INTERNAL int matmul_q6_k_pq(const uint8_t* q6k_data, size_t rows, size_t cols,
                                     const int8_t* xq, const float* dscale, float* y);
+
+// ============================================================
+// Vision / Multimodal support
+// ============================================================
+
+// Load vision encoder from the GGUF file's clip.vision.* metadata.
+// Called automatically during engine_create when vision metadata is detected.
+// Returns true if a vision encoder was loaded.
+bool engine_load_vision(desireeia_ctx* ctx);
+
+// Encode an image into embeddings using the loaded vision encoder.
+// out_embd receives the projected embeddings suitable for text model injection.
+// Returns true on success.
+bool engine_encode_image(desireeia_ctx* ctx, const DesireeAIImage& image,
+                         std::vector<float>& out_embd, uint32_t& out_dim);
+
+// Get the number of tokens the vision encoder produces per image.
+int32_t engine_vision_token_count(desireeia_ctx* ctx);
+
+// Resolved image placeholder token id (from the model's vocabulary), or -1.
+int32_t engine_vision_image_token(desireeia_ctx* ctx);
+
+// Check if the loaded model has a vision encoder.
+bool engine_has_vision(desireeia_ctx* ctx);
+
+// Multimodal prefill: run the model on a token stream where the image
+// placeholder token appears once per vision embedding vector, replacing each
+// occurrence's embedding with its vector from embd. See the note in ctx.cpp.
+bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
+                           const float* embd, size_t n_embd, int32_t image_token,
+                           int32_t& out_token);
 
 // Varianti "batch" (Fase 8, prefill): come le matmul_qX_k sopra ma con
 // n_tok colonne di attivazione invece di una sola. x e' n_tok blocchi

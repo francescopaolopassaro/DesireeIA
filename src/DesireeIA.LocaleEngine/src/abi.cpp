@@ -1,6 +1,8 @@
 #include "desireeia/abi.h"
 #include "core/engine.h"
 #include "core/profile.h"
+#include "vision/vision_clip.h"
+#include "vision/vision_image.h"
 
 #include <cstring>
 
@@ -269,4 +271,173 @@ DESIREEIA_API void desireeia_profile_dump(char* out_buf, size_t buf_size) {
 
 DESIREEIA_API void desireeia_profile_reset(void) {
     desireeia::profile_reset();
+}
+
+// ============================================================
+// Vision Module - ABI Functions
+// ============================================================
+
+DESIREEIA_API desireeia_error desireeia_load_image(const char* path,
+                                                   int32_t expected_channels,
+                                                   DesireeAIImage* out) {
+    if (!path || !out) return DESIREEIA_ERR_INVALID_ARG;
+
+    auto buf = desireeia::vision::load_image_from_file(path, expected_channels);
+    if (buf.empty()) return DESIREEIA_ERR_IO;
+
+    out->width = buf.width;
+    out->height = buf.height;
+    out->channels = buf.channels;
+    out->data = new uint8_t[buf.data.size()];
+    std::memcpy(out->data, buf.data.data(), buf.data.size());
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API void desireeia_free_image(DesireeAIImage* img) {
+    if (!img) return;
+    delete[] img->data;
+    img->data = nullptr;
+    img->width = 0;
+    img->height = 0;
+    img->channels = 0;
+}
+
+DESIREEIA_API DesireeAIVisionCtx* desireeia_vision_create(const char* model_path,
+                                                          desireeia_log_cb cb,
+                                                          void* user) {
+    if (!model_path) return nullptr;
+    return desireeia::vision::vision_create_context(model_path, cb, user);
+}
+
+DESIREEIA_API void desireeia_vision_destroy(DesireeAIVisionCtx* ctx) {
+    desireeia::vision::vision_destroy_context(ctx);
+}
+
+DESIREEIA_API desireeia_error desireeia_vision_get_config(const DesireeAIVisionCtx* ctx,
+                                                          DesireeAIVisionConfig* out) {
+    if (!ctx || !out) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::vision::vision_get_config(ctx, *out)) {
+        return DESIREEIA_ERR_UNDEFINED;
+    }
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_vision_encode(DesireeAIVisionCtx* ctx,
+                                                      const DesireeAIImage* image,
+                                                      float* out_embd,
+                                                      size_t out_capacity,
+                                                      size_t* out_len,
+                                                      uint32_t* out_dim) {
+    if (!ctx || !image || !out_len || !out_dim) return DESIREEIA_ERR_INVALID_ARG;
+    if (!image->data || image->width == 0 || image->height == 0) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+
+    std::vector<float> embd;
+    uint32_t dim = 0;
+    if (!desireeia::vision::vision_encode(ctx, *image, embd, dim)) {
+        return DESIREEIA_ERR_UNDEFINED;
+    }
+
+    *out_len = embd.size();
+    *out_dim = dim;
+    if (out_embd && out_capacity >= embd.size()) {
+        std::memcpy(out_embd, embd.data(), embd.size() * sizeof(float));
+    }
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_vision_preprocess(const DesireeAIImage* input,
+                                                          int32_t target_size,
+                                                          float* out_pixels,
+                                                          size_t out_capacity,
+                                                          size_t* out_len) {
+    if (!input || !out_len) return DESIREEIA_ERR_INVALID_ARG;
+    if (!input->data || input->width == 0 || input->height == 0) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+
+    std::vector<float> pixels;
+    if (!desireeia::vision::vision_preprocess_image(*input, target_size, pixels)) {
+        return DESIREEIA_ERR_UNDEFINED;
+    }
+
+    *out_len = pixels.size();
+    if (out_pixels && out_capacity >= pixels.size()) {
+        std::memcpy(out_pixels, pixels.data(), pixels.size() * sizeof(float));
+    }
+    return DESIREEIA_OK;
+}
+
+// ========================================================================
+// Multimodal model support (ctx-based vision encoder)
+// ========================================================================
+
+DESIREEIA_API desireeia_error desireeia_has_vision(desireeia_ctx* ctx,
+                                                   int32_t* out_has) {
+    if (!ctx || !out_has) return DESIREEIA_ERR_INVALID_ARG;
+    *out_has = desireeia::engine_has_vision(ctx) ? 1 : 0;
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_vision_token_count(desireeia_ctx* ctx,
+                                                           int32_t* out_count) {
+    if (!ctx || !out_count) return DESIREEIA_ERR_INVALID_ARG;
+    const int32_t n = desireeia::engine_vision_token_count(ctx);
+    if (n <= 0) return DESIREEIA_ERR_NOT_SUPPORTED;
+    *out_count = n;
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_vision_image_token(desireeia_ctx* ctx,
+                                                           int32_t* out_id) {
+    if (!ctx || !out_id) return DESIREEIA_ERR_INVALID_ARG;
+    *out_id = desireeia::engine_vision_image_token(ctx);
+    return *out_id >= 0 ? DESIREEIA_OK : DESIREEIA_ERR_NOT_SUPPORTED;
+}
+
+DESIREEIA_API desireeia_error desireeia_vision_encode_ctx(desireeia_ctx* ctx,
+                                                          const DesireeAIImage* image,
+                                                          float* out_embd,
+                                                          size_t out_capacity,
+                                                          size_t* out_len,
+                                                          uint32_t* out_dim) {
+    if (!ctx || !image || !out_len || !out_dim) return DESIREEIA_ERR_INVALID_ARG;
+    if (!image->data || image->width == 0 || image->height == 0) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+
+    std::vector<float> embd;
+    uint32_t dim = 0;
+    if (!desireeia::engine_encode_image(ctx, *image, embd, dim)) {
+        return DESIREEIA_ERR_NOT_SUPPORTED;
+    }
+
+    *out_len = embd.size();
+    *out_dim = dim;
+    if (out_embd && out_capacity >= embd.size()) {
+        std::memcpy(out_embd, embd.data(), embd.size() * sizeof(float));
+    }
+    if (embd.empty()) return DESIREEIA_ERR_UNDEFINED;
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
+                                                      const int32_t* tokens,
+                                                      size_t n_tokens,
+                                                      const float* embd,
+                                                      size_t n_embd,
+                                                      int32_t image_token,
+                                                      int32_t* out_token) {
+    if (!ctx || !tokens || !out_token || n_tokens == 0) return DESIREEIA_ERR_INVALID_ARG;
+    if (!embd || n_embd == 0) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_has_vision(ctx)) return DESIREEIA_ERR_NOT_SUPPORTED;
+
+    int32_t token = -1;
+    if (!desireeia::engine_predict_vision(ctx, tokens, n_tokens, embd, n_embd,
+                                          image_token, token)) {
+        return DESIREEIA_ERR_UNDEFINED;
+    }
+    *out_token = token;
+    return DESIREEIA_OK;
 }

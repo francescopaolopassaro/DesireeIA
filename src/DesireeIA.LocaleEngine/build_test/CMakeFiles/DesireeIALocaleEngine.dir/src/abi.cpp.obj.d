@@ -192,6 +192,9 @@ CMakeFiles/DesireeIALocaleEngine.dir/src/abi.cpp.obj: \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/stl_list.h \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/list.tcc \
  C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\core/profile.h \
+ C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision/vision_clip.h \
+ C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision/vision_image.h \
+ C:\Sorgenti\Personal\DesireeIA\src\DesireeIA.LocaleEngine\src\vision/vision_image.h \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/cstring \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/x86_64-w64-mingw32/include/string.h \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/x86_64-w64-mingw32/include/sec_api/string_s.h

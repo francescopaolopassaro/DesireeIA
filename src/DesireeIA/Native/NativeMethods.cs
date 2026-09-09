@@ -201,4 +201,95 @@ internal static class NativeMethods
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern void desireeia_profile_reset();
+
+    // ============================================================
+    // Vision Module - P/Invoke Declarations
+    // ============================================================
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct VisionImage
+    {
+        public uint Width;
+        public uint Height;
+        public uint Channels;
+        public IntPtr Data;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct VisionConfig
+    {
+        public int EmbeddingDim;
+        public int PatchSize;
+        public int ImageSize;
+        public int NumHeads;
+        public int NumLayers;
+        public int ProjectionDim;
+        public int HasEncoder;
+    }
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_load_image(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+        int expectedChannels,
+        out VisionImage outImage);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void desireeia_free_image(ref VisionImage image);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern IntPtr desireeia_vision_create(
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string modelPath,
+        LogCallback? cb,
+        IntPtr user);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void desireeia_vision_destroy(IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_vision_get_config(IntPtr ctx, out VisionConfig outConfig);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_vision_encode(
+        IntPtr ctx,
+        in VisionImage image,
+        float[]? outEmbd,
+        nuint outCapacity,
+        out nuint outLen,
+        out uint outDim);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_vision_preprocess(
+        in VisionImage input,
+        int targetSize,
+        float[]? outPixels,
+        nuint outCapacity,
+        out nuint outLen);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_has_vision(IntPtr ctx, out int outHas);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_vision_token_count(IntPtr ctx, out int outCount);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_vision_image_token(IntPtr ctx, out int outId);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_vision_encode_ctx(
+        IntPtr ctx,
+        in VisionImage image,
+        float[]? outEmbd,
+        nuint outCapacity,
+        out nuint outLen,
+        out uint outDim);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_predict_image(
+        IntPtr ctx,
+        int[] tokens,
+        nuint nTokens,
+        float[] embd,
+        nuint nEmbd,
+        int imageToken,
+        out int outToken);
 }

@@ -36,6 +36,9 @@ add_library(DesireeIALocaleEngine SHARED
     src/ssd_tier/mirror_manager.cpp
     src/ssd_tier/tiered_expert_store.cpp
     src/ssd_tier/hybrid_tier.cpp
+    src/vision/vision_image.cpp
+    src/vision/vision_clip.cpp
+    src/vision/vision_gguf.cpp
 )
 
 target_include_directories(DesireeIALocaleEngine PUBLIC include)

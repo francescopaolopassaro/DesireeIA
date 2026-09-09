@@ -38,6 +38,27 @@ Beyond the dense family:
 
 Mixture-of-Experts models route through a tiered expert store (see below) rather than holding every expert in RAM at once.
 
+## Multimodal (vision)
+
+When the loaded GGUF carries `clip.vision.*` metadata, the CLIP-style vision
+encoder (patch embedding, transformer layers, projection) is loaded
+automatically at `LocalModel.Load()` time — no extra setup. Images are
+understood, not generated: this covers vision *input* (an image is encoded
+into embedding vectors and injected at the model's image placeholder token,
+so the text model can answer questions about it), not image or video
+generation, and not video understanding (no frame decoding is implemented).
+
+```csharp
+if (model.HasVision)
+{
+    using var image = LocalModel.LoadImage("photo.png");
+    var embd = model.EncodeImage(image, out var dim);
+    var token = model.PredictWithImage(promptTokens, embd!);
+}
+```
+
+The CLI's `chat` command exposes this through `/image <path> [question]`.
+
 ## Engine architecture
 
 Three layers:
@@ -162,6 +183,40 @@ Backends are probed and the strongest available one is selected automatically, i
 4. Metal (Apple Silicon)
 5. CPU (always available — scalar fallback if AVX2 isn't present)
 
+## Generation features
+
+Beyond plain `Predict`/`NextToken`, the .NET wrapper offers:
+
+- **Async streaming** — `LocalModel.StreamAsync`/`ChatStreamAsync` return an
+  `IAsyncEnumerable<string>` with `CancellationToken` support, instead of a
+  blocking token loop. The native engine call itself stays synchronous (one
+  mutex per context serializes it anyway); streaming here is cooperative
+  (`await Task.Yield()` between tokens) so the caller can interleave other
+  async work and observe cancellation token-by-token.
+- **Stop sequences** — `GenerateOptions.StopSequences` stops generation the
+  moment any of the given strings appears, trimming it out of the output,
+  even when the sequence spans more than one decoded piece.
+- **Tool calling** (`ToolCalling`) — prompt-based: builds a system prompt
+  describing the available tools and parses a `<tool_call>{...}</tool_call>`
+  block from the response. This is not native function-calling — reliability
+  depends on the model actually following the instruction — and tool
+  results are re-appended to history with role `"user"` rather than `"tool"`,
+  since most non-ChatML chat templates here don't have a branch for an
+  arbitrary `"tool"` role and would silently drop it.
+- **Structured/JSON output** (`StructuredOutput`) — a prompt instruction plus
+  a tolerant extractor that recovers the first balanced, valid JSON block
+  even if the model wrapped it in prose or a markdown fence. Best-effort,
+  not grammar-constrained: a model producing no valid JSON anywhere yields
+  `null`, with no automatic retry.
+
+```csharp
+await foreach (var piece in model.ChatStreamAsync(messages,
+    new GenerateOptions { MaxTokens = 512, StopSequences = new[] { "\n\n" } }))
+{
+    Console.Write(piece);
+}
+```
+
 ## Requirements
 
 - .NET 10 SDK
@@ -203,9 +258,11 @@ CLI for end-to-end testing and benchmarking:
 dotnet run --project cli/DesireeIA.Cli -- hw
 dotnet run --project cli/DesireeIA.Cli -- info <model.gguf>
 dotnet run --project cli/DesireeIA.Cli -- tokenize <model.gguf> "<text>"
-dotnet run --project cli/DesireeIA.Cli -- generate <model.gguf> "<text>" [--max-tokens N] [--chat] [--temp T] [--top-k K] [--top-p P]
+dotnet run --project cli/DesireeIA.Cli -- generate <model.gguf> "<text>" [--max-tokens N] [--chat] [--temp T] [--top-k K] [--top-p P] [--stop "<s>"]... [--json [--schema "<json-schema>"]]
 dotnet run --project cli/DesireeIA.Cli -- embed <model.gguf> "<text>"   (BERT encoders only)
 dotnet run --project cli/DesireeIA.Cli -- bench <model.gguf> [--tokens N] [--warmup N] [--prompt "<text>"]
+dotnet run --project cli/DesireeIA.Cli -- chat <model.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]
+                                          (in-session: /image <path> [question], /save <path>, /saveb64 <path>)
 
 
 

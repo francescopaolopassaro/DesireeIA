@@ -248,6 +248,30 @@ src/core/matmul.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/matmul.cpp.s
 .PHONY : src/core/matmul.cpp.s
 
+src/core/mem_lock.obj: src/core/mem_lock.cpp.obj
+.PHONY : src/core/mem_lock.obj
+
+# target to build an object file
+src/core/mem_lock.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/mem_lock.cpp.obj
+.PHONY : src/core/mem_lock.cpp.obj
+
+src/core/mem_lock.i: src/core/mem_lock.cpp.i
+.PHONY : src/core/mem_lock.i
+
+# target to preprocess a source file
+src/core/mem_lock.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/mem_lock.cpp.i
+.PHONY : src/core/mem_lock.cpp.i
+
+src/core/mem_lock.s: src/core/mem_lock.cpp.s
+.PHONY : src/core/mem_lock.s
+
+# target to generate assembly for a file
+src/core/mem_lock.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/mem_lock.cpp.s
+.PHONY : src/core/mem_lock.cpp.s
+
 src/core/plan.obj: src/core/plan.cpp.obj
 .PHONY : src/core/plan.obj
 
@@ -440,6 +464,30 @@ src/kv/kv_cache.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_cache.cpp.s
 .PHONY : src/kv/kv_cache.cpp.s
 
+src/kv/kv_quant.obj: src/kv/kv_quant.cpp.obj
+.PHONY : src/kv/kv_quant.obj
+
+# target to build an object file
+src/kv/kv_quant.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_quant.cpp.obj
+.PHONY : src/kv/kv_quant.cpp.obj
+
+src/kv/kv_quant.i: src/kv/kv_quant.cpp.i
+.PHONY : src/kv/kv_quant.i
+
+# target to preprocess a source file
+src/kv/kv_quant.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_quant.cpp.i
+.PHONY : src/kv/kv_quant.cpp.i
+
+src/kv/kv_quant.s: src/kv/kv_quant.cpp.s
+.PHONY : src/kv/kv_quant.s
+
+# target to generate assembly for a file
+src/kv/kv_quant.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_quant.cpp.s
+.PHONY : src/kv/kv_quant.cpp.s
+
 src/models/bert_forward.obj: src/models/bert_forward.cpp.obj
 .PHONY : src/models/bert_forward.obj
 
@@ -584,6 +632,102 @@ src/safetensors/st_reader.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/safetensors/st_reader.cpp.s
 .PHONY : src/safetensors/st_reader.cpp.s
 
+src/ssd_tier/hybrid_tier.obj: src/ssd_tier/hybrid_tier.cpp.obj
+.PHONY : src/ssd_tier/hybrid_tier.obj
+
+# target to build an object file
+src/ssd_tier/hybrid_tier.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.obj
+.PHONY : src/ssd_tier/hybrid_tier.cpp.obj
+
+src/ssd_tier/hybrid_tier.i: src/ssd_tier/hybrid_tier.cpp.i
+.PHONY : src/ssd_tier/hybrid_tier.i
+
+# target to preprocess a source file
+src/ssd_tier/hybrid_tier.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.i
+.PHONY : src/ssd_tier/hybrid_tier.cpp.i
+
+src/ssd_tier/hybrid_tier.s: src/ssd_tier/hybrid_tier.cpp.s
+.PHONY : src/ssd_tier/hybrid_tier.s
+
+# target to generate assembly for a file
+src/ssd_tier/hybrid_tier.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/hybrid_tier.cpp.s
+.PHONY : src/ssd_tier/hybrid_tier.cpp.s
+
+src/ssd_tier/mirror_manager.obj: src/ssd_tier/mirror_manager.cpp.obj
+.PHONY : src/ssd_tier/mirror_manager.obj
+
+# target to build an object file
+src/ssd_tier/mirror_manager.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/mirror_manager.cpp.obj
+.PHONY : src/ssd_tier/mirror_manager.cpp.obj
+
+src/ssd_tier/mirror_manager.i: src/ssd_tier/mirror_manager.cpp.i
+.PHONY : src/ssd_tier/mirror_manager.i
+
+# target to preprocess a source file
+src/ssd_tier/mirror_manager.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/mirror_manager.cpp.i
+.PHONY : src/ssd_tier/mirror_manager.cpp.i
+
+src/ssd_tier/mirror_manager.s: src/ssd_tier/mirror_manager.cpp.s
+.PHONY : src/ssd_tier/mirror_manager.s
+
+# target to generate assembly for a file
+src/ssd_tier/mirror_manager.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/mirror_manager.cpp.s
+.PHONY : src/ssd_tier/mirror_manager.cpp.s
+
+src/ssd_tier/ssd_tier.obj: src/ssd_tier/ssd_tier.cpp.obj
+.PHONY : src/ssd_tier/ssd_tier.obj
+
+# target to build an object file
+src/ssd_tier/ssd_tier.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/ssd_tier.cpp.obj
+.PHONY : src/ssd_tier/ssd_tier.cpp.obj
+
+src/ssd_tier/ssd_tier.i: src/ssd_tier/ssd_tier.cpp.i
+.PHONY : src/ssd_tier/ssd_tier.i
+
+# target to preprocess a source file
+src/ssd_tier/ssd_tier.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/ssd_tier.cpp.i
+.PHONY : src/ssd_tier/ssd_tier.cpp.i
+
+src/ssd_tier/ssd_tier.s: src/ssd_tier/ssd_tier.cpp.s
+.PHONY : src/ssd_tier/ssd_tier.s
+
+# target to generate assembly for a file
+src/ssd_tier/ssd_tier.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/ssd_tier.cpp.s
+.PHONY : src/ssd_tier/ssd_tier.cpp.s
+
+src/ssd_tier/tiered_expert_store.obj: src/ssd_tier/tiered_expert_store.cpp.obj
+.PHONY : src/ssd_tier/tiered_expert_store.obj
+
+# target to build an object file
+src/ssd_tier/tiered_expert_store.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/tiered_expert_store.cpp.obj
+.PHONY : src/ssd_tier/tiered_expert_store.cpp.obj
+
+src/ssd_tier/tiered_expert_store.i: src/ssd_tier/tiered_expert_store.cpp.i
+.PHONY : src/ssd_tier/tiered_expert_store.i
+
+# target to preprocess a source file
+src/ssd_tier/tiered_expert_store.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/tiered_expert_store.cpp.i
+.PHONY : src/ssd_tier/tiered_expert_store.cpp.i
+
+src/ssd_tier/tiered_expert_store.s: src/ssd_tier/tiered_expert_store.cpp.s
+.PHONY : src/ssd_tier/tiered_expert_store.s
+
+# target to generate assembly for a file
+src/ssd_tier/tiered_expert_store.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/ssd_tier/tiered_expert_store.cpp.s
+.PHONY : src/ssd_tier/tiered_expert_store.cpp.s
+
 src/tokenizer/bpe_tokenizer.obj: src/tokenizer/bpe_tokenizer.cpp.obj
 .PHONY : src/tokenizer/bpe_tokenizer.obj
 
@@ -656,6 +800,78 @@ src/tokenizer/tokenizer.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/tokenizer.cpp.s
 .PHONY : src/tokenizer/tokenizer.cpp.s
 
+src/vision/vision_clip.obj: src/vision/vision_clip.cpp.obj
+.PHONY : src/vision/vision_clip.obj
+
+# target to build an object file
+src/vision/vision_clip.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj
+.PHONY : src/vision/vision_clip.cpp.obj
+
+src/vision/vision_clip.i: src/vision/vision_clip.cpp.i
+.PHONY : src/vision/vision_clip.i
+
+# target to preprocess a source file
+src/vision/vision_clip.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.i
+.PHONY : src/vision/vision_clip.cpp.i
+
+src/vision/vision_clip.s: src/vision/vision_clip.cpp.s
+.PHONY : src/vision/vision_clip.s
+
+# target to generate assembly for a file
+src/vision/vision_clip.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.s
+.PHONY : src/vision/vision_clip.cpp.s
+
+src/vision/vision_gguf.obj: src/vision/vision_gguf.cpp.obj
+.PHONY : src/vision/vision_gguf.obj
+
+# target to build an object file
+src/vision/vision_gguf.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj
+.PHONY : src/vision/vision_gguf.cpp.obj
+
+src/vision/vision_gguf.i: src/vision/vision_gguf.cpp.i
+.PHONY : src/vision/vision_gguf.i
+
+# target to preprocess a source file
+src/vision/vision_gguf.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.i
+.PHONY : src/vision/vision_gguf.cpp.i
+
+src/vision/vision_gguf.s: src/vision/vision_gguf.cpp.s
+.PHONY : src/vision/vision_gguf.s
+
+# target to generate assembly for a file
+src/vision/vision_gguf.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.s
+.PHONY : src/vision/vision_gguf.cpp.s
+
+src/vision/vision_image.obj: src/vision/vision_image.cpp.obj
+.PHONY : src/vision/vision_image.obj
+
+# target to build an object file
+src/vision/vision_image.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj
+.PHONY : src/vision/vision_image.cpp.obj
+
+src/vision/vision_image.i: src/vision/vision_image.cpp.i
+.PHONY : src/vision/vision_image.i
+
+# target to preprocess a source file
+src/vision/vision_image.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.i
+.PHONY : src/vision/vision_image.cpp.i
+
+src/vision/vision_image.s: src/vision/vision_image.cpp.s
+.PHONY : src/vision/vision_image.s
+
+# target to generate assembly for a file
+src/vision/vision_image.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.s
+.PHONY : src/vision/vision_image.cpp.s
+
 # Help Target
 help:
 	@echo The following are some of the valid targets for this Makefile:
@@ -680,6 +896,9 @@ help:
 	@echo ... src/core/matmul.obj
 	@echo ... src/core/matmul.i
 	@echo ... src/core/matmul.s
+	@echo ... src/core/mem_lock.obj
+	@echo ... src/core/mem_lock.i
+	@echo ... src/core/mem_lock.s
 	@echo ... src/core/plan.obj
 	@echo ... src/core/plan.i
 	@echo ... src/core/plan.s
@@ -704,6 +923,9 @@ help:
 	@echo ... src/kv/kv_cache.obj
 	@echo ... src/kv/kv_cache.i
 	@echo ... src/kv/kv_cache.s
+	@echo ... src/kv/kv_quant.obj
+	@echo ... src/kv/kv_quant.i
+	@echo ... src/kv/kv_quant.s
 	@echo ... src/models/bert_forward.obj
 	@echo ... src/models/bert_forward.i
 	@echo ... src/models/bert_forward.s
@@ -722,6 +944,18 @@ help:
 	@echo ... src/safetensors/st_reader.obj
 	@echo ... src/safetensors/st_reader.i
 	@echo ... src/safetensors/st_reader.s
+	@echo ... src/ssd_tier/hybrid_tier.obj
+	@echo ... src/ssd_tier/hybrid_tier.i
+	@echo ... src/ssd_tier/hybrid_tier.s
+	@echo ... src/ssd_tier/mirror_manager.obj
+	@echo ... src/ssd_tier/mirror_manager.i
+	@echo ... src/ssd_tier/mirror_manager.s
+	@echo ... src/ssd_tier/ssd_tier.obj
+	@echo ... src/ssd_tier/ssd_tier.i
+	@echo ... src/ssd_tier/ssd_tier.s
+	@echo ... src/ssd_tier/tiered_expert_store.obj
+	@echo ... src/ssd_tier/tiered_expert_store.i
+	@echo ... src/ssd_tier/tiered_expert_store.s
 	@echo ... src/tokenizer/bpe_tokenizer.obj
 	@echo ... src/tokenizer/bpe_tokenizer.i
 	@echo ... src/tokenizer/bpe_tokenizer.s
@@ -731,6 +965,15 @@ help:
 	@echo ... src/tokenizer/tokenizer.obj
 	@echo ... src/tokenizer/tokenizer.i
 	@echo ... src/tokenizer/tokenizer.s
+	@echo ... src/vision/vision_clip.obj
+	@echo ... src/vision/vision_clip.i
+	@echo ... src/vision/vision_clip.s
+	@echo ... src/vision/vision_gguf.obj
+	@echo ... src/vision/vision_gguf.i
+	@echo ... src/vision/vision_gguf.s
+	@echo ... src/vision/vision_image.obj
+	@echo ... src/vision/vision_image.i
+	@echo ... src/vision/vision_image.s
 .PHONY : help
 
 

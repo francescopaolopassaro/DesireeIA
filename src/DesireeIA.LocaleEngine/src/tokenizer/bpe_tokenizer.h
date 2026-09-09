@@ -22,6 +22,10 @@ public:
     bool load(const VocabData& vocab);
     std::vector<int32_t> encode(const std::string& text, bool add_bos) const;
     bool piece(int32_t id, std::string& out) const;
+    // Exact vocab lookup: checks the special-token cache first (raw token
+    // bytes as stored in vocab, e.g. "<image>"/"<|im_start|>"), then the
+    // regular piece map. -1 if absent.
+    int32_t token_to_id(const std::string& piece) const;
     int32_t bos_id() const { return bos_id_; }
     bool ready() const { return !id_to_piece_.empty(); }
 

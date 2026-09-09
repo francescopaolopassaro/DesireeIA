@@ -860,6 +860,78 @@ src/tokenizer/tokenizer.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/tokenizer/tokenizer.cpp.s
 .PHONY : src/tokenizer/tokenizer.cpp.s
 
+src/vision/vision_clip.obj: src/vision/vision_clip.cpp.obj
+.PHONY : src/vision/vision_clip.obj
+
+# target to build an object file
+src/vision/vision_clip.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.obj
+.PHONY : src/vision/vision_clip.cpp.obj
+
+src/vision/vision_clip.i: src/vision/vision_clip.cpp.i
+.PHONY : src/vision/vision_clip.i
+
+# target to preprocess a source file
+src/vision/vision_clip.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.i
+.PHONY : src/vision/vision_clip.cpp.i
+
+src/vision/vision_clip.s: src/vision/vision_clip.cpp.s
+.PHONY : src/vision/vision_clip.s
+
+# target to generate assembly for a file
+src/vision/vision_clip.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_clip.cpp.s
+.PHONY : src/vision/vision_clip.cpp.s
+
+src/vision/vision_gguf.obj: src/vision/vision_gguf.cpp.obj
+.PHONY : src/vision/vision_gguf.obj
+
+# target to build an object file
+src/vision/vision_gguf.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.obj
+.PHONY : src/vision/vision_gguf.cpp.obj
+
+src/vision/vision_gguf.i: src/vision/vision_gguf.cpp.i
+.PHONY : src/vision/vision_gguf.i
+
+# target to preprocess a source file
+src/vision/vision_gguf.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.i
+.PHONY : src/vision/vision_gguf.cpp.i
+
+src/vision/vision_gguf.s: src/vision/vision_gguf.cpp.s
+.PHONY : src/vision/vision_gguf.s
+
+# target to generate assembly for a file
+src/vision/vision_gguf.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_gguf.cpp.s
+.PHONY : src/vision/vision_gguf.cpp.s
+
+src/vision/vision_image.obj: src/vision/vision_image.cpp.obj
+.PHONY : src/vision/vision_image.obj
+
+# target to build an object file
+src/vision/vision_image.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.obj
+.PHONY : src/vision/vision_image.cpp.obj
+
+src/vision/vision_image.i: src/vision/vision_image.cpp.i
+.PHONY : src/vision/vision_image.i
+
+# target to preprocess a source file
+src/vision/vision_image.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.i
+.PHONY : src/vision/vision_image.cpp.i
+
+src/vision/vision_image.s: src/vision/vision_image.cpp.s
+.PHONY : src/vision/vision_image.s
+
+# target to generate assembly for a file
+src/vision/vision_image.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.s
+.PHONY : src/vision/vision_image.cpp.s
+
 tests/selftest.obj: tests/selftest.cpp.obj
 .PHONY : tests/selftest.obj
 
@@ -983,6 +1055,15 @@ help:
 	@echo ... src/tokenizer/tokenizer.obj
 	@echo ... src/tokenizer/tokenizer.i
 	@echo ... src/tokenizer/tokenizer.s
+	@echo ... src/vision/vision_clip.obj
+	@echo ... src/vision/vision_clip.i
+	@echo ... src/vision/vision_clip.s
+	@echo ... src/vision/vision_gguf.obj
+	@echo ... src/vision/vision_gguf.i
+	@echo ... src/vision/vision_gguf.s
+	@echo ... src/vision/vision_image.obj
+	@echo ... src/vision/vision_image.i
+	@echo ... src/vision/vision_image.s
 	@echo ... tests/selftest.obj
 	@echo ... tests/selftest.i
 	@echo ... tests/selftest.s

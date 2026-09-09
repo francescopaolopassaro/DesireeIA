@@ -1707,7 +1707,18 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
     for (size_t p = 0; p < n_tokens; ++p) {
         const int32_t t = tokens[p];
         if (t < 0 || (uint32_t) t >= cfg_.n_vocab) { last_fail_ = "token out of range t=" + std::to_string(t) + " n_vocab=" + std::to_string(cfg_.n_vocab); return false; }
-        if (!embed_row((uint32_t) t, x.data() + p * n_embd)) { last_fail_ = "embed_row failed t=" + std::to_string(t); return false; }
+        bool overridden = false;
+        if (!embd_override_.empty() && t == embd_override_token_ &&
+            embd_override_cursor_ + n_embd <= embd_override_.size()) {
+            std::memcpy(x.data() + p * n_embd,
+                        embd_override_.data() + embd_override_cursor_,
+                        n_embd * sizeof(float));
+            embd_override_cursor_ += n_embd;
+            overridden = true;
+        }
+        if (!overridden) {
+            if (!embed_row((uint32_t) t, x.data() + p * n_embd)) { last_fail_ = "embed_row failed t=" + std::to_string(t); return false; }
+        }
         if (quirks_.embd_scale_sqrt) {
             const float s = sqrtf((float) n_embd);
             float* xp = x.data() + p * n_embd;
