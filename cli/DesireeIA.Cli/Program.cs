@@ -1,6 +1,54 @@
 ﻿using System.Diagnostics;
 using System.Linq;
+using System.Collections.Generic;
 using DesireeIA;
+
+const string LogoAscii =
+    "                                   .....;X&$$XXX$&x...                                                \n" +
+    "                                   .:;&X;.... ....:&X:.                                                \n" +
+    "                                 ..+&+.....:+x;....:&;x&X:.                                            \n" +
+    "                              ....&x....:$$;..:X$..XX....$$... ...                                      \n" +
+    "                          ... ..;&:....+&:X&&&&&&&&&:.....:&:.  ..                                      \n" +
+    "                   ..  . .... ..&;....;&&+. ...  ...+&:.....x.....                                     \n" +
+    "                   .   ...    .&+.:...$x...         ..;..  .:&....                                     \n" +
+    "                             .:&.:&:.;&.     .        :$:  ..$x;..                                     \n" +
+    "                             .+X.+&..&+....    ........:x:. .+$.                                       \n" +
+    "                .           ..xx:&..;&&&&$X..  .+$&&$$x.&+.  :x.                                       \n" +
+    "                         .  .:xx$+..&;.......  ....:....$&;  .&.                                       \n" +
+    "                             .X&x..$&&x&&xX.&...;X&&X$&:Xx&+..&:..         :..                         \n" +
+    "                         .....&x.:&x........$:.  .......X&:X&:&:. ...                                  \n" +
+    "                            .X$.X&&X..    ..$..        .&&X.;&&;..                                     \n" +
+    "                          ..+$:&x&;&.     .......     .;&.&x.:&x..        ..                            \n" +
+    "                          ..&$&.+$.&+     ..+$X;..    .X&$$&x.+&..       ...                            \n" +
+    "                          ..$&..;$.x$.  ............  .&;.XX&:.&+::..                                  \n" +
+    "                            $+...&..$X....+XxxxXX;....&x..Xx+$.:&:...                                  \n" +
+    "                      .     $x. .+&..$&....;&&&$....:&+. .&:.&:.&x...                                  \n" +
+    "                     ...    .&;...$X..;&X..........$&+...XX..&:.+$...                                  \n" +
+    "                     . .    .:&+...$X..+&$$;:..:+&X.$:..+&..:&..;$...                                  \n" +
+    "                             ..&X...XX.:&..:+xx+....&:.x$...&+..xX...                                  \n" +
+    "             .                .X&$..:&;.&.         .Xx$x...XX...&;                                      \n" +
+    "                              .Xxx&..XX:&.       ...+&:...$x...XX.     ..                               \n" +
+    "                              .&::&:.;$x$..      ..x$.. +&:...X$..     ..                               \n" +
+    "                            .;&;..&; x&&...      .+&. .$X....&x$&&;.  ...                              \n" +
+    "                       ...:X&x...+&..&&:        .:&...Xx...+&......X&$:..                              \n" +
+    "                       .+x:..   .x..:x..         :+...X.. .x..      ..x:.                              \n" +
+    "                       ......    . .. ..          ... ... ...       .....                               \n" +
+    "                                   ...;.                                                             \n" +
+    "    .&&&&&&&&X...                  ..+$.                            .&&&.   ..&&&$.                      \n" +
+    "    .&+.   ..+&+.....+x:.. ...:x+:...:;...;:.;+....+x:...  ..:x+.....&&&.  ..&&&&&x..                 \n" +
+    "    .&+       +&:.+&x...&&..X&....x. x&...&&$...x&x...&$...&$...x&+..&&&....X&&.+&&+.                 \n" +
+    "    .&+     ..:&;.&+:::::$X.X&x::. ..x&. .&x. ..&+:::::$X.$$:::::x&..&&&...x&&;..X&&:...             \n" +
+    "    .&+     ..$&..&;...........:x$&:.x&. .&x   .&;........$X.........&&&..+&&&&&&&&&&:.               \n" +
+    "    .&+...:;X&X...+&x:..+X..x+...+&;.x&. .&x  ..+&x...+X..:&$;..:X;..&&&.:&&X.....:&&&..             \n" +
+    "    .++++++;:.     .:+++;.  .;+++;...:+...+:.    .:+++;.   ..;++;.  .;++.+++..     :++;.               \n" +
+    "    ...   .. .     ......   . .  . ... ... ..    .......   .  ....   ..... ...    ......                \n";
+
+static void ShowSplash()
+{
+    Console.Write(LogoAscii);
+}
+
+ShowSplash();
 
 if (args.Length == 0)
 {
@@ -20,6 +68,7 @@ try
         "embed" => CmdEmbed(rest),
         "generate" => CmdGenerate(rest),
         "bench" => CmdBench(rest),
+        "chat" => CmdChat(rest),
         "hw" => CmdHw(),
         _ => Unknown(command)
     };
@@ -57,6 +106,10 @@ static void PrintUsage()
                      [--temp T] [--top-k K] [--top-p P]
                      [--repeat-penalty R] [--repeat-last-n N] [--seed S]
           desireeia-cli bench <modello.gguf> [--tokens N] [--warmup N] [--prompt "<testo>"] [--threads N]
+          desireeia-cli chat <modello.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]
+
+        Chat session:
+          desireeia-cli chat <modello.gguf>  (interactive multi-turn conversation)
 
         Campionamento: senza --temp la generazione e' greedy (deterministica).
         --temp 0.8 --repeat-penalty 1.1 e' un punto di partenza ragionevole;
@@ -84,9 +137,6 @@ static (LocalModel model, ExecutionPlan plan) Open(string modelPath, int? thread
     }
     var overrides = threads is int t ? new ExecutionPlan { ThreadCount = t } : null;
     var plan = DesireeIAEngine.BuildPlan(modelPath, overrides);
-    // DESIREEIA_VERBOSE=1 attiva il logger nativo su stderr: utile per capire
-    // PERCHE' un load/predict fallisce (l'ABI restituisce solo un codice
-    // errore generico), senza dover ricompilare o attaccare un debugger.
     Action<string>? logger = Environment.GetEnvironmentVariable("DESIREEIA_VERBOSE") == "1"
         ? (msg => Console.Error.WriteLine($"[native] {msg}"))
         : null;
@@ -165,9 +215,6 @@ static int CmdEmbed(string[] rest)
         }
         Console.WriteLine($"{ids.Length} token, dimensione embedding = {(rows.Length > 0 ? rows[0].Length : 0)}");
 
-        // Mean-pooling: convenzione comune per un embedding di frase, MA e'
-        // una scelta dell'applicazione (CLI), non del motore — desireeia_embed
-        // restituisce sempre l'embedding grezzo per token.
         if (rows.Length == 0) return 0;
         var dim = rows[0].Length;
         var pooled = new float[dim];
@@ -194,11 +241,6 @@ static int CmdGenerate(string[] rest)
     using (model)
     {
         ApplySamplingOptions(model, rest);
-        // Il formato di chat e' rilevato dal motore al caricamento (dal
-        // tokenizer.chat_template del GGUF, o da un default per
-        // architettura): prima era gemma cablata qui, unico formato
-        // supportato — ora copre le famiglie di modelli piu' diffuse
-        // (vedi LocalModel.ApplyChatTemplate).
         var promptText = useChat
             ? model.ApplyChatTemplate(new[] { ("user", rest[1]) })
             : rest[1];
@@ -292,8 +334,103 @@ static int CmdBench(string[] rest)
     return 0;
 }
 
-// Campionamento: senza questi flag il comportamento resta greedy
-// (deterministico), come prima che il sampling esistesse. --temp lo attiva.
+static int CmdChat(string[] rest)
+{
+    if (rest.Length < 1)
+    {
+        Console.Error.WriteLine("usage: desireeia-cli chat <model.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]");
+        return 1;
+    }
+
+    var maxTokens = GetIntOption(rest, "--max-tokens", 512);
+    var (model, _) = Open(rest[0]);
+    using (model)
+    {
+        ApplySamplingOptions(model, rest);
+
+        Console.Write("System prompt (press Enter to skip): ");
+        var systemPrompt = Console.ReadLine()?.Trim() ?? "";
+        var hasSystem = !string.IsNullOrEmpty(systemPrompt);
+
+        var history = new List<(string Role, string Content)>();
+        if (hasSystem)
+        {
+            history.Add(("system", systemPrompt));
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("Chat started. Type /exit to quit, /clear to reset conversation.");
+        Console.WriteLine();
+
+        while (true)
+        {
+            Console.Write("you> ");
+            var input = Console.ReadLine();
+            if (input is null) break;
+            input = input.Trim();
+            if (input.Length == 0) continue;
+
+            var cmd = input.ToLowerInvariant();
+            if (cmd is "/exit" or "/quit") break;
+            if (cmd is "/clear")
+            {
+                history.Clear();
+                if (hasSystem) history.Add(("system", systemPrompt));
+                Console.WriteLine("[conversation cleared]");
+                Console.WriteLine();
+                continue;
+            }
+
+            history.Add(("user", input));
+
+            var messages = history.ToList();
+            var promptText = model.ApplyChatTemplate(messages, addAssistant: true);
+            // addBos left at its default (true): Predict() resets the KV
+            // cache and re-prefills the whole reconstructed history text on
+            // every turn (see engine_predict's reset_cache()), so this is a
+            // fresh sequence start each time, not a continuation — the same
+            // situation "generate --chat" is already in, and that path has
+            // always left addBos at its default. Explicitly turning it off
+            // here meant every turn's prompt started without the sequence-
+            // start marker the model was trained to expect from token 0,
+            // which is why the observed output degenerated into unrelated
+            // fragments immediately.
+            var ids = model.Tokenize(promptText);
+            if (ids is null || ids.Length == 0)
+            {
+                Console.Error.WriteLine("tokenization failed.");
+                history.RemoveAt(history.Count - 1);
+                Console.WriteLine();
+                continue;
+            }
+
+            Console.Write("assistant> ");
+            var sb = new System.Text.StringBuilder();
+            var next = model.Predict(ids);
+            var stopped = model.IsEndOfGeneration(next);
+            if (!stopped)
+            {
+                var piece = model.TokenPiece(next) ?? "";
+                sb.Append(piece);
+                Console.Write(piece);
+                for (int i = 1; i < maxTokens; i++)
+                {
+                    next = model.NextToken();
+                    if (model.IsEndOfGeneration(next)) { stopped = true; break; }
+                    piece = model.TokenPiece(next) ?? "";
+                    sb.Append(piece);
+                    Console.Write(piece);
+                }
+            }
+            Console.WriteLine();
+            Console.WriteLine();
+
+            history.Add(("assistant", sb.ToString()));
+        }
+    }
+    return 0;
+}
+
 static void ApplySamplingOptions(LocalModel model, string[] args)
 {
     var temp = GetFloatOption(args, "--temp", 0.0f);
