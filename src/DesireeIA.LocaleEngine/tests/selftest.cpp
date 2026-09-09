@@ -6,6 +6,7 @@
 #include "models/moe_route.h"
 #include "core/thread_pool.h"
 #include "quant/quant.h"
+#include "kv/kv_quant.h"
 #include "ssd_tier/ssd_tier.h"
 #include "ssd_tier/mirror_manager.h"
 #include "ssd_tier/tiered_expert_store.h"
@@ -1663,6 +1664,119 @@ int main(int argc, char** argv) {
     // wrong ones — the model then degenerates in a way that looks like a
     // maths bug anywhere else in the stack. This pins the addressing down by
     // reading the same expert two independent ways.
+    std::printf("\n--- kv_quant Q8_0 round-trip ---\n");
+    {
+        const size_t dim = 512; // 16 sub-blocks; also exercises head_dim=128 and kv_lora=512 shapes
+        std::vector<float> row(dim);
+        uint32_t rng = 777u;
+        auto next = [&]() {
+            rng = rng * 1664525u + 1013904223u;
+            return (float) ((int32_t) (rng >> 8) % 20001 - 10000) / 10000.0f;
+        };
+        for (size_t i = 0; i < dim; ++i) row[i] = next() * 2.5f;
+
+        std::vector<uint8_t> packed(desireeia::kv_quant_row_bytes(dim));
+        desireeia::kv_quantize_row(row.data(), dim, packed.data());
+
+        // Dequantize by hand (the block_q8_0 layout is public) to check
+        // round-trip error, the same way the Q4_K quantizer test does.
+        std::vector<float> back(dim);
+        {
+            const size_t nblocks = (dim + 31) / 32;
+            const auto* blocks = reinterpret_cast<const block_q8_0*>(packed.data());
+            for (size_t b = 0; b < nblocks; ++b) {
+                const float d = desireeia_fp16_to_fp32(blocks[b].d);
+                for (size_t i = 0; i < 32 && b * 32 + i < dim; ++i) {
+                    back[b * 32 + i] = d * (float) blocks[b].qs[i];
+                }
+            }
+        }
+        double se = 0.0, sref = 0.0;
+        for (size_t i = 0; i < dim; ++i) {
+            const double e = (double) back[i] - row[i];
+            se += e * e;
+            sref += (double) row[i] * row[i];
+        }
+        const double rel_rms = std::sqrt(se / dim) / std::sqrt(sref / dim);
+        std::printf("  kv_quant Q8_0 round-trip: rel_rms=%.5f\n", rel_rms);
+        // Q8_0 (127 levels, per-32 scale) should stay under 1% relative RMS
+        // on a well-behaved distribution; this is a "the format is written
+        // correctly" gate the same way the Q4_K one is, not a quality target.
+        if (rel_rms < 0.01) { std::printf("  kv_quant Q8_0 round-trip error within bound OK\n"); passed++; }
+        else { std::printf("  kv_quant Q8_0 round-trip error TOO HIGH\n"); failed++; }
+
+        // kv_axpy_q8_0 must match a plain-float weighted accumulation of the
+        // SAME quantized-then-dequantized row -- i.e. it must be reading the
+        // packed bytes correctly, not just producing plausible-looking output.
+        const float weight = 0.37f;
+        std::vector<float> y_kernel(dim, 0.0f), y_ref(dim, 0.0f);
+        desireeia::kv_axpy_q8_0(y_kernel.data(), packed.data(), dim, weight);
+        for (size_t i = 0; i < dim; ++i) y_ref[i] += weight * back[i];
+        bool axpy_ok = true;
+        for (size_t i = 0; i < dim; ++i) {
+            if (!approx(y_kernel[i], y_ref[i], 1e-4f)) { axpy_ok = false; break; }
+        }
+        if (axpy_ok) { std::printf("  kv_axpy_q8_0 matches manual dequant+accumulate OK\n"); passed++; }
+        else { std::printf("  kv_axpy_q8_0 MISMATCH vs manual dequant+accumulate\n"); failed++; }
+
+        // kv_dot_q8_0: the per-row K-scoring kernel used directly by the
+        // classic (non-MLA) attention loop, where cached rows for one head
+        // are strided (interleaved with other kv-heads), not contiguous —
+        // the reason this exists instead of reusing matmul_q8_0.
+        {
+            std::vector<float> query2(dim);
+            for (size_t i = 0; i < dim; ++i) query2[i] = next();
+            const float got = desireeia::kv_dot_q8_0(query2.data(), packed.data(), dim);
+            double ref2 = 0.0;
+            for (size_t i = 0; i < dim; ++i) ref2 += (double) query2[i] * back[i];
+            if (approx(got, (float) ref2, std::fabs((float) ref2) * 0.02f + 1e-3f)) {
+                std::printf("  kv_dot_q8_0 matches manual dequant+dot OK\n");
+                passed++;
+            } else {
+                std::printf("  kv_dot_q8_0 MISMATCH (got %.5f want ~%.5f)\n", got, ref2);
+                failed++;
+            }
+        }
+
+        // matmul_q8_0 (the existing, proven weight kernel) must treat a
+        // stack of quantized KV rows exactly like a Q8_0 weight matrix: this
+        // is what lets the K-side read path reuse it verbatim instead of
+        // needing a parallel kernel. Two rows, same bytes twice, one query:
+        // both outputs must equal the single-row dot computed independently.
+        {
+            std::vector<uint8_t> two_rows(packed.size() * 2);
+            std::memcpy(two_rows.data(), packed.data(), packed.size());
+            std::memcpy(two_rows.data() + packed.size(), packed.data(), packed.size());
+            std::vector<float> query(dim);
+            for (size_t i = 0; i < dim; ++i) query[i] = next();
+            std::vector<float> scores(2, 0.0f);
+            const int rc = desireeia::matmul_q8_0(two_rows.data(), 2, dim, query.data(), scores.data());
+            // matmul_q8_0 quantizes the QUERY internally too (that's the
+            // "activation" side of a normal weight matvec) — a fair
+            // reference has to do the same on both sides, not compare
+            // against a full-precision query. quantize_q8_0 is the exact
+            // function it calls internally.
+            std::vector<int8_t> qq;
+            std::vector<float> qscale;
+            std::vector<uint8_t> qsigns;
+            desireeia::quantize_q8_0(query.data(), dim, qq, qscale, qsigns);
+            std::vector<float> query_dq(dim);
+            for (size_t b = 0; b * 32 < dim; ++b) {
+                for (size_t i = 0; i < 32 && b * 32 + i < dim; ++i) {
+                    query_dq[b * 32 + i] = qscale[b] * (float) qq[b * 32 + i];
+                }
+            }
+            double ref = 0.0;
+            for (size_t i = 0; i < dim; ++i) ref += (double) query_dq[i] * back[i];
+            const bool match = rc == DESIREEIA_OK &&
+                std::fabs(scores[0] - scores[1]) < 1e-4f &&
+                approx(scores[0], (float) ref, std::fabs((float) ref) * 0.02f + 1e-3f);
+            if (match) { std::printf("  matmul_q8_0 on KV cache rows matches manual dot OK\n"); passed++; }
+            else { std::printf("  matmul_q8_0 on KV cache rows MISMATCH (got %.5f/%.5f want ~%.5f)\n",
+                               scores[0], scores[1], ref); failed++; }
+        }
+    }
+
     std::printf("\n--- MoE expert addressing ---\n");
     {
         const std::string moe_path =

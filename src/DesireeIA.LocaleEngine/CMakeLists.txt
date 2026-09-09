@@ -11,6 +11,7 @@ add_library(DesireeIALocaleEngine SHARED
     src/abi.cpp
     src/core/probe.cpp
     src/core/plan.cpp
+    src/core/mem_lock.cpp
     src/core/matmul.cpp
     src/core/thread_pool.cpp
     src/core/quant.cpp
@@ -29,6 +30,7 @@ add_library(DesireeIALocaleEngine SHARED
     src/quant/quant.cpp
     src/safetensors/st_reader.cpp
     src/kv/kv_cache.cpp
+    src/kv/kv_quant.cpp
     src/expert/expert_store.cpp
     src/ssd_tier/ssd_tier.cpp
     src/ssd_tier/mirror_manager.cpp

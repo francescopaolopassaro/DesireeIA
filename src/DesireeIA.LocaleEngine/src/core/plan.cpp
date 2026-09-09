@@ -91,7 +91,18 @@ desireeia_plan build_plan(const desireeia_hw_info& hw, const std::string& model_
     p.expert_cache_count = static_cast<int32_t>(cache);
 
     p.expert_prefetch_enabled = 1;
-    p.kv_compression_enabled = 1;
+    // OFF by default. Until 2026-09-09 this flag reached the engine but the
+    // KvCache class it configured never actually quantized anything — a
+    // "compression" that did nothing, defaulting to on because on cost
+    // nothing. That changed: the flag now drives a real Q8_0 quantized
+    // classic (non-MLA) KV cache path (kv/kv_quant.h). A behavior change
+    // that alters what decode actually computes does not get to inherit the
+    // old no-op flag's default just because the field already existed —
+    // same reasoning as every other opt-in added this session (weight
+    // requantization, MoE expert stacking): proven correct in isolation
+    // (selftest), not yet proven on a real end-to-end model run, so it stays
+    // off until it is. DESIREEIA_KV_QUANT=1 to opt in for testing.
+    p.kv_compression_enabled = 0;
     p.expert_pin_enabled = 1;
     p.expert_prefetch_depth = 1;
     p.batch_union_enabled = 1;
@@ -122,6 +133,10 @@ desireeia_plan build_plan(const desireeia_hw_info& hw, const std::string& model_
     }
 #endif
     env_ssd_tier_override(p.ssd_tier_mode);
+
+    if (const char* kvq = std::getenv("DESIREEIA_KV_QUANT")) {
+        if (kvq[0] != '\0' && kvq[0] != '0') p.kv_compression_enabled = 1;
+    }
 
     return p;
 }

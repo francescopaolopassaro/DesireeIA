@@ -237,8 +237,9 @@ struct LayerWeights {
 // budget, see open()); embeddings and the KV cache stay resident.
 class DenseForward : public IForwardEngine {
 public:
+    ~DenseForward() override;
     bool open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, uint64_t ram_budget_mb,
-              ExpertStore* experts);
+              ExpertStore* experts, bool kv_quantized = false);
     void reset_cache() override;
     // If all_logits != nullptr, it's filled with n_tokens*n_vocab logits
     // (one per batch position, not just the last): used by speculative
@@ -262,6 +263,9 @@ public:
     // Bytes used by the resident K/V cache (tokens already processed, not
     // allocated capacity): used by engine_context_size.
     uint64_t kv_bytes() const override {
+        if (kv_quantized_) {
+            return (uint64_t) cache_cols_ * cfg_.n_layers * cfg_.n_head_kv * kv_q_row_bytes_ * 2;
+        }
         return (uint64_t) cache_cols_ * cfg_.n_layers * cfg_.n_head_kv * cfg_.head_dim * 2 * sizeof(float);
     }
     bool weight_cache_enabled() const override { return cache_enabled_; }
@@ -303,6 +307,13 @@ private:
                     std::vector<float>& edown);
     const LayerWeights* get_layer(ModelReader& rd, uint32_t il);
     void grow_cache(size_t needed);
+
+    // Stores one position's freshly computed K and V (kv_dim floats each,
+    // n_head_kv heads back to back) into whichever cache is active — float
+    // or, when kv_quantized_, one Q8_0 row per kv-head. Shared by the
+    // prefill (batched) and decode write sites so the branch on
+    // kv_quantized_ exists in exactly one place.
+    void write_kv_cache(uint32_t l, uint32_t pos, const float* k, const float* v);
 
     // MLA (DenseQuirks::mla): computes compressed-rank attention for ONE
     // token (position pos of layer l) and writes the result, already
@@ -371,6 +382,33 @@ private:
     std::vector<float> v_cache_;
     size_t cache_capacity_ = 0;
     size_t cache_cols_ = 0;
+
+    // Q8_0-quantized KV cache, used instead of k_cache_/v_cache_ when
+    // kv_quantized_ is set (see open()'s kv_quantized parameter). Roughly
+    // 3.76x smaller than the float cache (34 bytes per 32-float sub-block vs
+    // 128), which is real memory-bandwidth headroom on the path that reads
+    // the cache once per token per position — see docs/performance_plan.md
+    // item 2. Off (empty, k_cache_/v_cache_ used) unless the caller opts in:
+    // this changes what decode actually computes, not just how it's stored,
+    // and stays a deliberate choice rather than a silent default flip.
+    //
+    // Not used for MLA layers regardless of this flag: MLA's own compressed
+    // latent cache (kv_lora_rank+rope wide, a few hundred floats) is already
+    // far smaller than a classic per-head KV cache, so quantizing it on top
+    // buys little, and MLA's absorbed-attention math was hard-won correctness
+    // work this session — not something to put back at risk for a small gain.
+    bool kv_quantized_ = false;
+    std::vector<uint8_t> k_cache_q_;
+    std::vector<uint8_t> v_cache_q_;
+    // Whether tok_embd_/out_head_ were successfully locked resident (see
+    // DESIREEIA_MLOCK in open()), so the destructor knows whether to unlock
+    // them — a reload within the same process (Load/Dispose in the .NET
+    // wrapper) must not leave a previous model's pages holding locked-memory
+    // quota after that model is gone.
+    bool mlocked_ = false;
+    // Bytes one kv-head's quantized row occupies (kv_quant_row_bytes(head_dim)),
+    // cached at open() time so the hot path never recomputes it.
+    size_t kv_q_row_bytes_ = 0;
 };
 
 }

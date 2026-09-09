@@ -219,6 +219,8 @@ CMakeFiles/DesireeIALocaleEngine.dir/src/models/dense_forward.cpp.obj: \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/x86_64-w64-mingw32/include/sec_api/string_s.h \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/cassert \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/x86_64-w64-mingw32/include/assert.h \
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/kv/kv_quant.h \
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/mem_lock.h \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/lib/gcc/x86_64-w64-mingw32/16.1.0/include/immintrin.h \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/lib/gcc/x86_64-w64-mingw32/16.1.0/include/x86gprintrin.h \
  C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/lib/gcc/x86_64-w64-mingw32/16.1.0/include/ia32intrin.h \

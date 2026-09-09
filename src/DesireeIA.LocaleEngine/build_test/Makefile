@@ -308,6 +308,30 @@ src/core/matmul.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/matmul.cpp.s
 .PHONY : src/core/matmul.cpp.s
 
+src/core/mem_lock.obj: src/core/mem_lock.cpp.obj
+.PHONY : src/core/mem_lock.obj
+
+# target to build an object file
+src/core/mem_lock.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/mem_lock.cpp.obj
+.PHONY : src/core/mem_lock.cpp.obj
+
+src/core/mem_lock.i: src/core/mem_lock.cpp.i
+.PHONY : src/core/mem_lock.i
+
+# target to preprocess a source file
+src/core/mem_lock.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/mem_lock.cpp.i
+.PHONY : src/core/mem_lock.cpp.i
+
+src/core/mem_lock.s: src/core/mem_lock.cpp.s
+.PHONY : src/core/mem_lock.s
+
+# target to generate assembly for a file
+src/core/mem_lock.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/core/mem_lock.cpp.s
+.PHONY : src/core/mem_lock.cpp.s
+
 src/core/plan.obj: src/core/plan.cpp.obj
 .PHONY : src/core/plan.obj
 
@@ -499,6 +523,30 @@ src/kv/kv_cache.s: src/kv/kv_cache.cpp.s
 src/kv/kv_cache.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_cache.cpp.s
 .PHONY : src/kv/kv_cache.cpp.s
+
+src/kv/kv_quant.obj: src/kv/kv_quant.cpp.obj
+.PHONY : src/kv/kv_quant.obj
+
+# target to build an object file
+src/kv/kv_quant.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_quant.cpp.obj
+.PHONY : src/kv/kv_quant.cpp.obj
+
+src/kv/kv_quant.i: src/kv/kv_quant.cpp.i
+.PHONY : src/kv/kv_quant.i
+
+# target to preprocess a source file
+src/kv/kv_quant.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_quant.cpp.i
+.PHONY : src/kv/kv_quant.cpp.i
+
+src/kv/kv_quant.s: src/kv/kv_quant.cpp.s
+.PHONY : src/kv/kv_quant.s
+
+# target to generate assembly for a file
+src/kv/kv_quant.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/kv/kv_quant.cpp.s
+.PHONY : src/kv/kv_quant.cpp.s
 
 src/models/bert_forward.obj: src/models/bert_forward.cpp.obj
 .PHONY : src/models/bert_forward.obj
@@ -866,6 +914,9 @@ help:
 	@echo ... src/core/matmul.obj
 	@echo ... src/core/matmul.i
 	@echo ... src/core/matmul.s
+	@echo ... src/core/mem_lock.obj
+	@echo ... src/core/mem_lock.i
+	@echo ... src/core/mem_lock.s
 	@echo ... src/core/plan.obj
 	@echo ... src/core/plan.i
 	@echo ... src/core/plan.s
@@ -890,6 +941,9 @@ help:
 	@echo ... src/kv/kv_cache.obj
 	@echo ... src/kv/kv_cache.i
 	@echo ... src/kv/kv_cache.s
+	@echo ... src/kv/kv_quant.obj
+	@echo ... src/kv/kv_quant.i
+	@echo ... src/kv/kv_quant.s
 	@echo ... src/models/bert_forward.obj
 	@echo ... src/models/bert_forward.i
 	@echo ... src/models/bert_forward.s

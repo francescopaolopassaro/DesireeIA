@@ -56,15 +56,18 @@ DetectHardware()  ->  BuildPlan(modelPath, overrides)  ->  LocalModel.Load(...)
 
 At load time the engine:
 
-1. Detects hardware (CPU core count, AVX/AVX2/AVX512/NEON, NUMA, CUDA/Intel Arc/Metal/NPU acceleration, RAM).
+1. Detects hardware (physical CPU core count — hyperthread siblings are not
+   counted as extra cores, since the AVX2 kernels here are memory-bound and
+   two threads sharing a physical core's L1/L2 contend rather than add
+   throughput —, AVX/AVX2/AVX512/NEON, CUDA/Intel Arc/Metal/NPU acceleration,
+   RAM). NUMA topology is not currently detected.
 2. Builds an execution plan automatically unless the caller overrides it (RAM budget, thread count, quantization, format).
 3. Applies tiered caching for MoE experts:
    - experts streamed from disk with an LRU cache,
    - a learned hot-set (frequently used experts pinned, persisted alongside the model),
    - one-layer-ahead expert prefetch,
    - batch-union expert fetching (each unique expert read once per batch of positions),
-   - optional dual-SSD mirroring,
-   - KV cache compression.
+   - optional dual-SSD mirroring.
 
 Every part of the plan can be overridden by the caller.
 
@@ -116,6 +119,38 @@ The quantizer fits each sub-block by minimizing squared reconstruction error
 regression of the values on their levels, over several starting ranges) rather
 than simply spanning min to max, and applies the same treatment to the shared
 6-bit scales. The self-test asserts it beats a plain min/max fit.
+
+### KV cache quantization
+
+The KV cache can optionally be stored as Q8_0 (32-value sub-blocks, one fp16
+scale each) instead of float32 — roughly 3.76x smaller. Only applies to the
+classic (non-MLA) attention path; an MLA model's own compressed latent cache
+is already far smaller than a classic per-head cache, so this doesn't touch it.
+
+Off by default, and not just out of caution: measured at 48 and ~400 tokens
+of context on this project's own benchmark, it was 15-24% *slower*, not
+faster — at those lengths the float cache already fits comfortably in CPU
+cache, so there's no real memory-bandwidth pressure to relieve, and every
+read pays a real int8-to-float decode cost with nothing to show for it. The
+crossover point where a smaller cache would start winning, if there is one
+on typical hardware, needs a much longer context than what's been tested
+here. Enable it with `DESIREEIA_KV_QUANT=1` to measure on your own
+workload — long-context use is the case worth trying it on.
+
+### Memory locking
+
+The largest weight tensors (the token embedding, and the output head when a
+model has a separate one) can optionally be locked resident with the OS —
+`VirtualLock` on Windows, `mlock` on Linux/macOS, both with a best-effort
+attempt to raise the platform's default quota first, since either API simply
+fails outright on a multi-hundred-MB range under the out-of-the-box limit.
+Failure is silent and non-fatal: an unprivileged process keeps its weights
+either way, just without a guarantee against a swap stall mid-decode under
+memory pressure.
+
+This is deliberately partial: the per-layer weights are not locked (that
+would mean walking every tensor across every layer, real additional work, not
+done here), only the embedding/output head. Enable with `DESIREEIA_MLOCK=1`.
 
 ## Hardware backends
 

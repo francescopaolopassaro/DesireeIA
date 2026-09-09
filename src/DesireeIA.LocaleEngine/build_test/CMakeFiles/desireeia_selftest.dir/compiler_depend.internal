@@ -7,6 +7,7 @@ CMakeFiles/desireeia_selftest.dir/tests/selftest.cpp.obj
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/arch_tags.h
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/engine.h
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/thread_pool.h
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/kv/kv_quant.h
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/moe_route.h
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/quant/quant.h
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/ssd_tier/hybrid_tier.h

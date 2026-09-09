@@ -6,6 +6,7 @@ CMakeFiles/desireeia_selftest.dir/tests/selftest.cpp.obj: C:/Sorgenti/Personal/D
   C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/arch_tags.h \
   C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/engine.h \
   C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/thread_pool.h \
+  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/kv/kv_quant.h \
   C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/moe_route.h \
   C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/quant/quant.h \
   C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/ssd_tier/hybrid_tier.h \
@@ -288,8 +289,6 @@ C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.
 
 C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/arch_tags.h:
 
-C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/new_except.h:
-
 C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/engine.h:
 
 C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/x86_64-w64-mingw32/include/ctype.h:
@@ -298,11 +297,13 @@ C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.
 
 C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/thread_pool.h:
 
-C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/quant/quant.h:
-
 C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/node_handle.h:
 
 C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/ssd_tier/hybrid_tier.h:
+
+C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/quant/quant.h:
+
+C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/kv/kv_quant.h:
 
 C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/ssd_tier/mirror_manager.h:
 
@@ -413,6 +414,8 @@ C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.
 C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/move.h:
 
 C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/new_allocator.h:
+
+C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/new_except.h:
 
 C:/Users/fpassaro/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/include/c++/16.1.0/bits/unordered_map.h:
 

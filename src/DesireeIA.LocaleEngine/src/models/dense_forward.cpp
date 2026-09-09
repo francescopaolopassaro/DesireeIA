@@ -2,6 +2,8 @@
 #include "moe_route.h"
 #include "../core/profile.h"
 #include "../quant/quant.h"
+#include "../kv/kv_quant.h"
+#include "../core/mem_lock.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -174,6 +176,32 @@ static void matmul_f32(const float* w, size_t r, size_t c, const float* x, float
                 acc += (double) wrow[i] * x[i];
             }
             y[j] = (float) acc;
+        }
+    });
+    profile_counters().calls_f32.fetch_add(1, std::memory_order_relaxed);
+}
+
+static inline float dot_f32(const float* a, const float* b, size_t n);
+
+// SIMD float32 counterpart to matmul_f32's scalar double accumulation.
+//
+// matmul_f32 stays as it is: it is the generic fallback for any tensor
+// format without a quantized kernel, used across every architecture here,
+// and its double accumulation is deliberate precision headroom for a path
+// meant to be rare. MLA's absorbed attention breaks that assumption — the
+// K/V up-projection halves (wk_b_h/wv_b_h) are genuinely float (no on-disk
+// quantized form survives the transpose the "absorb" trick needs), but they
+// run on EVERY head, EVERY layer, EVERY token, not rarely. Measured on a
+// real model: this one fallback was 43% of total decode time. Reusing the
+// same float32 SIMD accumulation already trusted for the attention score dot
+// product (dot_f32, right below) fixes that without touching matmul_f32
+// itself — nothing that already depends on its double-precision behavior is
+// affected.
+static void matmul_f32_fast(const float* w, size_t r, size_t c, const float* x, float* y) {
+    ScopedTimer t(profile_counters().ns_f32_compute);
+    parallel_rows(r, [&](size_t j0, size_t j1) {
+        for (size_t j = j0; j < j1; ++j) {
+            y[j] = dot_f32(w + j * c, x, c);
         }
     });
     profile_counters().calls_f32.fetch_add(1, std::memory_order_relaxed);
@@ -548,11 +576,16 @@ static void softmax_inplace(float* s, size_t n) {
 }
 
 bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, uint64_t ram_budget_mb,
-                         ExpertStore* experts) {
+                         ExpertStore* experts, bool kv_quantized) {
     const std::string arch_tag = meta.arch.empty() ? "gemma" : meta.arch;
     const std::string kp = arch_tag + ".";
     quirks_ = quirks_for(arch);
     experts_ = experts;
+    // Never for MLA: see the note on kv_quantized_ in the header. head_dim
+    // is repurposed there to the compressed kv_lora_rank+rope width, not a
+    // classic per-head size, so kv_q_row_bytes_ is only meaningful (and only
+    // computed) for the non-MLA case anyway.
+    kv_quantized_ = kv_quantized && !quirks_.mla;
 
     uint32_t v32 = 0;
     float  f32 = 0.0f;
@@ -791,10 +824,55 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
     layer_cache_.clear();
     if (cache_enabled_) layer_cache_.resize(cfg_.n_layers);
 
+    if (kv_quantized_) {
+        // Q8_0 needs 32-wide sub-blocks; every head_dim in practice (64,
+        // 80, 96, 128...) is already a multiple of 32, but a checkpoint
+        // that somehow isn't falls back to the float cache rather than
+        // quantizing a partial block silently.
+        if (cfg_.head_dim == 0 || cfg_.head_dim % 32 != 0) kv_quantized_ = false;
+        else kv_q_row_bytes_ = kv_quant_row_bytes(cfg_.head_dim);
+    }
+
     cache_capacity_ = 0;
     cache_cols_ = 0;
     grow_cache(512);
+
+    // Opt-in, same reasoning as every other new capability this session:
+    // proven in isolation, not yet run for hours against real memory
+    // pressure, so it doesn't get to default on just because failing safely
+    // costs nothing. DESIREEIA_MLOCK=1 to enable.
+    //
+    // Locks only the token embedding and (when present) the separate output
+    // head — the single largest tensors that are simple to reach here as one
+    // contiguous buffer each, and loaded once, never resized again. NOT a
+    // guarantee that the whole model stays resident: the per-layer weights
+    // (layer_cache_, when the weight cache is on) are dozens of separate
+    // vectors per layer and are not locked by this — that would need walking
+    // every LayerWeights member across every layer, real additional work
+    // left for a follow-up rather than claimed here. See
+    // docs/performance_plan.md item 4.
+    if (std::getenv("DESIREEIA_MLOCK")) {
+        auto lock_matvec = [this](const MatVec& m) {
+            bool ok = false;
+            if (!m.raw.empty()) ok = mlock_range(m.raw.data(), m.raw.size());
+            else if (!m.f.empty()) ok = mlock_range(m.f.data(), m.f.size() * sizeof(float));
+            mlocked_ = mlocked_ || ok;
+        };
+        lock_matvec(tok_embd_);
+        lock_matvec(out_head_);
+    }
+
     return true;
+}
+
+DenseForward::~DenseForward() {
+    if (!mlocked_) return;
+    auto unlock_matvec = [](const MatVec& m) {
+        if (!m.raw.empty()) munlock_range(m.raw.data(), m.raw.size());
+        else if (!m.f.empty()) munlock_range(m.f.data(), m.f.size() * sizeof(float));
+    };
+    unlock_matvec(tok_embd_);
+    unlock_matvec(out_head_);
 }
 
 void DenseForward::reset_cache() {
@@ -1435,6 +1513,32 @@ void DenseForward::grow_cache(size_t needed) {
     const size_t cols = cache_capacity_ > 0 ? cache_capacity_ : 1;
     const size_t new_cols = std::max(needed, cols * 2);
 
+    // kv_quantized_ is a whole-model decision (never set for MLA layers, see
+    // the note on the member): only one of the two storages is ever grown,
+    // not both — no point paying for an allocation that stays unused.
+    if (kv_quantized_) {
+        const size_t row_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
+        std::vector<uint8_t> nk(cfg_.n_layers * new_cols * row_bytes, 0);
+        std::vector<uint8_t> nv(cfg_.n_layers * new_cols * row_bytes, 0);
+        if (cache_capacity_ > 0) {
+            // Same per-layer copy as the float path below, and for the same
+            // reason: a flat memcpy only preserves layer 0 once the
+            // per-layer stride changes between the old and new capacity.
+            for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
+                std::memcpy(nk.data() + (size_t) l * new_cols * row_bytes,
+                            k_cache_q_.data() + (size_t) l * cache_capacity_ * row_bytes,
+                            cache_capacity_ * row_bytes);
+                std::memcpy(nv.data() + (size_t) l * new_cols * row_bytes,
+                            v_cache_q_.data() + (size_t) l * cache_capacity_ * row_bytes,
+                            cache_capacity_ * row_bytes);
+            }
+        }
+        k_cache_q_.swap(nk);
+        v_cache_q_.swap(nv);
+        cache_capacity_ = new_cols;
+        return;
+    }
+
     std::vector<float> nk(cfg_.n_layers * new_cols * kv_dim, 0.0f);
     std::vector<float> nv(cfg_.n_layers * new_cols * kv_dim, 0.0f);
     if (cache_capacity_ > 0) {
@@ -1457,6 +1561,30 @@ void DenseForward::grow_cache(size_t needed) {
     k_cache_.swap(nk);
     v_cache_.swap(nv);
     cache_capacity_ = new_cols;
+}
+
+void DenseForward::write_kv_cache(uint32_t l, uint32_t pos, const float* k, const float* v) {
+    const uint32_t kv_dim = cfg_.n_head_kv * cfg_.head_dim;
+    if (!kv_quantized_) {
+        float* kc = k_cache_.data() + ((size_t) l * cache_capacity_ + pos) * kv_dim;
+        float* vc = v_cache_.data() + ((size_t) l * cache_capacity_ + pos) * kv_dim;
+        std::memcpy(kc, k, kv_dim * sizeof(float));
+        std::memcpy(vc, v, kv_dim * sizeof(float));
+        return;
+    }
+    // One Q8_0 row per kv-head: each head_dim-wide slice gets its own
+    // sub-block scales, matching the read side's per-head addressing
+    // (kv_dot_q8_0/kv_axpy_q8_0 are called once per head, never across the
+    // whole kv_dim-wide position at once — see the note on kv_dot_q8_0 for
+    // why a single wide row wouldn't fit how GQA/MHA actually read this).
+    const size_t row_bytes = kv_q_row_bytes_;
+    const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
+    uint8_t* kc = k_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes + (size_t) pos * pos_bytes;
+    uint8_t* vc = v_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes + (size_t) pos * pos_bytes;
+    for (uint32_t h = 0; h < cfg_.n_head_kv; ++h) {
+        kv_quantize_row(k + (size_t) h * cfg_.head_dim, cfg_.head_dim, kc + (size_t) h * row_bytes);
+        kv_quantize_row(v + (size_t) h * cfg_.head_dim, cfg_.head_dim, vc + (size_t) h * row_bytes);
+    }
 }
 
 // MLA (DeepSeek2 and siblings): compressed-rank "absorbed" attention, see
@@ -1523,7 +1651,11 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
         // Assorbimento: q_nope_absorbed[j] = sum_i wk_b[i,j,h] * q_nope[i],
         // j in [0,kv_lora) — vedi la derivazione dal layout ggml nella nota
         // su LayerWeights::wk_b_h in dense_forward.h.
-        matvec(lw->wk_b_h[h], kv_lora, nope_w, qh, qcur.data());
+        // Not matvec(): wk_b_h is always Float format (see the note on
+        // out_head_/wk_b_h construction), and this call happens on every
+        // head of every layer of every token — the fast SIMD path, not the
+        // generic scalar-double fallback matvec() would otherwise pick.
+        matmul_f32_fast(lw->wk_b_h[h].f.data(), kv_lora, nope_w, qh, qcur.data());
         std::memcpy(qcur.data() + kv_lora, qh + nope_w, rope_w * sizeof(float));
         rope_mla_cached(qcur.data() + kv_lora, rope_w, rope_cache_kv.data());
         if (h == 0) trace_vec("qcur", l, pos, qcur.data(), comp_w);
@@ -1540,7 +1672,8 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
             axpy_f32(attn_raw.data(), cache_base + (size_t) cc * comp_w, scores[cc], kv_lora);
         }
         // De-assorbimento: out[j] = sum_i wv_b[i,j,h] * attn_raw[i], j in [0,v_mla).
-        matvec(lw->wv_b_h[h], v_mla, kv_lora, attn_raw.data(), attn_concat.data() + (size_t) h * v_mla);
+        matmul_f32_fast(lw->wv_b_h[h].f.data(), v_mla, kv_lora, attn_raw.data(),
+                        attn_concat.data() + (size_t) h * v_mla);
         if (h == 0) trace_vec("attn_raw", l, pos, attn_raw.data(), kv_lora);
     }
     trace_vec("attn_concat", l, pos, attn_concat.data(), attn_concat.size());
@@ -1875,10 +2008,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     }
                 }
 
-                float* kc = k_cache_.data() + ((size_t) l * cache_capacity_ + pos) * kv_dim;
-                float* vc = v_cache_.data() + ((size_t) l * cache_capacity_ + pos) * kv_dim;
-                std::memcpy(kc, kp, kv_dim * sizeof(float));
-                std::memcpy(vc, vp, kv_dim * sizeof(float));
+                write_kv_cache(l, pos, kp, vp);
 
                 // Stessa mascheratura SWA del percorso di decode (vedi la
                 // nota estesa li'): restringe l'intervallo invece di
@@ -1893,8 +2023,6 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 for (uint32_t h = (uint32_t) h_begin; h < (uint32_t) h_end; ++h) {
                     const uint32_t hkv = h / heads_per_kv;
                     const float* qh = qp + (size_t) h * cfg_.head_dim;
-                    const float* kb = k_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
-                    const float* vb = v_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
                     // Ogni testa scrive nella propria fetta locale di scores
                     // (buffer allocato per-testa qui, non condiviso come nel
                     // percorso di decode): il batch path processa un token
@@ -1902,22 +2030,49 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     // indipendenti fra loro.
                     std::vector<float> scores_h_local((size_t) pos + 1, 0.0f);
                     float* scores_h = scores_h_local.data();
-                    if (quirks_.alibi) {
-                        const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);
+                    float* oh = aout + (size_t) h * cfg_.head_dim;
+                    if (kv_quantized_) {
+                        const size_t row_bytes = kv_q_row_bytes_;
+                        const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
+                        const uint8_t* kb = k_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                                           + (size_t) hkv * row_bytes;
+                        const uint8_t* vb = v_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                                           + (size_t) hkv * row_bytes;
+                        if (quirks_.alibi) {
+                            const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);
+                            for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                                scores_h[cc] = kv_dot_q8_0(qh, kb + (size_t) cc * pos_bytes, cfg_.head_dim) * inv_d
+                                             - slope * (float) (pos - cc);
+                            }
+                        } else {
+                            for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                                scores_h[cc] = kv_dot_q8_0(qh, kb + (size_t) cc * pos_bytes, cfg_.head_dim) * inv_d;
+                            }
+                        }
+                        softmax_inplace(scores_h + cc_start, (size_t) pos + 1 - cc_start);
+                        for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
                         for (uint32_t cc = cc_start; cc <= pos; ++cc) {
-                            scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d
-                                         - slope * (float) (pos - cc);
+                            kv_axpy_q8_0(oh, vb + (size_t) cc * pos_bytes, cfg_.head_dim, scores_h[cc]);
                         }
                     } else {
-                        for (uint32_t cc = cc_start; cc <= pos; ++cc) {
-                            scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d;
+                        const float* kb = k_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
+                        const float* vb = v_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
+                        if (quirks_.alibi) {
+                            const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);
+                            for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                                scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d
+                                             - slope * (float) (pos - cc);
+                            }
+                        } else {
+                            for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                                scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d;
+                            }
                         }
-                    }
-                    softmax_inplace(scores_h + cc_start, (size_t) pos + 1 - cc_start);
-                    float* oh = aout + (size_t) h * cfg_.head_dim;
-                    for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
-                    for (uint32_t cc = cc_start; cc <= pos; ++cc) {
-                        axpy_f32(oh, vb + (size_t) cc * kv_dim, scores_h[cc], cfg_.head_dim);
+                        softmax_inplace(scores_h + cc_start, (size_t) pos + 1 - cc_start);
+                        for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
+                        for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                            axpy_f32(oh, vb + (size_t) cc * kv_dim, scores_h[cc], cfg_.head_dim);
+                        }
                     }
                 }
                 });
@@ -2110,10 +2265,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 }
             }
 
-            float* kc = k_cache_.data() + ((size_t) l * cache_capacity_ + pos) * kv_dim;
-            float* vc = v_cache_.data() + ((size_t) l * cache_capacity_ + pos) * kv_dim;
-            std::memcpy(kc, k.data(), kv_dim * sizeof(float));
-            std::memcpy(vc, v.data(), kv_dim * sizeof(float));
+            write_kv_cache(l, pos, k.data(), v.data());
             }
 
             {
@@ -2146,31 +2298,14 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 float* scores_h = scores.data() + (size_t) h * score_stride;
                 const uint32_t hkv = h / heads_per_kv;
                 const float* qh = q.data() + (size_t) h * cfg_.head_dim;
-                const float* kb = k_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
-                const float* vb = v_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
+                float* oh = attn_out.data() + (size_t) h * cfg_.head_dim;
                 // Kept in float and vectorized, not a `double`
                 // accumulator: double entirely blocked vectorization of
                 // the innermost attention dot product, and the scores go
                 // through a softmax right afterward anyway.
-                if (quirks_.alibi) {
-                    const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);
-                    for (uint32_t cc = cc_start; cc <= pos; ++cc) {
-                        scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d
-                                     - slope * (float) (pos - cc);
-                    }
-                } else {
-                    for (uint32_t cc = cc_start; cc <= pos; ++cc) {
-                        scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d;
-                    }
-                }
-                // Softmax solo sulla sottofinestra [cc_start, pos]: le
-                // posizioni prima di cc_start non partecipano (equivalente a
-                // un punteggio -inf), e non vengono nemmeno lette dal ciclo
-                // di accumulo di V sotto.
-                softmax_inplace(scores_h + cc_start, score_stride - cc_start);
-                float* oh = attn_out.data() + (size_t) h * cfg_.head_dim;
-                // ORDINE DEI CICLI INVERTITO (2026-09-07). Prima il ciclo
-                // esterno era su d e quello interno su cc:
+                //
+                // ORDINE DEI CICLI INVERTITO (2026-09-07) nell'accumulo V.
+                // Prima il ciclo esterno era su d e quello interno su cc:
                 //     for d: for cc: acc += scores[cc] * vb[cc*kv_dim + d];
                 // cioe' l'accesso piu' interno saltava di kv_dim float (4 KB
                 // con kv_dim=1024) a ogni iterazione: OGNI accesso cadeva su
@@ -2180,10 +2315,53 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 // a spiegare i ~17 ms di tratto seriale misurati dal profiler.
                 // Con l'ordine giusto il ciclo interno percorre una riga
                 // contigua di V, quindi ogni cache line serve 16 valori ed e'
-                // anche vettorizzabile.
-                for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
-                for (uint32_t cc = cc_start; cc <= pos; ++cc) {
-                    axpy_f32(oh, vb + (size_t) cc * kv_dim, scores_h[cc], cfg_.head_dim);
+                // anche vettorizzabile. Vale per entrambi i rami sotto.
+                if (kv_quantized_) {
+                    const size_t row_bytes = kv_q_row_bytes_;
+                    const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
+                    const uint8_t* kb = k_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                                       + (size_t) hkv * row_bytes;
+                    const uint8_t* vb = v_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                                       + (size_t) hkv * row_bytes;
+                    if (quirks_.alibi) {
+                        const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);
+                        for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                            scores_h[cc] = kv_dot_q8_0(qh, kb + (size_t) cc * pos_bytes, cfg_.head_dim) * inv_d
+                                         - slope * (float) (pos - cc);
+                        }
+                    } else {
+                        for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                            scores_h[cc] = kv_dot_q8_0(qh, kb + (size_t) cc * pos_bytes, cfg_.head_dim) * inv_d;
+                        }
+                    }
+                    softmax_inplace(scores_h + cc_start, score_stride - cc_start);
+                    for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
+                    for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                        kv_axpy_q8_0(oh, vb + (size_t) cc * pos_bytes, cfg_.head_dim, scores_h[cc]);
+                    }
+                } else {
+                    const float* kb = k_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
+                    const float* vb = v_cache_.data() + ((size_t) l * cache_capacity_) * kv_dim + (size_t) hkv * cfg_.head_dim;
+                    if (quirks_.alibi) {
+                        const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);
+                        for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                            scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d
+                                         - slope * (float) (pos - cc);
+                        }
+                    } else {
+                        for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                            scores_h[cc] = dot_f32(qh, kb + (size_t) cc * kv_dim, cfg_.head_dim) * inv_d;
+                        }
+                    }
+                    // Softmax solo sulla sottofinestra [cc_start, pos]: le
+                    // posizioni prima di cc_start non partecipano (equivalente
+                    // a un punteggio -inf), e non vengono nemmeno lette dal
+                    // ciclo di accumulo di V sotto.
+                    softmax_inplace(scores_h + cc_start, score_stride - cc_start);
+                    for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
+                    for (uint32_t cc = cc_start; cc <= pos; ++cc) {
+                        axpy_f32(oh, vb + (size_t) cc * kv_dim, scores_h[cc], cfg_.head_dim);
+                    }
                 }
             }
             });

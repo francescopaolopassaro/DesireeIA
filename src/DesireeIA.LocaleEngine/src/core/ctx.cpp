@@ -534,7 +534,8 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         }
     } else if (meta.format == DESIREEIA_FORMAT_GGUF && arch_kind != ArchKind::Unknown) {
         DenseForward* df = new DenseForward;
-        if (df->open(*reader, meta, arch_kind, ctx->st.plan.ram_budget_mb, ctx->st.experts)) {
+        if (df->open(*reader, meta, arch_kind, ctx->st.plan.ram_budget_mb, ctx->st.experts,
+                     ctx->st.plan.kv_compression_enabled != 0)) {
             ctx->gf = df;
             if (log) {
                 log(5, df->weight_cache_enabled()
