@@ -1648,9 +1648,23 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
     float mla_corr_lo = 0.0f, mla_corr_hi = 0.0f, mla_kq_scale = 0.0f;
     if (quirks_.mla) {
         cfg_.layer_rope_corr_dims(0, mla_corr_lo, mla_corr_hi);
-        const float attn_factor_org = cfg_.rope_attn_factor * (1.0f + 0.1f * logf(1.0f / cfg_.rope_freq_scale));
-        const float mscale = attn_factor_org * (1.0f + 0.1f * cfg_.rope_yarn_log_mul * logf(1.0f / cfg_.rope_freq_scale));
-        mla_kq_scale = mscale * mscale / sqrtf((float) (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope));
+        // The plain 1/sqrt(d) scale, unconditionally — matches a real
+        // reference implementation's attn_scale exactly and never changes
+        // with YaRN.
+        //
+        // A YaRN attn_factor correction belongs on the ROPE-carrying
+        // dimensions ONLY, and rope_cache_init already applies it there
+        // (scaling cos/sin, which is passed cfg_.rope_attn_factor below):
+        // both q's roped slice and the cached k's roped slice pick it up
+        // independently, so their dot product already carries it squared.
+        // Multiplying it into kq_scale here on top of that would apply it a
+        // second time — and to the "nope" portion of the score too, which
+        // never goes through rope_cache_init and has no business being
+        // rescaled by a rope correction at all. Measured: with this file's
+        // factor=40 the double count alone made the pre-softmax score ~3x
+        // too large, collapsing softmax into a near one-hot distribution and
+        // degenerating decoding into repeating a handful of dominant tokens.
+        mla_kq_scale = 1.0f / sqrtf((float) (cfg_.n_embd_head_qk_nope + cfg_.n_embd_head_qk_rope));
         // Diagnostic escape hatch: isolate the YaRN scale/ramp contribution
         // from the base absorbed-attention math while tracking down a
         // real-model MLA bug. Not a normal user knob.
