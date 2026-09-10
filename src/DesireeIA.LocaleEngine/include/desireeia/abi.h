@@ -238,6 +238,52 @@ DESIREEIA_API desireeia_error desireeia_set_sampling(desireeia_ctx* ctx,
 DESIREEIA_API desireeia_error desireeia_get_sampling(const desireeia_ctx* ctx,
                                             desireeia_sampling* out);
 
+/* Recover-LoRA: carica un adapter LoRA in formato GGUF, convenzione
+ * desireeialmn (tensori "<nome_base>.lora_a" / "<nome_base>.lora_b",
+ * metadato "adapter.lora.alpha"). Applicato a runtime senza toccare i pesi
+ * base: out = base_mm(x, W) + scale * B @ (A @ x). Puo' essere chiamata
+ * piu' volte per caricare piu' adapter contemporaneamente (i contributi si
+ * sommano); scale moltiplica il fattore alpha/rank dell'adapter (1.0 se
+ * l'adapter non ha alpha). Copre attenzione, FFN densa/MLA/shared-expert;
+ * NON copre gli esperti MoE instradati (percorso diverso, vedi
+ * docs/README). Ritorna DESIREEIA_ERR_NOT_SUPPORTED se il modello non ha
+ * un motore forward generativo (es. encoder BERT), DESIREEIA_ERR_IO se il
+ * file non si apre, DESIREEIA_ERR_PARSE se non e' un adapter LoRA valido. */
+DESIREEIA_API desireeia_error desireeia_load_lora_adapter(desireeia_ctx* ctx,
+                                                  const char* lora_gguf_path,
+                                                  float scale);
+
+/* Rimuove tutti gli adapter LoRA caricati sul contesto. */
+DESIREEIA_API desireeia_error desireeia_clear_lora_adapters(desireeia_ctx* ctx);
+
+/* Prerouter routing prediction: predice, dai dati del layer L, quali
+ * esperti instradera' probabilmente il layer L+1, cosi' i loro pesi
+ * possono essere precaricati in background un layer prima del reale
+ * calcolo del router (vedi src/models/prerouter.h per la matematica).
+ * Non ha mai effetto sulla correttezza: una previsione sbagliata o
+ * assente lascia semplicemente girare il percorso di lettura gia'
+ * esistente quando il layer L+1 calcola davvero il proprio router.
+ *
+ * `path`: file GGUF con la convenzione di denominazione propria di questo
+ * motore (tensori "prerouter.<N>.fc1.weight" / ".fc2.weight" /
+ * ".linear_init.weight" per ogni layer "owner" N) — NON compatibile byte
+ * per byte con nessun formato di riferimento esterno. Ritorna
+ * DESIREEIA_ERR_NOT_SUPPORTED se il modello non ha esperti MoE o non ha
+ * un motore forward generativo, DESIREEIA_ERR_PARSE se il file non
+ * contiene nessuna testa valida in quel formato. */
+DESIREEIA_API desireeia_error desireeia_load_prerouter(desireeia_ctx* ctx, const char* path);
+
+/* Rimuove tutte le teste prerouter caricate. */
+DESIREEIA_API desireeia_error desireeia_clear_prerouter(desireeia_ctx* ctx);
+
+/* Attiva/disattiva l'euristica di fallback ("il layer L+1 instrada agli
+ * stessi esperti appena usati dal layer L") per i layer owner senza una
+ * testa prerouter addestrata caricata. Spenta di default: nessuna testa
+ * addestrata e' oggi disponibile per nessun modello, quindi questa e'
+ * l'unico modo di avere QUALCHE previsione finche' non ne esiste una
+ * reale — dichiaratamente un placeholder, non una previsione accurata. */
+DESIREEIA_API desireeia_error desireeia_set_prerouter_heuristic(desireeia_ctx* ctx, int32_t enabled);
+
 /* Applica il formato di chat rilevato per il modello (dal
  * "tokenizer.chat_template" del GGUF, o da un default per architettura se
  * assente) a una sequenza di messaggi, scrivendo il prompt risultante in

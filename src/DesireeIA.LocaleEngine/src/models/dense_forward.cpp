@@ -207,6 +207,43 @@ static void matmul_f32_fast(const float* w, size_t r, size_t c, const float* x, 
     profile_counters().calls_f32.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Adds every active LoRA delta of `m` into y, on top of whatever the base
+// matmul already wrote there:
+//   y += scale * B @ (A @ x)     for each loaded adapter that targets m
+// A/B are always float and rank-sized (small), so this is a pair of tiny
+// dense matmuls, negligible next to the base matmul regardless of its
+// quant format. No-op (one empty() check) when nothing is loaded, which
+// is the overwhelming common case — this must stay cheap since it runs on
+// the same hot path as every quantized matmul in the engine.
+static void apply_lora(const MatVec& m, size_t r, size_t c, const float* x, float* y) {
+    if (m.lora.empty()) return;
+    std::vector<float> mid;
+    for (const auto& lw : m.lora) {
+        if (lw.rank == 0) continue;
+        mid.assign(lw.rank, 0.0f);
+        for (size_t k = 0; k < lw.rank; ++k) {
+            const float* arow = lw.a.data() + k * c;
+            double acc = 0.0;
+            for (size_t i = 0; i < c; ++i) acc += (double) arow[i] * x[i];
+            mid[k] = (float) acc;
+        }
+        for (size_t j = 0; j < r; ++j) {
+            const float* brow = lw.b.data() + j * lw.rank;
+            double acc = 0.0;
+            for (size_t k = 0; k < lw.rank; ++k) acc += (double) brow[k] * mid[k];
+            y[j] += lw.scale * (float) acc;
+        }
+    }
+}
+
+// Same as apply_lora, but over n_tok columns of activation (see matvec_batch).
+static void apply_lora_batch(const MatVec& m, size_t r, size_t c, const float* x, size_t n_tok, float* y) {
+    if (m.lora.empty()) return;
+    for (size_t tk = 0; tk < n_tok; ++tk) {
+        apply_lora(m, r, c, x + tk * c, y + tk * r);
+    }
+}
+
 // Dispatcher: usa il kernel quantizzato diretto se il tensore e' Q4_0 su
 // disco, altrimenti ricade sul matmul float classico su dati dequantizzati.
 static void matvec(const MatVec& m, size_t r, size_t c, const float* x, float* y) {
@@ -224,6 +261,7 @@ static void matvec(const MatVec& m, size_t r, size_t c, const float* x, float* y
         case MatVecFormat::Q8_K: matmul_q8_k(m.raw.data(), r, c, x, y); break;
         default:                 matmul_f32(m.f.data(), r, c, x, y);   break;
     }
+    apply_lora(m, r, c, x, y);
 }
 
 // Same dispatch as matvec above, but over a bare pointer instead of a MatVec.
@@ -284,6 +322,7 @@ static void matvec_batch(const MatVec& m, size_t r, size_t c, const float* x, si
             }
             break;
     }
+    apply_lora_batch(m, r, c, x, n_tok, y);
 }
 
 // Fase "elimina ri-quantizzazione ridondante" (2026-09-07): wq/wk/wv (e
@@ -312,9 +351,15 @@ static void matvec_shared(const MatVec& m, size_t r, size_t c, const float* x,
                            const std::vector<int8_t>& xq, const std::vector<float>& xscale,
                            const std::vector<int32_t>& xsum, float* y) {
     switch (m.format) {
-        case MatVecFormat::Q4_K: matmul_q4_k_pq(m.raw.data(), r, c, xq.data(), xscale.data(), xsum.data(), y); break;
-        case MatVecFormat::Q6_K: matmul_q6_k_pq(m.raw.data(), r, c, xq.data(), xscale.data(), y); break;
-        default: matvec(m, r, c, x, y); break;
+        case MatVecFormat::Q4_K:
+            matmul_q4_k_pq(m.raw.data(), r, c, xq.data(), xscale.data(), xsum.data(), y);
+            apply_lora(m, r, c, x, y);
+            break;
+        case MatVecFormat::Q6_K:
+            matmul_q6_k_pq(m.raw.data(), r, c, xq.data(), xscale.data(), y);
+            apply_lora(m, r, c, x, y);
+            break;
+        default: matvec(m, r, c, x, y); break; // matvec() already applies LoRA
     }
 }
 
@@ -363,6 +408,9 @@ static void matvec_shared_group(const SharedMatvec* items, size_t n, const float
     }
     if (fusable && fused_pq_supported(jobs, n) &&
         matmul_fused_pq(jobs, n) == DESIREEIA_OK) {
+        for (size_t i = 0; i < n; ++i) {
+            apply_lora(*items[i].m, items[i].r, items[i].c, x, items[i].y);
+        }
         return;
     }
     for (size_t i = 0; i < n; ++i) {
@@ -573,6 +621,14 @@ static void softmax_inplace(float* s, size_t n) {
     }
 }
 
+}
+
+// Test-only entry point: apply_lora() above is translation-unit-local
+// (anonymous namespace), so tests/selftest.cpp — which links against this
+// object file but can't see anonymous-namespace symbols by name — reaches
+// the same code through this thin wrapper instead of duplicating the math.
+void lora_apply_delta_for_test(const MatVec& m, size_t r, size_t c, const float* x, float* y) {
+    apply_lora(m, r, c, x, y);
 }
 
 bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, uint64_t ram_budget_mb,
@@ -1044,6 +1100,15 @@ static bool requantize_q6k_to_q4k(std::vector<uint8_t>& raw, uint32_t rows, uint
     return true;
 }
 
+void DenseForward::maybe_prefetch_experts(const LayerWeights& lw, uint32_t layer,
+                                          const std::vector<std::pair<uint32_t, float>>& selected) {
+    if (!experts_ || lw.exps_stacked || selected.empty()) return;
+    std::vector<uint32_t> idxs;
+    idxs.reserve(selected.size());
+    for (const auto& sel : selected) idxs.push_back(sel.first);
+    experts_->prefetch_async(layer, idxs);
+}
+
 bool DenseForward::expert_ffn(const LayerWeights& lw, uint32_t layer, uint32_t eidx,
                               const float* xin, bool gelu_act,
                               std::vector<float>& ffn, std::vector<float>& ffn_gate,
@@ -1127,6 +1192,7 @@ bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_
             }
             out.raw = std::move(raw);
             out.format = fmt;
+            attach_lora_deltas(name, rows, cols, out);
             return true;
         }
     }
@@ -1153,7 +1219,170 @@ bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_
     }
 
     if (!rd.read_tensor(name, out.f) || out.f.size() != (size_t) rows * cols) return false;
+    attach_lora_deltas(name, rows, cols, out);
     return true;
+}
+
+void DenseForward::attach_lora_deltas(const std::string& name, uint32_t rows, uint32_t cols, MatVec& out) {
+    if (lora_adapters_.empty()) return;
+    for (auto& ad : lora_adapters_) {
+        std::vector<float> a, b;
+        if (!ad.reader->read_tensor(name + ".lora_a", a)) continue;
+        if (!ad.reader->read_tensor(name + ".lora_b", b)) continue;
+        if (cols == 0 || a.empty() || a.size() % cols != 0) continue;
+        const uint32_t rank = (uint32_t) (a.size() / cols);
+        if (rank == 0 || b.size() != (size_t) rows * rank) continue;
+
+        LoraWeight lw;
+        lw.a = std::move(a);
+        lw.b = std::move(b);
+        lw.rank = rank;
+        // Classic PEFT alpha/rank scaling times the caller-supplied scale.
+        lw.scale = ad.alpha > 0.0f ? ad.user_scale * ad.alpha / (float) rank : ad.user_scale;
+        out.lora.push_back(std::move(lw));
+    }
+}
+
+bool DenseForward::load_lora(const std::string& lora_gguf_path, float scale, std::string& err) {
+    std::unique_ptr<ModelReader> reader(make_gguf_reader());
+    ModelMeta meta;
+    if (!reader->open(lora_gguf_path, meta)) {
+        err = "failed to open LoRA adapter file: " + lora_gguf_path;
+        return false;
+    }
+    std::string adapter_type;
+    if (reader->meta_str("adapter.type", adapter_type) && adapter_type != "lora") {
+        err = "not a LoRA adapter file (adapter.type=" + adapter_type + "): " + lora_gguf_path;
+        return false;
+    }
+
+    LoraAdapter ad;
+    ad.reader = std::move(reader);
+    ad.reader->meta_f32("adapter.lora.alpha", ad.alpha);
+    ad.user_scale = scale;
+    lora_adapters_.push_back(std::move(ad));
+
+    // layer_cache_ is populated LAZILY (see get_layer()'s sentinel check on
+    // w.wq/w.wkv_a_mqa): the common case (adapter loaded right after the
+    // model, before the first generation call) means every entry is still
+    // untouched and will pick this adapter up naturally on first access —
+    // nothing to do. For a layer already lazily loaded (generation already
+    // happened on this model), reset it back to that same "not loaded yet"
+    // state so the next get_layer() call re-reads it, this time attaching
+    // the new adapter. Streaming models (cache disabled) need nothing
+    // extra either way: load_matrix() re-runs on every step regardless.
+    if (cache_enabled_) {
+        for (auto& lw : layer_cache_) {
+            if (!lw.wq.empty() || !lw.wkv_a_mqa.empty()) lw = LayerWeights{};
+        }
+    }
+    return true;
+}
+
+void DenseForward::maybe_prefetch_predicted(uint32_t layer, const std::vector<uint32_t>& idxs) {
+    if (!experts_ || stack_experts_ || idxs.empty() || layer >= cfg_.n_layers) return;
+    experts_->prefetch_async(layer, idxs);
+}
+
+void DenseForward::build_prerouter_feature(const float* hidden,
+                                           const std::vector<std::pair<uint32_t, float>>& selected,
+                                           std::vector<float>& out) const {
+    const uint32_t n_embd = cfg_.n_embd;
+    const uint32_t n_expert = cfg_.n_expert;
+    out.assign((size_t) n_embd + 2 * (size_t) n_expert, 0.0f);
+    std::copy(hidden, hidden + n_embd, out.begin());
+    for (const auto& sel : selected) {
+        if (sel.first < n_expert) {
+            out[n_embd + sel.first] = 1.0f;
+            out[n_embd + n_expert + sel.first] = 1.0f;
+        }
+    }
+}
+
+void DenseForward::maybe_predict_next_layer(uint32_t l, const float* hidden,
+                                            const std::vector<std::pair<uint32_t, float>>& selected) {
+    if (l + 1 >= cfg_.n_layers) return;
+
+    std::vector<uint32_t> predicted;
+    auto it = prerouter_heads_.find(l);
+    if (it != prerouter_heads_.end()) {
+        std::vector<float> feat;
+        build_prerouter_feature(hidden, selected, feat);
+        prerouter_predict(it->second, feat.data(), feat.size(), cfg_.n_expert_used, predicted);
+    } else if (prerouter_heuristic_) {
+        predicted.reserve(selected.size());
+        for (const auto& sel : selected) predicted.push_back(sel.first);
+    } else {
+        return;
+    }
+    maybe_prefetch_predicted(l + 1, predicted);
+}
+
+bool DenseForward::load_prerouter(const std::string& path, std::string& err) {
+    if (cfg_.n_expert == 0) {
+        err = "model has no MoE experts (n_expert=0); prerouter has nothing to predict";
+        return false;
+    }
+    std::unique_ptr<ModelReader> reader(make_gguf_reader());
+    ModelMeta meta;
+    if (!reader->open(path, meta)) {
+        err = "failed to open prerouter file: " + path;
+        return false;
+    }
+
+    // Tensor naming: "prerouter.<owner_layer>.fc1.weight" / ".fc2.weight" /
+    // ".linear_init.weight" — this engine's own convention, NOT the same
+    // layout as any external reference implementation's format (there is
+    // no byte-compatible external file to load here; see README).
+    const uint32_t n_expert = cfg_.n_expert;
+    const size_t feat_dim = (size_t) cfg_.n_embd + 2 * (size_t) n_expert;
+    uint32_t loaded = 0;
+    for (uint32_t owner = 0; owner < cfg_.n_layers; ++owner) {
+        const std::string p = "prerouter." + std::to_string(owner) + ".";
+        std::vector<float> fc1, fc2, lin;
+        if (!reader->read_tensor(p + "fc1.weight", fc1)) continue;
+        if (!reader->read_tensor(p + "fc2.weight", fc2)) continue;
+        if (!reader->read_tensor(p + "linear_init.weight", lin)) continue;
+        if (feat_dim == 0 || fc1.empty() || fc1.size() % feat_dim != 0) continue;
+        const uint32_t prerouter_hidden = (uint32_t) (fc1.size() / feat_dim);
+        if (fc2.size() != (size_t) n_expert * prerouter_hidden) continue;
+        if (lin.size() != (size_t) n_expert * feat_dim) continue;
+
+        PrerouterHead head;
+        head.fc1 = std::move(fc1);
+        head.fc2 = std::move(fc2);
+        head.lin = std::move(lin);
+        head.hidden = cfg_.n_embd;
+        head.prerouter_hidden = prerouter_hidden;
+        head.n_expert = n_expert;
+        prerouter_heads_[owner] = std::move(head);
+        ++loaded;
+    }
+    if (loaded == 0) {
+        err = "no valid prerouter heads found (expected tensors named "
+              "prerouter.<N>.fc1/fc2/linear_init.weight): " + path;
+        return false;
+    }
+    return true;
+}
+
+void DenseForward::clear_prerouter() {
+    prerouter_heads_.clear();
+}
+
+void DenseForward::set_prerouter_heuristic(bool on) {
+    prerouter_heuristic_ = on;
+}
+
+void DenseForward::clear_lora() {
+    lora_adapters_.clear();
+    // Same reasoning as load_lora(): force already-loaded layers to reload
+    // on next access, this time with no adapter to attach.
+    if (cache_enabled_) {
+        for (auto& lw : layer_cache_) {
+            if (!lw.wq.empty() || !lw.wkv_a_mqa.empty()) lw = LayerWeights{};
+        }
+    }
 }
 
 // falcon (DenseQuirks::fused_qkv): a single attn_qkv.weight tensor, rows
@@ -1887,6 +2116,8 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     auto selected = moe_route_ex(router_logits, cfg_.n_expert_used, cfg_.moe_norm_w, cfg_.moe_w_scale,
                                                   cfg_.moe_sigmoid_gate ? MoeGatingFunc::Sigmoid : MoeGatingFunc::Softmax,
                                                   lw->router_bias.empty() ? nullptr : &lw->router_bias);
+                    maybe_prefetch_experts(*lw, l, selected);
+                    maybe_predict_next_layer(l, mla_fnorm.data(), selected);
                     std::fill(expert_out.begin(), expert_out.end(), 0.0f);
                     static const bool skip_routed = std::getenv("DESIREEIA_MOE_SHARED_ONLY") != nullptr;
                     if (!skip_routed)
@@ -2125,6 +2356,8 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     float* projp = proj_all.data() + p * n_embd;
                     matvec(lw->router, cfg_.n_expert, n_embd, xnp, router_logits.data());
                     auto selected = moe_route(router_logits, cfg_.n_expert_used, cfg_.moe_norm_w, cfg_.moe_w_scale);
+                    maybe_prefetch_experts(*lw, l, selected);
+                    maybe_predict_next_layer(l, xnp, selected);
                     std::fill(expert_out.begin(), expert_out.end(), 0.0f);
                     for (const auto& sel : selected) {
                         const uint32_t eidx = sel.first;
@@ -2411,6 +2644,8 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 // esperti ancora, gap noto).
                 matvec(lw->router, cfg_.n_expert, n_embd, xnp, router_logits.data());
                 auto selected = moe_route(router_logits, cfg_.n_expert_used, cfg_.moe_norm_w, cfg_.moe_w_scale);
+                maybe_prefetch_experts(*lw, l, selected);
+                maybe_predict_next_layer(l, xnp, selected);
 
                 std::fill(expert_out.begin(), expert_out.end(), 0.0f);
                 for (const auto& sel : selected) {

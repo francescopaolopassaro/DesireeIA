@@ -5,8 +5,10 @@
 #include "ssd_tier/hybrid_tier.h"
 #include "thread_pool.h"
 #include <algorithm>
+#include <condition_variable>
 #include <functional>
 #include <list>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -151,6 +153,10 @@ struct ExpertRequest {
 class ExpertStore {
 public:
     ExpertStore(int32_t cache_count, LogFn log);
+    ~ExpertStore();
+    ExpertStore(const ExpertStore&) = delete;
+    ExpertStore& operator=(const ExpertStore&) = delete;
+
     // Il reader non e' posseduto: deve restare valido per tutta la vita
     // di ExpertStore (in ctx.cpp entrambi vivono dentro lo stesso EngineState).
     void set_reader(ModelReader* reader) { reader_ = reader; }
@@ -159,6 +165,20 @@ public:
     void fetch_union(const std::vector<ExpertRequest>& reqs, std::vector<float>& out_buffer,
                      std::vector<const float*>& out_ptrs);
     void prefetch_layer(uint32_t layer, const std::vector<uint32_t>& idxs);
+
+    // Overlap reale (a differenza di prefetch_layer sopra, che nessuno
+    // chiama mai oggi): accoda gli indici richiesti per `layer` a un
+    // worker in background dedicato, che li carica (Gate/Up/Down) mentre
+    // il chiamante continua a calcolare. Non blocca. Un solo slot in
+    // sospeso: una richiesta piu' recente rimpiazza quella precedente non
+    // ancora iniziata (conta solo la previsione piu' fresca). Sicuro da
+    // chiamare insieme a fetch()/fetch_union() dallo stesso thread
+    // "principale" mentre il worker gira: le strutture cache condividono
+    // mtx_, le letture fisiche condividono reader_mtx_ (mai due letture
+    // concorrenti sullo stesso reader, ma la metadata-cache e il calcolo
+    // del chiamante non aspettano mai l'I/O del worker).
+    void prefetch_async(uint32_t layer, const std::vector<uint32_t>& idxs);
+
     void set_prefetch_depth(int32_t depth) { prefetch_depth_ = depth > 0 ? depth : 1; }
     void set_pin_enabled(bool on) { pin_enabled_ = on; }
     void set_usage_file(const std::string& path) { usage_file_ = path; }
@@ -177,7 +197,18 @@ private:
         return (static_cast<uint64_t>(layer) << 48) | (static_cast<uint64_t>(idx) << 8) |
                static_cast<uint64_t>(part);
     }
+    // Legge (I/O reale) SENZA tenere mtx_: solo reader_mtx_, cosi' non
+    // blocca mai le operazioni sulla cache dell'altro thread durante una
+    // lettura lenta. Ogni chiamante re-acquisisce mtx_ per inserire il
+    // risultato in map_/order_ dopo il ritorno.
     bool load_data(uint64_t key, std::vector<float>& out);
+    // Inserisce (o aggiorna) `key` in map_/order_ con eviction LRU che
+    // salta le entry pinnate — stessa politica del ramo "miss" di fetch(),
+    // fattorizzata qui perche' sia fetch() sia il worker di prefetch_async
+    // ne hanno bisogno. Il chiamante deve gia' tenere mtx_.
+    void insert_locked(uint64_t key, std::vector<float>&& data);
+    void prefetch_worker_loop();
+
     ModelReader* reader_ = nullptr;
     HybridTier* hybrid_tier_ = nullptr;
     int32_t cache_count_;
@@ -185,9 +216,28 @@ private:
     bool pin_enabled_ = true;
     std::string usage_file_;
     LogFn log_;
+
+    // Protegge map_/order_/usage_. Mai tenuto durante una lettura (I/O).
+    std::mutex mtx_;
     std::list<Entry> order_;
     std::unordered_map<uint64_t, std::list<Entry>::iterator> map_;
     std::unordered_map<uint64_t, uint32_t> usage_;
+
+    // Serializza le letture fisiche (reader_/hybrid_tier_) fra il thread
+    // chiamante e il worker di prefetch: nessuna lettura concorrente sullo
+    // stesso reader, per non dover verificare/garantire la thread-safety
+    // di GgufReader/HybridTier internamente. Il guadagno e' l'overlap fra
+    // I/O del worker e calcolo del chiamante, non I/O parallelo fra loro.
+    std::mutex reader_mtx_;
+
+    // Worker in background per prefetch_async: un solo slot in sospeso.
+    std::thread worker_;
+    std::mutex qmtx_;
+    std::condition_variable qcv_;
+    bool worker_stop_ = false;
+    bool has_pending_ = false;
+    uint32_t pending_layer_ = 0;
+    std::vector<uint32_t> pending_idxs_;
 };
 
 DESIREEIA_INTERNAL ModelReader* make_gguf_reader();
@@ -292,6 +342,19 @@ bool engine_embed(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
 // Campionamento (vedi core/sampler.h e desireeia_sampling in abi.h).
 bool engine_set_sampling(desireeia_ctx* ctx, const desireeia_sampling& params);
 bool engine_get_sampling(const desireeia_ctx* ctx, desireeia_sampling& out);
+
+// LoRA adapters (Recover-LoRA). Forwards to IForwardEngine::load_lora/
+// clear_lora — DESIREEIA_ERR_NOT_SUPPORTED-equivalent (returns false) for
+// models with no generative forward engine (BERT encoders) or one that
+// doesn't implement it (see forward_iface.h's default).
+bool engine_load_lora(desireeia_ctx* ctx, const char* lora_gguf_path, float scale, std::string& err);
+bool engine_clear_lora(desireeia_ctx* ctx);
+
+// Prerouter routing prediction. Same not-supported-by-default contract as
+// the LoRA calls above (see forward_iface.h).
+bool engine_load_prerouter(desireeia_ctx* ctx, const char* path, std::string& err);
+bool engine_clear_prerouter(desireeia_ctx* ctx);
+bool engine_set_prerouter_heuristic(desireeia_ctx* ctx, bool enabled);
 
 // Template di chat (vedi core/chat_template.h). Applica il formato
 // rilevato al caricamento del modello ai messaggi passati, producendo il

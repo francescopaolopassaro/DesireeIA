@@ -697,6 +697,60 @@ bool engine_get_sampling(const desireeia_ctx* ctx, desireeia_sampling& out) {
     return true;
 }
 
+bool engine_load_lora(desireeia_ctx* ctx, const char* lora_gguf_path, float scale, std::string& err) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || !lora_gguf_path) { err = "invalid argument"; return false; }
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (!c->gf) {
+        err = "model has no generative forward engine (LoRA requires a dense/MLA model, not a BERT encoder)";
+        return false;
+    }
+    if (!c->gf->load_lora(lora_gguf_path, scale, err)) {
+        if (c->st.log) c->st.log(3, err.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool engine_clear_lora(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (c->gf) c->gf->clear_lora();
+    return true;
+}
+
+bool engine_load_prerouter(desireeia_ctx* ctx, const char* path, std::string& err) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || !path) { err = "invalid argument"; return false; }
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (!c->gf) {
+        err = "model has no generative forward engine (prerouter requires a dense/MLA MoE model)";
+        return false;
+    }
+    if (!c->gf->load_prerouter(path, err)) {
+        if (c->st.log) c->st.log(3, err.c_str());
+        return false;
+    }
+    return true;
+}
+
+bool engine_clear_prerouter(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (c->gf) c->gf->clear_prerouter();
+    return true;
+}
+
+bool engine_set_prerouter_heuristic(desireeia_ctx* ctx, bool enabled) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (c->gf) c->gf->set_prerouter_heuristic(enabled);
+    return true;
+}
+
 bool engine_apply_chat_template(const desireeia_ctx* ctx,
                                 const char** roles, const char** contents, size_t n_messages,
                                 bool add_assistant, std::string& out) {

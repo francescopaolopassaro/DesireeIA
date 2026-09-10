@@ -4,10 +4,13 @@
 #include "core/engine.h"
 #include "core/arch_tags.h"
 #include "core/forward_iface.h"
+#include "prerouter.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace desireeia {
@@ -145,10 +148,29 @@ struct DenseConfig {
 // necessarily in the same format.
 enum class MatVecFormat { Float, Q2_K, Q3_K, Q4_0, Q4_1, Q4_K, Q5_0, Q5_1, Q5_K, Q6_K, Q8_0, Q8_K };
 
+// One loaded LoRA delta targeting a single weight tensor (Recover-LoRA
+// style: the quantized base is frozen, a trained low-rank adapter recovers
+// most of the quantization loss). Applied on top of the base matmul:
+//   out = base_mm(x, W) + scale * B @ (A @ x)
+// A is [rank, cols] row-major, B is [rows, rank] row-major — same
+// row-major convention as every other weight in this engine (see MatVec).
+// Both are always float: rank is small (dozens of values), so there is no
+// quantized-kernel benefit and dequantizing once at load time is simplest.
+struct LoraWeight {
+    std::vector<float> a;
+    std::vector<float> b;
+    uint32_t rank = 0;
+    float scale = 1.0f;
+};
+
 struct MatVec {
     std::vector<float> f;
     std::vector<uint8_t> raw;
     MatVecFormat format = MatVecFormat::Float;
+    // One entry per currently-loaded LoRA adapter that targets this tensor.
+    // Empty (the common case: no adapter loaded, or this adapter doesn't
+    // touch this tensor) costs one vector-empty check on the hot path.
+    std::vector<LoraWeight> lora;
     bool empty() const { return f.empty() && raw.empty(); }
 };
 
@@ -228,6 +250,12 @@ struct LayerWeights {
     MatVec ffn_down_shexp;
 };
 
+// Test-only: applies m's LoRA delta(s) into y (y += scale*B@(A@x) per
+// adapter). Defined in dense_forward.cpp, used by tests/selftest.cpp to
+// verify the math against a hand-built synthetic adapter, without needing
+// a real trained adapter file.
+void lora_apply_delta_for_test(const MatVec& m, size_t r, size_t c, const float* x, float* y);
+
 // Float forward path for dense transformer architectures (grouped-query
 // attention, NEOX RoPE, RMSNorm, gated FFN). Differences between model
 // families (embedding scale, SiLU/GELU-tanh activation, bias on q/k/v)
@@ -293,12 +321,54 @@ public:
     // already logs it through the caller-supplied LogFn on failure.
     const std::string& last_fail() const override { return last_fail_; }
 
+    // LoRA adapters (see LoraWeight above). Loading is independent of
+    // model loading/caching: an adapter can be attached after the model is
+    // already open, and load_matrix() re-attaches its deltas to every
+    // tensor it touches from then on — including on models where the
+    // weight cache is disabled and layers are re-read every step.
+    //
+    // Scope: attention (wq/wk/wv/wo), dense/MLA FFN (wff_*, wq_a/wq_b/
+    // wq_lite/wkv_a_mqa), shared-expert FFN. NOT covered: routed MoE
+    // experts (wexp_*, a different code path/tensor layout — see
+    // expert_ffn), the fused-QKV tensor (falcon, load_qkv_fused splits one
+    // tensor into three and would need its own splitting logic), and
+    // MLA's absorbed per-head wk_b_h/wv_b_h (always float, applied via a
+    // dedicated fast path that bypasses matvec() entirely — see the note
+    // at its call site). All of those are next-phase extensions, not
+    // silently-wrong: an adapter simply has no effect on tensors outside
+    // this scope.
+    bool load_lora(const std::string& lora_gguf_path, float scale, std::string& err) override;
+    void clear_lora() override;
+
+    // Prerouter routing prediction: predicts, from layer L's own data,
+    // which experts layer L+1 is likely to route to, and fires the same
+    // background-prefetch mechanism used by maybe_prefetch_experts one
+    // layer earlier than the baseline (real, already-known selection)
+    // trigger. Two independent sources of a prediction, either or both
+    // usable: a trained head loaded per owner layer (this engine's own
+    // GGUF tensor-naming convention — see load_prerouter's doc comment in
+    // dense_forward.cpp), or a heuristic fallback ("layer L+1 routes to
+    // the same experts layer L just used") for when no trained head
+    // exists for a given owner layer. Off by default either way: loading
+    // a head or enabling the heuristic is opt-in, and neither ever
+    // affects correctness — a wrong/missing prediction just means the
+    // normal (already-existing) fetch path runs when layer L+1 actually
+    // computes its own router.
+    bool load_prerouter(const std::string& path, std::string& err) override;
+    void clear_prerouter() override;
+    void set_prerouter_heuristic(bool on) override;
+
 private:
     mutable std::string last_fail_;
     bool load_embd(ModelReader& rd);
     bool load_norms(ModelReader& rd);
     bool load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w);
     bool load_matrix(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out);
+    // Looks up `name` in every loaded LoRA adapter and, if found (and
+    // shape-compatible), appends a LoraWeight to out.lora. Called from
+    // load_matrix() right after the base tensor is loaded, since that's
+    // the one place rows/cols are already known for every named weight.
+    void attach_lora_deltas(const std::string& name, uint32_t rows, uint32_t cols, MatVec& out);
     bool load_qkv_fused(ModelReader& rd, const std::string& name,
                          uint32_t q_dim, uint32_t kv_dim, uint32_t cols,
                          MatVec& wq, MatVec& wk, MatVec& wv);
@@ -320,6 +390,35 @@ private:
                     std::vector<float>& egate, std::vector<float>& eup,
                     std::vector<float>& edown);
     const LayerWeights* get_layer(ModelReader& rd, uint32_t il);
+
+    // Real overlap (baseline, no prediction): fires a background fetch for
+    // `selected`'s experts of `layer` the instant the router resolves
+    // them, before the expert_ffn loop below starts consuming them one at
+    // a time. No-op when the layer's experts are already resident
+    // (exps_stacked: no I/O in the hot path to hide latency behind) or
+    // when there's no ExpertStore at all (dense/non-streamed models).
+    void maybe_prefetch_experts(const LayerWeights& lw, uint32_t layer,
+                                 const std::vector<std::pair<uint32_t, float>>& selected);
+
+    // Predictive overlap (prerouter): called right after
+    // maybe_prefetch_experts at each MoE call site, using layer l's own
+    // hidden state and its real `selected` experts. See the doc comment
+    // on the public load_prerouter override above.
+    void maybe_predict_next_layer(uint32_t l, const float* hidden,
+                                  const std::vector<std::pair<uint32_t, float>>& selected);
+    // feat = concat[hidden (n_embd), one-hot(selected) (n_expert), one-hot(selected) (n_expert)].
+    // The second one-hot block is Edge0's "previous token" feature slot;
+    // this engine reuses the SAME (current-token) selection for it rather
+    // than tracking cross-step state, a deliberate simplification (see
+    // load_prerouter's doc comment) that affects prediction quality with
+    // a real trained head, not the mechanism's correctness.
+    void build_prerouter_feature(const float* hidden,
+                                 const std::vector<std::pair<uint32_t, float>>& selected,
+                                 std::vector<float>& out) const;
+    // Guards on stack_experts_ (cheap, whole-model flag) instead of the
+    // predicted layer's own LayerWeights, since checking the latter would
+    // force get_layer() to load that layer early — defeating the point.
+    void maybe_prefetch_predicted(uint32_t layer, const std::vector<uint32_t>& idxs);
     void grow_cache(size_t needed);
 
     // Stores one position's freshly computed K and V (kv_dim floats each,
@@ -431,6 +530,21 @@ private:
     std::vector<float> embd_override_;
     int32_t embd_override_token_ = -1;
     size_t embd_override_cursor_ = 0;
+
+    // LoRA adapters. Each holds its own GGUF reader open for the lifetime
+    // of the adapter (LoRA files are tiny — a handful of MB at most — so
+    // keeping the reader alive to re-read A/B on every load_matrix() call
+    // costs nothing next to the base weight streaming already happening).
+    struct LoraAdapter {
+        std::unique_ptr<ModelReader> reader;
+        float alpha = 0.0f;      // adapter.lora.alpha metadata; 0 = not set
+        float user_scale = 1.0f; // caller-supplied scale (desireeia_load_lora_adapter)
+    };
+    std::vector<LoraAdapter> lora_adapters_;
+
+    // Prerouter: heads keyed by owner layer (predicts owner+1's routing).
+    std::unordered_map<uint32_t, PrerouterHead> prerouter_heads_;
+    bool prerouter_heuristic_ = false;
 };
 
 }

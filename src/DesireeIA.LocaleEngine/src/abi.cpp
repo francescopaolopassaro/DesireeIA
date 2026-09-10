@@ -238,6 +238,49 @@ DESIREEIA_API desireeia_error desireeia_get_sampling(const desireeia_ctx* ctx,
     return DESIREEIA_OK;
 }
 
+DESIREEIA_API desireeia_error desireeia_load_lora_adapter(desireeia_ctx* ctx,
+                                                            const char* lora_gguf_path,
+                                                            float scale) {
+    if (!ctx || !lora_gguf_path) return DESIREEIA_ERR_INVALID_ARG;
+    std::string err;
+    if (!desireeia::engine_load_lora(ctx, lora_gguf_path, scale, err)) {
+        if (err.find("not a LoRA adapter") != std::string::npos) return DESIREEIA_ERR_PARSE;
+        if (err.find("no generative forward engine") != std::string::npos) return DESIREEIA_ERR_NOT_SUPPORTED;
+        return DESIREEIA_ERR_IO;
+    }
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_clear_lora_adapters(desireeia_ctx* ctx) {
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_clear_lora(ctx)) return DESIREEIA_ERR_UNDEFINED;
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_load_prerouter(desireeia_ctx* ctx, const char* path) {
+    if (!ctx || !path) return DESIREEIA_ERR_INVALID_ARG;
+    std::string err;
+    if (!desireeia::engine_load_prerouter(ctx, path, err)) {
+        if (err.find("no valid prerouter heads") != std::string::npos) return DESIREEIA_ERR_PARSE;
+        if (err.find("no generative forward engine") != std::string::npos ||
+            err.find("no MoE experts") != std::string::npos) return DESIREEIA_ERR_NOT_SUPPORTED;
+        return DESIREEIA_ERR_IO;
+    }
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_clear_prerouter(desireeia_ctx* ctx) {
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_clear_prerouter(ctx)) return DESIREEIA_ERR_UNDEFINED;
+    return DESIREEIA_OK;
+}
+
+DESIREEIA_API desireeia_error desireeia_set_prerouter_heuristic(desireeia_ctx* ctx, int32_t enabled) {
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_prerouter_heuristic(ctx, enabled != 0)) return DESIREEIA_ERR_UNDEFINED;
+    return DESIREEIA_OK;
+}
+
 DESIREEIA_API desireeia_error desireeia_apply_chat_template(const desireeia_ctx* ctx,
                                                     const char** roles,
                                                     const char** contents,

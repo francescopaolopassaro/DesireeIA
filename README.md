@@ -173,6 +173,96 @@ This is deliberately partial: the per-layer weights are not locked (that
 would mean walking every tensor across every layer, real additional work, not
 done here), only the embedding/output head. Enable with `DESIREEIA_MLOCK=1`.
 
+### Recover-LoRA adapters
+
+DesireeIA can apply LoRA adapters at runtime on top of a frozen (quantized)
+base model, without ever merging them into the base weights. This recovers
+most of the quality lost to quantization when the adapter was trained for
+that purpose (Recover-LoRA:
+distillation from an FP teacher against the int4 base), but works with any
+standard LoRA adapter converted to this format.
+
+Applied per weight tensor, on top of the base matmul, base weight untouched:
+
+```
+out = base_mm(x, W) + scale * B @ (A @ x)          scale = user_scale * alpha / rank
+```
+
+**Adapter file format** — a separate GGUF file, desireeialmn's convention
+(a PEFT checkpoint can be converted to it with desireeialmn's
+`convert_lora_to_gguf.py`):
+
+- for every fine-tuned base tensor `<name>`, two tensors:
+  `<name>.lora_a` (`[rank, cols]`) and `<name>.lora_b` (`[rows, rank]`);
+- optional metadata `adapter.lora.alpha` (f32) — classic PEFT `alpha/rank`
+  scaling, multiplied by the caller-supplied scale;
+- optional `adapter.type` (must be `"lora"` if present).
+
+Multiple adapters can be loaded at once; their contributions simply add.
+
+**Scope**: attention (`wq`/`wk`/`wv`/`wo`), dense/MLA FFN (`wff_*`,
+`wq_a`/`wq_b`/`wq_lite`/`wkv_a_mqa`), shared-expert FFN, the router, and the
+output head — covering every dense/MLA architecture this engine supports.
+**Not yet covered**: routed MoE experts (a different code path/tensor
+layout — see `expert_ffn`), the fused-QKV tensor (falcon), and MLA's
+absorbed per-head `wk_b_h`/`wv_b_h` (a dedicated fast path that bypasses the
+matmul dispatcher these deltas hook into). An adapter targeting those
+tensors is simply a no-op there, not silently wrong.
+
+```csharp
+model.LoadLoraAdapter("path/to/adapter.gguf", scale: 1.0f);
+// ... generate ...
+model.ClearLoraAdapters();
+```
+
+CLI: `--lora <adapter.gguf>` / `--lora-scale <f>` on `generate`, `bench`,
+and `chat`. `DESIREEIA_LORA_PATH` / `DESIREEIA_LORA_SCALE` set the default
+when the flags aren't passed — same parametrization pattern as every other
+`DESIREEIA_*` env var here.
+
+```powershell
+desireeia-cli chat model.gguf --lora adapter.gguf --lora-scale 1.0
+```
+
+### Real SSD-expert overlap and prerouter prediction
+
+MoE models whose experts stream from disk (the fallback path used when a
+layer's experts aren't fully resident/stacked in RAM — see "Storage tier"
+above) fetch each selected expert's weights on a background worker thread
+instead of blocking the calling thread inline. This is separate from —
+and a prerequisite for — routing prediction:
+
+- **Baseline overlap** (always on, no configuration needed): the instant a
+  layer's own router resolves its selected experts, their weights start
+  loading in the background while the engine finishes whatever compute
+  came before that point; by the time each expert's matmul actually needs
+  the data, it's often already resident instead of a cold blocking read.
+- **Prerouter prediction** (opt-in): additionally predicts, from a
+  trained per-layer head, which experts the *next* layer is likely to
+  route to, and starts loading those a full layer earlier than the
+  baseline case above. No trained head is published for any model
+  supported here yet, so a documented heuristic fallback is available
+  instead — "the next layer routes to the same experts this layer just
+  used" — a naive placeholder, not a claim of real accuracy.
+
+```csharp
+model.LoadPrerouter("path/to/prerouter.gguf");  // trained heads, when one exists
+model.SetPrerouterHeuristic(true);              // or: naive fallback, no file needed
+```
+
+CLI: `--prerouter <file.gguf>` / `--prerouter-heuristic` on
+`generate`/`bench`/`chat`; `DESIREEIA_PREROUTER_PATH` /
+`DESIREEIA_PREROUTER_HEURISTIC=1` env var defaults, same pattern as
+`--lora`. A prerouter file uses this engine's own GGUF tensor-naming
+convention (`prerouter.<owner_layer>.fc1.weight` / `.fc2.weight` /
+`.linear_init.weight`) — there is no published external file in this
+format to load; the mechanism exists so a head trained specifically for
+this engine can be dropped in later.
+
+Neither mechanism ever affects correctness: a missed or wrong prediction
+simply means the pre-existing (still correct) fetch path runs when the
+data is actually needed.
+
 ## Hardware backends
 
 Backends are probed and the strongest available one is selected automatically, in priority order:

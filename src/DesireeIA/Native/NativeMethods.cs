@@ -181,6 +181,23 @@ internal static class NativeMethods
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_get_sampling(IntPtr ctx, out Sampling outParams);
 
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_load_lora_adapter(IntPtr ctx,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string loraGgufPath, float scale);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_clear_lora_adapters(IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_load_prerouter(IntPtr ctx,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string path);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_clear_prerouter(IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_prerouter_heuristic(IntPtr ctx, int enabled);
+
     // string[] con ArraySubType=LPUTF8Str non e' un marshaling supportato su
     // questo runtime ("Invalid managed/unmanaged type combination"): gli
     // array di stringhe passano come IntPtr[] a puntatori UTF-8 allocati a

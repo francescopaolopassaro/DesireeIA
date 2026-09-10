@@ -327,6 +327,89 @@ public sealed class LocalModel : IDisposable
         };
     }
 
+    /// <summary>
+    /// Carica un adapter Recover-LoRA in formato GGUF (convenzione
+    /// desireeialmn: tensori "&lt;nome_base&gt;.lora_a"/".lora_b", metadato
+    /// "adapter.lora.alpha"), applicato a runtime senza toccare i pesi base
+    /// quantizzati. Puo' essere chiamato piu' volte per caricare piu'
+    /// adapter contemporaneamente: i contributi si sommano. Copre
+    /// attenzione, FFN densa/MLA/shared-expert; non copre gli esperti MoE
+    /// instradati. Va chiamato prima della prima generazione per applicarsi
+    /// a tutti i layer di un modello con weight-cache abilitata (layer gia'
+    /// generati vengono comunque ricaricati automaticamente al prossimo
+    /// accesso, ma solo da quel punto in poi).
+    /// </summary>
+    public void LoadLoraAdapter(string loraGgufPath, float scale = 1.0f)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var err = NativeMethods.desireeia_load_lora_adapter(_context, loraGgufPath, scale);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Load LoRA adapter failed: {err}");
+        }
+    }
+
+    /// <summary>Rimuove tutti gli adapter LoRA caricati sul contesto.</summary>
+    public void ClearLoraAdapters()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var err = NativeMethods.desireeia_clear_lora_adapters(_context);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Clear LoRA adapters failed: {err}");
+        }
+    }
+
+    /// <summary>
+    /// Carica una testa di previsione del routing prerouter (formato GGUF,
+    /// convenzione propria di questo motore: tensori
+    /// "prerouter.&lt;N&gt;.fc1/fc2/linear_init.weight" per layer "owner"
+    /// N). Predice quali esperti instradera' il layer N+1 dai dati del
+    /// layer N, cosi' i loro pesi possono essere precaricati in background
+    /// un layer prima del calcolo reale del router. Non ha mai effetto
+    /// sulla correttezza: una previsione sbagliata o assente lascia
+    /// semplicemente girare il percorso di lettura gia' esistente.
+    /// Nessuna testa addestrata e' oggi disponibile pubblicamente per
+    /// nessun modello supportato: vedi <see cref="SetPrerouterHeuristic"/>
+    /// per un fallback euristico che non richiede alcun file.
+    /// </summary>
+    public void LoadPrerouter(string path)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var err = NativeMethods.desireeia_load_prerouter(_context, path);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Load prerouter failed: {err}");
+        }
+    }
+
+    /// <summary>Rimuove tutte le teste prerouter caricate.</summary>
+    public void ClearPrerouter()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var err = NativeMethods.desireeia_clear_prerouter(_context);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Clear prerouter failed: {err}");
+        }
+    }
+
+    /// <summary>
+    /// Attiva/disattiva l'euristica di fallback ("il layer N+1 instrada
+    /// agli stessi esperti appena usati dal layer N") per i layer owner
+    /// senza una testa prerouter addestrata caricata. Spenta di default;
+    /// dichiaratamente un placeholder, non una previsione accurata.
+    /// </summary>
+    public void SetPrerouterHeuristic(bool enabled)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var err = NativeMethods.desireeia_set_prerouter_heuristic(_context, enabled ? 1 : 0);
+        if (err != NativeMethods.Error.Ok)
+        {
+            throw new InvalidOperationException($"Set prerouter heuristic failed: {err}");
+        }
+    }
+
     // ============================================================
     // Streaming generation (async, con stop sequences)
     // ============================================================

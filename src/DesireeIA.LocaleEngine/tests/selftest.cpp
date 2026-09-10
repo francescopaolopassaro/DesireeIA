@@ -11,6 +11,8 @@
 #include "ssd_tier/mirror_manager.h"
 #include "ssd_tier/tiered_expert_store.h"
 #include "ssd_tier/hybrid_tier.h"
+#include "models/dense_forward.h"
+#include "models/prerouter.h"
 #include <cstdio>
 #include <cassert>
 #include <vector>
@@ -22,6 +24,7 @@
 #include <memory>
 #include <atomic>
 #include <chrono>
+#include <thread>
 
 static bool approx(float a, float b, float tol) {
     return std::fabs(a - b) <= tol;
@@ -2162,6 +2165,195 @@ int main(int argc, char** argv) {
             // reference before the reader goes away.
             tier.set_source(nullptr);
             delete src;
+        }
+    }
+
+    std::printf("--- LoRA delta application (Recover-LoRA) ---\n");
+    {
+        // No real trained adapter file exists to test against, so this
+        // verifies the math directly: y += scale * B @ (A @ x), summed
+        // over every loaded adapter, against a hand-computed expectation.
+        // See LoraWeight/lora_apply_delta_for_test in models/dense_forward.h.
+        using desireeia::LoraWeight;
+        using desireeia::MatVec;
+
+        MatVec m; // base content is irrelevant: the function under test only
+                  // ADDS the delta onto whatever y already holds (simulating
+                  // running right after the base matmul, as in matvec()).
+        const size_t r = 2, c = 3;
+
+        LoraWeight lw1;
+        lw1.rank = 2;
+        lw1.a = {1, 0, 1,  0, 1, 1};  // [rank=2, cols=3]
+        lw1.b = {2, 0,  1, 1};        // [rows=2, rank=2]
+        lw1.scale = 0.5f;
+        m.lora.push_back(lw1);
+
+        LoraWeight lw2;
+        lw2.rank = 1;
+        lw2.a = {1, 1, 1};  // [rank=1, cols=3]
+        lw2.b = {1, 2};     // [rows=2, rank=1]
+        lw2.scale = 1.0f;
+        m.lora.push_back(lw2);
+
+        const float x[3] = {1.0f, 2.0f, 3.0f};
+        // adapter 1: mid=A1@x=[4,5], delta=B1@mid=[8,9], scaled=[4.0,4.5]
+        // adapter 2: mid=A2@x=[6],   delta=B2@mid=[6,12], scaled=[6.0,12.0]
+        // sum = [10.0, 16.5]
+        float y[2] = {10.0f, 20.0f}; // simulated base matmul output
+        desireeia::lora_apply_delta_for_test(m, r, c, x, y);
+
+        const float expected[2] = {20.0f, 36.5f};
+        const bool lora_ok = std::fabs(y[0] - expected[0]) < 1e-4f &&
+                             std::fabs(y[1] - expected[1]) < 1e-4f;
+        if (lora_ok) {
+            std::printf("  LoRA delta (2 adapters summed): y=[%.4f, %.4f] matches analytic expectation OK\n", y[0], y[1]);
+            passed++;
+        } else {
+            std::printf("  LoRA delta FAIL: y=[%.4f, %.4f] expected=[%.4f, %.4f]\n", y[0], y[1], expected[0], expected[1]);
+            failed++;
+        }
+
+        // No adapters attached must be a true no-op: this runs on every
+        // matvec() call in the engine regardless of whether LoRA is used.
+        MatVec m_empty;
+        float y2[2] = {5.0f, 6.0f};
+        desireeia::lora_apply_delta_for_test(m_empty, r, c, x, y2);
+        const bool noop_ok = y2[0] == 5.0f && y2[1] == 6.0f;
+        if (noop_ok) {
+            std::printf("  LoRA delta no-op (no adapters loaded) OK\n");
+            passed++;
+        } else {
+            std::printf("  LoRA delta no-op FAIL: y=[%.4f, %.4f]\n", y2[0], y2[1]);
+            failed++;
+        }
+    }
+
+    std::printf("--- ExpertStore async prefetch overlap ---\n");
+    {
+        // A fake reader that sleeps a few ms per read (simulating SSD
+        // latency) and returns a value that encodes (layer,idx,part), so
+        // fetch() results can be checked for correctness, not just
+        // presence. Exercises prefetch_async()+fetch() racing on the same
+        // ExpertStore from two threads (the worker, and this "main"
+        // thread), the exact scenario the mtx_/reader_mtx_ split exists for.
+        struct SlowFakeReader : public desireeia::ModelReader {
+            bool open(const std::string&, desireeia::ModelMeta&) override { return true; }
+            bool read_tensor(const std::string&, std::vector<float>&) override { return false; }
+            bool read_expert(uint32_t layer, uint32_t idx, desireeia::ExpertPart part,
+                              std::vector<float>& out) override {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                out.assign(1, (float) layer * 1000.0f + (float) idx * 10.0f + (float) part);
+                return true;
+            }
+        };
+
+        SlowFakeReader reader;
+        desireeia::ExpertStore store(64, nullptr);
+        store.set_reader(&reader);
+
+        // Baseline: fetch() with nothing prefetched still works (regression
+        // check — the miss path is now split across mtx_/reader_mtx_).
+        std::vector<float> out;
+        bool base_ok = store.fetch(3, 7, desireeia::ExpertPart::Gate, out) &&
+                       !out.empty() && out[0] == 3.0f * 1000.0f + 7.0f * 10.0f + 0.0f;
+        if (base_ok) {
+            std::printf("  ExpertStore::fetch() with nothing prefetched OK\n");
+            passed++;
+        } else {
+            std::printf("  ExpertStore::fetch() baseline FAIL\n");
+            failed++;
+        }
+
+        // Kick off a background prefetch for layer 5, experts {1,2}, then
+        // immediately fetch() one of them from the "main" thread — must
+        // return the correct value regardless of whether the worker
+        // already finished it (race by construction: fetch() is called
+        // right after prefetch_async(), not after a sleep).
+        store.prefetch_async(5, {1, 2});
+        bool race_ok = true;
+        for (uint32_t idx : {1u, 2u}) {
+            std::vector<float> v;
+            if (!store.fetch(5, idx, desireeia::ExpertPart::Up, v) || v.empty() ||
+                v[0] != 5.0f * 1000.0f + (float) idx * 10.0f + 1.0f) {
+                race_ok = false;
+            }
+        }
+        if (race_ok) {
+            std::printf("  ExpertStore::prefetch_async() + fetch() race: correct data OK\n");
+            passed++;
+        } else {
+            std::printf("  ExpertStore::prefetch_async() + fetch() race FAIL\n");
+            failed++;
+        }
+
+        // Give the worker time to fully finish the prefetch, then confirm
+        // fetching the third requested part (Down) hits the now-resident
+        // cache entry instead of failing/reading garbage.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        std::vector<float> v;
+        bool resident_ok = store.fetch(5, 1, desireeia::ExpertPart::Down, v) && !v.empty() &&
+                            v[0] == 5.0f * 1000.0f + 1.0f * 10.0f + 2.0f;
+        if (resident_ok) {
+            std::printf("  ExpertStore prefetch fully resident after settling OK\n");
+            passed++;
+        } else {
+            std::printf("  ExpertStore prefetch settling FAIL\n");
+            failed++;
+        }
+    }
+
+    std::printf("--- prerouter_predict synthetic math ---\n");
+    {
+        // hidden=1, n_expert=2, prerouter_hidden=2, feat_dim=1+2*2=5.
+        // feat = [hidden=2.0, cur_oh=(1,0), prev_oh=(1,0)].
+        // fc1 picks out feat[0] and feat[1] into the two hidden units;
+        // fc2 forwards each hidden unit to its own expert unchanged;
+        // linear_init adds a large direct term (10*hidden) ONLY to
+        // expert 1 — chosen so expert 1's logit is unambiguously the
+        // highest regardless of the exact GELU value, making this a
+        // robust structural test (right expert wins) rather than a
+        // brittle float-equality one.
+        desireeia::PrerouterHead head;
+        head.hidden = 1;
+        head.n_expert = 2;
+        head.prerouter_hidden = 2;
+        head.fc1 = {1, 0, 0, 0, 0,
+                    0, 1, 0, 0, 0};
+        head.fc2 = {1, 0,
+                    0, 1};
+        head.lin = {0, 0, 0, 0, 0,
+                    10, 0, 0, 0, 0};
+        const float feat[5] = {2.0f, 1.0f, 0.0f, 1.0f, 0.0f};
+
+        std::vector<uint32_t> top1;
+        desireeia::prerouter_predict(head, feat, 5, 1, top1);
+        const bool top1_ok = top1.size() == 1 && top1[0] == 1;
+
+        std::vector<uint32_t> top2;
+        desireeia::prerouter_predict(head, feat, 5, 2, top2);
+        const bool top2_ok = top2.size() == 2 && top2[0] == 1 && top2[1] == 0;
+
+        if (top1_ok && top2_ok) {
+            std::printf("  prerouter_predict top-1/top-2 ranking correct OK\n");
+            passed++;
+        } else {
+            std::printf("  prerouter_predict FAIL: top1=[%s] top2=[%s]\n",
+                        top1.empty() ? "" : std::to_string(top1[0]).c_str(),
+                        top2.size() < 2 ? "" : (std::to_string(top2[0]) + "," + std::to_string(top2[1])).c_str());
+            failed++;
+        }
+
+        // Shape mismatch (wrong feat_dim) must fail closed: empty output,
+        // never a wrong/garbage prediction fed into a real prefetch.
+        std::vector<uint32_t> bad;
+        desireeia::prerouter_predict(head, feat, 4, 1, bad);
+        if (bad.empty()) {
+            std::printf("  prerouter_predict shape-mismatch fails closed OK\n");
+            passed++;
+        } else {
+            std::printf("  prerouter_predict shape-mismatch FAIL (should be empty)\n");
+            failed++;
         }
     }
 

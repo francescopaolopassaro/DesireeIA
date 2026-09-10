@@ -21,6 +21,7 @@ add_library(DesireeIALocaleEngine SHARED
     src/core/arch_tags.cpp
     src/models/dense_forward.cpp
     src/models/moe_route.cpp
+    src/models/prerouter.cpp
     src/models/ssm_forward.cpp
     src/models/bert_forward.cpp
     src/tokenizer/spm_tokenizer.cpp

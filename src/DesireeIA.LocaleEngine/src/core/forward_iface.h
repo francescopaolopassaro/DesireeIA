@@ -35,6 +35,28 @@ public:
         static const std::string none;
         return none;
     }
+
+    // LoRA adapters (Recover-LoRA). Default: not supported — only
+    // DenseForward overrides these; BertForward/SsmForward have no
+    // matmul-dispatch choke point to hook a delta into (see the override's
+    // doc comment in dense_forward.h for what IS covered).
+    virtual bool load_lora(const std::string& lora_gguf_path, float scale, std::string& err) {
+        (void) lora_gguf_path; (void) scale;
+        err = "LoRA adapters are not supported by this model's forward engine";
+        return false;
+    }
+    virtual void clear_lora() {}
+
+    // Prerouter routing prediction. Default: not supported — only
+    // DenseForward overrides these (MoE-only mechanism; BertForward/
+    // SsmForward have no router to predict ahead of).
+    virtual bool load_prerouter(const std::string& path, std::string& err) {
+        (void) path;
+        err = "prerouter prediction is not supported by this model's forward engine";
+        return false;
+    }
+    virtual void clear_prerouter() {}
+    virtual void set_prerouter_heuristic(bool on) { (void) on; }
 };
 
 }

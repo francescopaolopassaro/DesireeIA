@@ -110,8 +110,14 @@ static void PrintUsage()
                      [--json [--schema "<json-schema>"]]  (best-effort: istruisce il modello a
                                          rispondere solo con JSON e ne estrae il blocco valido;
                                          non e' grammar-constrained decoding)
+                     [--lora <adapter.gguf>] [--lora-scale S]  (Recover-LoRA, vedi README)
+                     [--prerouter <file.gguf>] [--prerouter-heuristic]  (vedi README)
           desireeia-cli bench <modello.gguf> [--tokens N] [--warmup N] [--prompt "<testo>"] [--threads N]
+                     [--lora <adapter.gguf>] [--lora-scale S]
+                     [--prerouter <file.gguf>] [--prerouter-heuristic]
           desireeia-cli chat <modello.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]
+                     [--lora <adapter.gguf>] [--lora-scale S]
+                     [--prerouter <file.gguf>] [--prerouter-heuristic]
 
         Chat session:
           desireeia-cli chat <modello.gguf>  (interactive multi-turn conversation)
@@ -137,7 +143,7 @@ static int CmdHw()
     return 0;
 }
 
-static (LocalModel model, ExecutionPlan plan) Open(string modelPath, int? threads = null)
+static (LocalModel model, ExecutionPlan plan) Open(string modelPath, int? threads = null, string[]? args = null)
 {
     if (!File.Exists(modelPath))
     {
@@ -149,6 +155,38 @@ static (LocalModel model, ExecutionPlan plan) Open(string modelPath, int? thread
         ? (msg => Console.Error.WriteLine($"[native] {msg}"))
         : null;
     var model = LocalModel.Load(modelPath, plan, logger);
+
+    // Recover-LoRA: --lora/--lora-scale take priority over the
+    // DESIREEIA_LORA_PATH/DESIREEIA_LORA_SCALE env var defaults, mirroring
+    // how every other tier/quant knob here is parametrized (CLI flag first,
+    // env var fallback, hardcoded nothing).
+    var loraPath = (args is not null ? GetStringOption(args, "--lora", null) : null)
+        ?? Environment.GetEnvironmentVariable("DESIREEIA_LORA_PATH");
+    if (!string.IsNullOrEmpty(loraPath))
+    {
+        var loraScaleStr = (args is not null ? GetStringOption(args, "--lora-scale", null) : null)
+            ?? Environment.GetEnvironmentVariable("DESIREEIA_LORA_SCALE");
+        var loraScale = loraScaleStr is not null &&
+                         float.TryParse(loraScaleStr, System.Globalization.NumberStyles.Float,
+                                         System.Globalization.CultureInfo.InvariantCulture, out var s)
+            ? s : 1.0f;
+        model.LoadLoraAdapter(loraPath, loraScale);
+    }
+
+    // Prerouter: same CLI-flag-first, env-var-fallback pattern as --lora.
+    var prerouterPath = (args is not null ? GetStringOption(args, "--prerouter", null) : null)
+        ?? Environment.GetEnvironmentVariable("DESIREEIA_PREROUTER_PATH");
+    if (!string.IsNullOrEmpty(prerouterPath))
+    {
+        model.LoadPrerouter(prerouterPath);
+    }
+    var heuristicFlag = args is not null && HasFlag(args, "--prerouter-heuristic");
+    var heuristicEnv = Environment.GetEnvironmentVariable("DESIREEIA_PREROUTER_HEURISTIC") == "1";
+    if (heuristicFlag || heuristicEnv)
+    {
+        model.SetPrerouterHeuristic(true);
+    }
+
     return (model, plan);
 }
 
@@ -249,7 +287,7 @@ static async Task<int> CmdGenerate(string[] rest)
     var stopSequences = GetStringListOption(rest, "--stop");
     var jsonMode = HasFlag(rest, "--json");
     var jsonSchema = GetStringOption(rest, "--schema", null);
-    var (model, _) = Open(rest[0]);
+    var (model, _) = Open(rest[0], args: rest);
     using (model)
     {
         ApplySamplingOptions(model, rest);
@@ -310,7 +348,7 @@ static int CmdBench(string[] rest)
     var prompt = GetStringOption(rest, "--prompt", null);
     var threadsOpt = GetIntOption(rest, "--threads", 0);
 
-    var (model, plan) = Open(rest[0], threadsOpt > 0 ? threadsOpt : null);
+    var (model, plan) = Open(rest[0], threadsOpt > 0 ? threadsOpt : null, rest);
     using (model)
     {
         Console.WriteLine($"plan: {plan}");
@@ -353,12 +391,12 @@ static int CmdChat(string[] rest)
 {
     if (rest.Length < 1)
     {
-        Console.Error.WriteLine("usage: desireeia-cli chat <model.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]");
+        Console.Error.WriteLine("usage: desireeia-cli chat <model.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N] [--lora <adapter.gguf>] [--lora-scale S]");
         return 1;
     }
 
     var maxTokens = GetIntOption(rest, "--max-tokens", 512);
-    var (model, _) = Open(rest[0]);
+    var (model, _) = Open(rest[0], args: rest);
     using (model)
     {
         ApplySamplingOptions(model, rest);
