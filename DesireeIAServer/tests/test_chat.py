@@ -44,6 +44,30 @@ def test_chat_sync(client):
     assert body["timings"]["predicted_n"] == 2
 
 
+def test_chat_sync_with_full_sampling_override(client):
+    # Regression test: slots.py::_apply_sampling used to build its
+    # dataclasses.replace() kwargs with OpenAI-shaped field names
+    # (repeat_penalty, frequency_penalty, presence_penalty, repeat_last_n)
+    # instead of the real SamplingOptions names (penalty_repeat,
+    # penalty_frequency, penalty_presence, penalty_last_n) — replace()
+    # raised TypeError for an unrecognized kwarg, but only when at least
+    # one of these fields was actually set to a non-falsy value. The only
+    # other sampling test here sends temperature=0.0 and nothing else, so
+    # that branch was never exercised: this failed on every real chat UI
+    # request (its sliders always send non-default values) while every
+    # existing test stayed green. Every field that maps to a differently-
+    # named SamplingOptions field is set here specifically to catch that
+    # class of mismatch again if it comes back.
+    r = client.post("/v1/chat/completions", json=_ok({
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.8, "top_p": 0.9, "top_k": 50,
+        "repeat_penalty": 1.1, "frequency_penalty": 0.2,
+        "presence_penalty": 0.1, "repeat_last_n": 32,
+    }))
+    assert r.status_code == 200
+    assert r.json()["choices"][0]["message"]["content"] == "TokenA TokenB "
+
+
 def test_chat_stream(client):
     with client.stream("POST", "/v1/chat/completions", json={**_ok(), "stream": True}) as response:
         assert response.status_code == 200

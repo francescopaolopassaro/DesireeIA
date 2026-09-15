@@ -133,6 +133,16 @@ class FakeDesireeiaModule:
 
 
 @pytest.fixture
+def anyio_backend():
+    # Every other test here drives the app synchronously through
+    # TestClient; this exists only for the handful of tests that need to
+    # await something directly (see test_models_api.py's SSE route test
+    # and its comment on why). asyncio is the only backend this project
+    # uses anywhere else, so trio support is not exercised.
+    return "asyncio"
+
+
+@pytest.fixture
 def fake_desireeia(monkeypatch):
     import desireeiaserver.engine as engine_mod
 

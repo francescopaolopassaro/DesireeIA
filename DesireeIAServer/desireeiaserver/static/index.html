@@ -7,11 +7,12 @@ integration, no AI training/ingestion without explicit written consent
 from the author.
 
 Chat UI for the DesireeIA server: talks to its own /v1/chat/completions
-(SSE streaming), /v1/models, /props and /config endpoints — no build step,
-no framework, served as a static file by FastAPI (see app.py's
-_static_directory). Kept to one file on purpose: this is an operator
-console bundled with the server binary, not a product with its own
-release cycle.
+(SSE streaming), /v1/models, /models (folder), /props and /config
+endpoints — no build step, no framework, no CDN dependency (this has to
+work on a machine with no internet access, same as the engine itself),
+served as a static file by FastAPI (see app.py's _static_directory). Kept
+to one file on purpose: this is an operator console bundled with the
+server binary, not a product with its own release cycle.
 -->
 <!doctype html>
 <html lang="en">
@@ -19,160 +20,443 @@ release cycle.
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DesireeIA</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%236d8dff'/%3E%3Ccircle cx='32' cy='32' r='30' fill='none' stroke='%23a06dff' stroke-width='3'/%3E%3Cpath d='M32 20c-5 0-8.5 3.8-8.5 9 0 3.3 1.5 6 4.3 8.3V41c0 .8.7 1.5 1.5 1.5h5.4c.8 0 1.5-.7 1.5-1.5v-3.7c2.8-2.3 4.3-5 4.3-8.3 0-5.2-3.5-9-8.5-9z' fill='%23fff'/%3E%3C/svg%3E">
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0f1115; --panel: #171a21; --border: #262b36; --border-2: #333a4a;
-      --text: #e6e6e6; --muted: #8b93a3; --accent: #4f8cff; --accent-2: #3a6fd8;
-      --ok: #5bd68a; --err: #ff7b72; --warn: #e6b45b;
-      --bubble-user: #1f3a5f; --bubble-assistant: #1c2028;
+      --bg: #0a0c11;
+      --sidebar-bg: #0d1017;
+      --chat-bg: #0f1219;
+      --panel: #161a24;
+      --panel-2: #1b202c;
+      --border: #212635;
+      --border-strong: #2c3346;
+      --text: #edeff3;
+      --text-dim: #aab0c0;
+      --muted: #6d7690;
+      --accent: #6d8dff;
+      --accent-hover: #5b78e8;
+      --accent-soft: rgba(109, 141, 255, 0.14);
+      --accent-glow: rgba(109, 141, 255, 0.35);
+      --ok: #4ade80;
+      --err: #f87171;
+      --err-soft: rgba(248, 113, 113, 0.12);
+      --warn: #fbbf24;
+      --user-bubble: #253a66;
+      --assistant-bubble: var(--panel);
+      --radius-sm: 6px;
+      --radius-md: 10px;
+      --radius-lg: 16px;
+      --font-sans: -apple-system, "Segoe UI", "Inter", system-ui, sans-serif;
+      --font-mono: "Cascadia Code", "SF Mono", Consolas, "Liberation Mono", monospace;
+      --shadow-1: 0 1px 2px rgba(0,0,0,0.3);
+      --shadow-2: 0 8px 24px rgba(0,0,0,0.35);
     }
     * { box-sizing: border-box; }
     body {
-      margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      margin: 0; font-family: var(--font-sans);
       background: var(--bg); color: var(--text); height: 100vh; overflow: hidden;
+      -webkit-font-smoothing: antialiased;
     }
-    #app { display: flex; height: 100vh; }
+    #app { display: flex; height: 100vh; position: relative; }
 
-    /* --- sidebar --- */
+    /* ============================= sidebar ============================= */
     #sidebar {
-      width: 280px; min-width: 220px; max-width: 360px; flex-shrink: 0;
-      background: var(--panel); border-right: 1px solid var(--border);
-      display: flex; flex-direction: column; padding: 0.75rem;
-      overflow-y: auto;
+      width: 296px; min-width: 296px; flex-shrink: 0;
+      background: var(--sidebar-bg); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column;
+      transition: margin-left 0.22s ease;
     }
-    #sidebar h1 { font-size: 1rem; margin: 0.25rem 0 0.75rem; font-weight: 600; }
-    .field { margin-bottom: 0.85rem; }
+    #sidebar-scroll { flex: 1; overflow-y: auto; padding: 1rem; }
+    #brand {
+      display: flex; align-items: center; gap: 0.6rem;
+      padding: 0.2rem 0.2rem 1rem;
+    }
+    #brand .mark {
+      width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0;
+      box-shadow: 0 0 0 1px rgba(255,255,255,0.08) inset, 0 4px 12px rgba(109,141,255,0.25);
+    }
+    #brand .mark svg, #empty-state .mark svg { width: 100%; height: 100%; display: block; }
+    #brand .label { font-size: 1rem; font-weight: 650; letter-spacing: -0.01em; }
+
+    .section { margin-bottom: 1.4rem; }
+    .section-title {
+      font-size: 0.68rem; font-weight: 650; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.07em;
+      margin: 0 0 0.55rem 0.1rem; display: flex; align-items: center; gap: 0.35rem;
+    }
+    .section-title svg { width: 12px; height: 12px; opacity: 0.8; }
+
+    .field { margin-bottom: 0.75rem; }
+    .field:last-child { margin-bottom: 0; }
     .field label {
-      display: block; font-size: 0.72rem; color: var(--muted);
-      text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 0.3rem;
+      display: block; font-size: 0.74rem; color: var(--text-dim);
+      margin-bottom: 0.3rem; font-weight: 500;
     }
+    .field label .val { color: var(--muted); font-weight: 400; font-variant-numeric: tabular-nums; }
+
     select, input[type=number], input[type=text], input[type=password], textarea {
-      width: 100%; background: #0f1115; color: var(--text);
-      border: 1px solid var(--border-2); border-radius: 6px;
-      padding: 0.4rem 0.5rem; font-size: 0.85rem; font-family: inherit;
+      width: 100%; background: var(--panel); color: var(--text);
+      border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+      padding: 0.45rem 0.6rem; font-size: 0.84rem; font-family: inherit;
+      transition: border-color 0.15s, box-shadow 0.15s;
     }
-    select:focus, input:focus, textarea:focus { outline: 1px solid var(--accent); }
-    .range-row { display: flex; align-items: center; gap: 0.5rem; }
-    .range-row input[type=range] { flex: 1; accent-color: var(--accent); }
-    .range-row span {
-      width: 3rem; text-align: right; font-variant-numeric: tabular-nums;
-      font-size: 0.8rem; color: var(--muted);
+    select:focus, input:focus, textarea:focus {
+      outline: none; border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
     }
+    select { cursor: pointer; }
+    textarea { resize: vertical; line-height: 1.4; }
+
+    input[type=range] {
+      width: 100%; accent-color: var(--accent); cursor: pointer;
+      height: 4px; margin: 0.3rem 0;
+    }
+
     .btn {
-      background: var(--accent); color: white; border: none; border-radius: 6px;
-      padding: 0.45rem 0.8rem; font-size: 0.85rem; cursor: pointer; font-weight: 500;
+      background: var(--accent); color: #fff; border: none; border-radius: var(--radius-sm);
+      padding: 0.48rem 0.85rem; font-size: 0.82rem; cursor: pointer; font-weight: 600;
+      display: inline-flex; align-items: center; justify-content: center; gap: 0.4rem;
+      transition: background 0.15s, transform 0.05s;
+      font-family: inherit;
     }
-    .btn:hover { background: var(--accent-2); }
-    .btn:disabled { opacity: 0.5; cursor: default; }
-    .btn-secondary { background: #262b36; }
-    .btn-secondary:hover { background: #333a4a; }
+    .btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+    .btn:hover { background: var(--accent-hover); }
+    .btn:active { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.45; cursor: default; }
+    .btn-secondary { background: var(--panel-2); color: var(--text); border: 1px solid var(--border-strong); }
+    .btn-secondary:hover { background: #232937; border-color: #3a4258; }
+    .btn-block { width: 100%; }
     .btn-row { display: flex; gap: 0.5rem; }
-    #settings-status { font-size: 0.75rem; margin-top: 0.4rem; min-height: 1rem; }
+    .btn-row .btn { flex: 1; }
+
+    #settings-status { font-size: 0.72rem; margin-top: 0.45rem; min-height: 1rem; }
     #settings-status.ok { color: var(--ok); }
     #settings-status.err { color: var(--err); }
-    hr.sep { border: none; border-top: 1px solid var(--border); margin: 0.9rem 0; }
-    #status-line {
-      margin-top: auto; padding-top: 0.75rem; font-size: 0.72rem; color: var(--muted);
-      display: flex; align-items: center; gap: 0.4rem;
-    }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
-    .dot.ok { background: var(--ok); }
-    .dot.err { background: var(--err); }
-    .dot.warn { background: var(--warn); }
 
-    /* --- chat column --- */
-    #chat-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    hr.sep { border: none; border-top: 1px solid var(--border); margin: 0 0 1.4rem; }
+
+    /* -- models folder list -- */
+    #models-list {
+      display: flex; flex-direction: column; gap: 0.3rem;
+      max-height: 9.5rem; overflow-y: auto; margin-bottom: 0.55rem;
+    }
+    .model-row {
+      display: flex; align-items: center; gap: 0.45rem;
+      font-size: 0.76rem; padding: 0.4rem 0.55rem; border-radius: var(--radius-sm);
+      background: var(--panel); border: 1px solid var(--border);
+      transition: border-color 0.15s;
+    }
+    .model-row:hover { border-color: var(--border-strong); }
+    .model-row .dot-fmt {
+      width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--ok);
+    }
+    .model-row .dot-fmt.invalid { background: var(--err); }
+    .model-row .name {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+      color: var(--text-dim);
+    }
+    .model-row .name.invalid { color: var(--err); }
+    .model-row .size { color: var(--muted); flex-shrink: 0; font-variant-numeric: tabular-nums; font-size: 0.7rem; }
+    .model-row .del-btn {
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      padding: 0.1rem; flex-shrink: 0; display: flex; border-radius: 4px;
+      transition: color 0.15s, background 0.15s;
+    }
+    .model-row .del-btn:hover { color: var(--err); background: var(--err-soft); }
+    .model-row .del-btn svg { width: 13px; height: 13px; }
+    .models-empty { font-size: 0.76rem; color: var(--muted); padding: 0.5rem 0.1rem; }
+
+    #upload-status { font-size: 0.72rem; margin-top: 0.5rem; min-height: 1rem; }
+    #upload-status.ok { color: var(--ok); }
+    #upload-status.err { color: var(--err); }
+    #upload-status .bar {
+      height: 3px; background: var(--border-strong); border-radius: 2px; overflow: hidden; margin-top: 0.3rem;
+    }
+    #upload-status .bar-fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.15s; }
+
+    #status-line {
+      padding: 0.85rem 1rem; border-top: 1px solid var(--border);
+      font-size: 0.72rem; color: var(--muted);
+      display: flex; align-items: center; gap: 0.45rem;
+    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+    .dot.ok { background: var(--ok); box-shadow: 0 0 6px rgba(74,222,128,0.6); }
+    .dot.err { background: var(--err); box-shadow: 0 0 6px rgba(248,113,113,0.6); }
+    .dot.warn { background: var(--warn); box-shadow: 0 0 6px rgba(251,191,36,0.6); }
+
+    /* ============================= chat column ============================= */
+    #chat-col { flex: 1; display: flex; flex-direction: column; min-width: 0; background: var(--chat-bg); }
+
+    #chat-header {
+      display: flex; align-items: center; gap: 0.7rem;
+      padding: 0.7rem 1.25rem; border-bottom: 1px solid var(--border);
+      background: var(--chat-bg); flex-shrink: 0; min-height: 3.2rem;
+    }
+    #menu-btn {
+      display: none; background: none; border: none; color: var(--text-dim);
+      cursor: pointer; padding: 0.3rem; border-radius: 6px;
+    }
+    #menu-btn:hover { background: var(--panel); }
+    #menu-btn svg { width: 18px; height: 18px; }
+    #chat-header .title-wrap { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+    #chat-model-name {
+      font-size: 0.88rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis;
+      white-space: nowrap; max-width: 26rem;
+    }
+    #chat-header .sub { font-size: 0.72rem; color: var(--muted); }
+    #chat-header .spacer { flex: 1; }
+    #clear-btn, #settings-btn {
+      background: none; border: 1px solid var(--border-strong); color: var(--text-dim);
+      border-radius: var(--radius-sm); padding: 0.35rem 0.65rem; font-size: 0.76rem;
+      cursor: pointer; display: flex; align-items: center; gap: 0.35rem; font-family: inherit;
+    }
+    #clear-btn:hover, #settings-btn:hover { border-color: var(--border-strong); background: var(--panel); color: var(--text); }
+    #clear-btn svg, #settings-btn svg { width: 13px; height: 13px; }
+
+    /* ============================= settings modal ============================= */
+    #settings-backdrop {
+      display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 30;
+    }
+    #settings-modal {
+      display: none; flex-direction: column; position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%, -50%); width: min(480px, calc(100vw - 2rem));
+      max-height: min(82vh, 720px); background: var(--sidebar-bg);
+      border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-2); z-index: 31; overflow: hidden;
+    }
+    #app.settings-open #settings-backdrop, #app.settings-open #settings-modal { display: flex; }
+    .modal-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.9rem 1.1rem; border-bottom: 1px solid var(--border); flex-shrink: 0;
+    }
+    .modal-header .modal-title { font-size: 0.95rem; font-weight: 650; }
+    #settings-close {
+      background: none; border: none; color: var(--text-dim); cursor: pointer;
+      padding: 0.3rem; border-radius: 6px;
+    }
+    #settings-close:hover { background: var(--panel); color: var(--text); }
+    #settings-close svg { width: 16px; height: 16px; }
+    .modal-body { padding: 1.1rem; overflow-y: auto; }
+    .field-hint { font-size: 0.7rem; color: var(--muted); margin-top: 0.3rem; line-height: 1.4; }
+
+    /* ============================= attachments ============================= */
+    #attach-btn { flex-shrink: 0; width: 34px; height: 34px; padding: 0; border-radius: 9px; }
+    #attach-btn svg { width: 15px; height: 15px; }
+    .attachment-chip {
+      max-width: 48rem; margin: 0 auto 0.5rem; display: flex; align-items: center; gap: 0.5rem;
+      background: var(--panel); border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
+      padding: 0.4rem 0.6rem; font-size: 0.78rem; color: var(--text-dim);
+    }
+    .attachment-chip svg { flex-shrink: 0; }
+    .attachment-chip .name {
+      flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono);
+    }
+    .attachment-chip .size { color: var(--muted); flex-shrink: 0; }
+    .attachment-chip .remove-btn {
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      padding: 0.1rem; display: flex; border-radius: 4px; flex-shrink: 0;
+    }
+    .attachment-chip .remove-btn:hover { color: var(--err); background: var(--err-soft); }
+
+    /* ============================= tool calls ============================= */
+    .msg.tool .avatar { background: var(--panel-2); color: var(--text-dim); }
+    .bubble.tool-call, .bubble.tool-result {
+      font-size: 0.78rem; color: var(--text-dim); background: var(--panel-2);
+      border: 1px dashed var(--border-strong);
+    }
+    .bubble .tool-tag { font-weight: 650; margin-right: 0.4rem; }
+
     #messages {
-      flex: 1; overflow-y: auto; padding: 1.25rem 1.5rem;
-      display: flex; flex-direction: column; gap: 0.9rem;
+      flex: 1; overflow-y: auto; padding: 1.5rem 1.5rem 0.5rem;
+      display: flex; flex-direction: column; gap: 1.3rem; scroll-behavior: smooth;
     }
-    .msg { max-width: 46rem; margin: 0 auto; width: 100%; display: flex; }
-    .msg.user { justify-content: flex-end; }
+    .msg { max-width: 48rem; margin: 0 auto; width: 100%; display: flex; gap: 0.7rem; }
+    .msg.user { flex-direction: row-reverse; }
+
+    .avatar {
+      width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 0.7rem; font-weight: 700; color: #fff; margin-top: 0.1rem;
+    }
+    .msg.user .avatar { background: linear-gradient(135deg, #4c6ef5, #3454c9); }
+    .msg.assistant .avatar { background: linear-gradient(135deg, var(--accent), #a06dff); }
+
+    .bubble-col { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; max-width: 84%; }
+    .msg.user .bubble-col { align-items: flex-end; }
+
     .bubble {
-      max-width: 80%; padding: 0.6rem 0.85rem; border-radius: 10px;
-      white-space: pre-wrap; word-wrap: break-word; line-height: 1.45; font-size: 0.92rem;
+      padding: 0.65rem 0.9rem; border-radius: var(--radius-md);
+      line-height: 1.55; font-size: 0.9rem; word-wrap: break-word; overflow-wrap: break-word;
     }
-    .msg.user .bubble { background: var(--bubble-user); }
-    .msg.assistant .bubble { background: var(--bubble-assistant); border: 1px solid var(--border); }
+    .msg.user .bubble { background: var(--user-bubble); border-top-right-radius: 4px; }
+    .msg.assistant .bubble {
+      background: var(--assistant-bubble); border: 1px solid var(--border);
+      border-top-left-radius: 4px;
+    }
+    .bubble.error { border-color: var(--err); background: var(--err-soft); color: #ffb4b0; }
     .bubble.streaming::after {
-      content: '▍'; opacity: 0.6; animation: blink 1s step-start infinite;
+      content: ''; display: inline-block; width: 7px; height: 1em; margin-left: 2px;
+      background: var(--accent); vertical-align: text-bottom;
+      animation: blink 0.9s step-start infinite;
     }
     @keyframes blink { 50% { opacity: 0; } }
-    .bubble .meta {
-      display: block; margin-top: 0.4rem; font-size: 0.7rem; color: var(--muted);
-    }
-    .bubble.error { border-color: var(--err); color: var(--err); }
-    .empty-hint {
-      margin: auto; color: var(--muted); font-size: 0.9rem; text-align: center;
+
+    .bubble p { margin: 0 0 0.6em; }
+    .bubble p:last-child { margin-bottom: 0; }
+    .bubble .md-h { margin: 0.7em 0 0.35em; font-weight: 650; line-height: 1.3; }
+    .bubble h1.md-h { font-size: 1.15em; }
+    .bubble h2.md-h { font-size: 1.06em; }
+    .bubble h3.md-h { font-size: 1em; }
+    .bubble ul, .bubble ol { margin: 0.3em 0 0.6em; padding-left: 1.3em; }
+    .bubble li { margin: 0.15em 0; }
+    .bubble strong { font-weight: 650; color: #fff; }
+    .bubble a { color: var(--accent); text-decoration: none; }
+    .bubble a:hover { text-decoration: underline; }
+    .inline-code {
+      font-family: var(--font-mono); font-size: 0.86em; background: rgba(255,255,255,0.08);
+      padding: 0.1em 0.35em; border-radius: 4px;
     }
 
+    .code-block {
+      margin: 0.5em 0; border-radius: var(--radius-sm); overflow: hidden;
+      border: 1px solid var(--border-strong); background: #0b0d13;
+    }
+    .code-block-header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0.35rem 0.65rem; background: #12151d; border-bottom: 1px solid var(--border-strong);
+      font-size: 0.7rem;
+    }
+    .code-lang { color: var(--muted); text-transform: lowercase; font-family: var(--font-mono); }
+    .copy-code-btn, .copy-msg-btn {
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      font-size: 0.7rem; padding: 0.15rem 0.4rem; border-radius: 4px;
+      display: inline-flex; align-items: center; gap: 0.3rem; font-family: inherit;
+    }
+    .copy-code-btn:hover, .copy-msg-btn:hover { color: var(--text); background: rgba(255,255,255,0.06); }
+    .copy-code-btn svg, .copy-msg-btn svg { width: 11px; height: 11px; }
+    .code-block pre {
+      margin: 0; padding: 0.75rem 0.9rem; overflow-x: auto;
+      font-family: var(--font-mono); font-size: 0.82rem; line-height: 1.55;
+    }
+    .code-block code { font-family: inherit; background: none; padding: 0; }
+
+    .msg-actions {
+      display: flex; gap: 0.3rem; opacity: 0; transition: opacity 0.12s;
+      height: 1.1rem;
+    }
+    .msg:hover .msg-actions { opacity: 1; }
+    .msg.user .msg-actions { justify-content: flex-end; }
+
+    .bubble .meta { display: block; margin-top: 0.5rem; font-size: 0.68rem; color: var(--muted); }
+
+    #empty-state {
+      margin: auto; text-align: center; color: var(--muted); max-width: 26rem;
+      display: flex; flex-direction: column; align-items: center; gap: 0.6rem;
+    }
+    #empty-state .mark {
+      width: 44px; height: 44px; border-radius: 50%; margin-bottom: 0.3rem;
+      box-shadow: 0 8px 24px rgba(109,141,255,0.25);
+    }
+    #empty-state .title { font-size: 1rem; font-weight: 600; color: var(--text-dim); }
+    #empty-state .hint { font-size: 0.82rem; line-height: 1.5; }
+
+    #composer-wrap { padding: 0.9rem 1.5rem 1.2rem; flex-shrink: 0; }
     #composer {
-      border-top: 1px solid var(--border); padding: 0.85rem 1.5rem 1.1rem;
-      display: flex; justify-content: center;
+      max-width: 48rem; width: 100%; margin: 0 auto;
+      display: flex; align-items: flex-end; gap: 0.5rem;
+      background: var(--panel); border: 1px solid var(--border-strong);
+      border-radius: var(--radius-lg); padding: 0.5rem 0.5rem 0.5rem 0.9rem;
+      box-shadow: var(--shadow-2);
+      transition: border-color 0.15s, box-shadow 0.15s;
     }
-    #composer-inner { max-width: 46rem; width: 100%; display: flex; gap: 0.6rem; align-items: flex-end; }
+    #composer:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft), var(--shadow-2); }
     #prompt {
-      flex: 1; resize: none; min-height: 2.4rem; max-height: 10rem;
-      padding: 0.55rem 0.75rem; font-size: 0.92rem; line-height: 1.4;
+      flex: 1; resize: none; min-height: 1.6rem; max-height: 10rem;
+      padding: 0.35rem 0; font-size: 0.9rem; line-height: 1.4;
+      background: transparent; border: none;
     }
-    #send-btn, #stop-btn { flex-shrink: 0; padding: 0.55rem 1.1rem; }
+    #prompt:focus { outline: none; box-shadow: none; }
+    #send-btn, #stop-btn {
+      flex-shrink: 0; width: 34px; height: 34px; padding: 0; border-radius: 9px;
+    }
+    #send-btn svg, #stop-btn svg { width: 16px; height: 16px; }
     #stop-btn { background: #4a2020; display: none; }
     #stop-btn:hover { background: #5c2828; }
-    #stop-btn.visible { display: inline-block; }
+    #stop-btn.visible { display: inline-flex; }
     #send-btn.hidden { display: none; }
+    #send-btn:disabled { background: var(--panel-2); color: var(--muted); }
 
-    ::-webkit-scrollbar { width: 10px; }
-    ::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 5px; }
+    /* ============================= misc ============================= */
+    ::-webkit-scrollbar { width: 9px; height: 9px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a4258; }
+
+    #sidebar-backdrop { display: none; }
+
+    @media (max-width: 780px) {
+      #menu-btn { display: flex; align-items: center; justify-content: center; }
+      #sidebar {
+        position: fixed; inset: 0 auto 0 0; z-index: 20;
+        margin-left: -296px; box-shadow: var(--shadow-2);
+      }
+      #app.sidebar-open #sidebar { margin-left: 0; }
+      #sidebar-backdrop {
+        display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 15;
+      }
+      #app.sidebar-open #sidebar-backdrop { display: block; }
+      .msg { max-width: 100%; }
+      .bubble-col { max-width: 92%; }
+      #chat-model-name { max-width: 12rem; }
+    }
   </style>
 </head>
 <body>
 <div id="app">
+  <div id="sidebar-backdrop"></div>
   <aside id="sidebar">
-    <h1>DesireeIA</h1>
+    <div id="sidebar-scroll">
+      <div id="brand">
+        <div class="mark">
+          <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <defs>
+              <linearGradient id="logoGrad" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+                <stop stop-color="#6d8dff"/><stop offset="1" stop-color="#a06dff"/>
+              </linearGradient>
+            </defs>
+            <circle cx="32" cy="32" r="30" fill="url(#logoGrad)"/>
+            <g stroke="rgba(255,255,255,0.55)" stroke-width="1">
+              <line x1="32" y1="6" x2="14" y2="16"/><line x1="32" y1="6" x2="50" y2="16"/>
+              <line x1="14" y1="16" x2="10" y2="32"/><line x1="50" y1="16" x2="54" y2="32"/>
+              <line x1="10" y1="32" x2="18" y2="46"/><line x1="54" y1="32" x2="46" y2="46"/>
+              <line x1="14" y1="16" x2="50" y2="16"/><line x1="10" y1="32" x2="54" y2="32"/>
+            </g>
+            <g fill="#fff">
+              <circle cx="32" cy="6" r="1.6"/><circle cx="14" cy="16" r="1.6"/><circle cx="50" cy="16" r="1.6"/>
+              <circle cx="10" cy="32" r="1.6"/><circle cx="54" cy="32" r="1.6"/>
+              <circle cx="18" cy="46" r="1.6"/><circle cx="46" cy="46" r="1.6"/>
+            </g>
+            <path d="M32 18c-6 0-10 4.6-10 10.8 0 4 1.8 7.2 5.2 10V44c0 1 .8 1.8 1.8 1.8h6c1 0 1.8-.8 1.8-1.8v-5.2c3.4-2.8 5.2-6 5.2-10C42 22.6 38 18 32 18z" fill="#fff"/>
+          </svg>
+        </div>
+        <div class="label">DesireeIA</div>
+      </div>
 
-    <div class="field">
-      <label for="model-select">Model</label>
-      <select id="model-select"></select>
-    </div>
-
-    <div class="field">
-      <label for="system-prompt">System prompt</label>
-      <textarea id="system-prompt" rows="2" placeholder="(optional)"></textarea>
-    </div>
-
-    <hr class="sep">
-
-    <div class="field">
-      <label>Temperature <span id="temperature-val"></span></label>
-      <div class="range-row">
-        <input type="range" id="temperature" min="0" max="2" step="0.05">
+      <div class="section">
+        <div class="section-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
+          Models folder
+        </div>
+        <div id="models-list"></div>
+        <button class="btn btn-secondary btn-block" id="upload-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0-12l-4 4m4-4l4 4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
+          Upload checkpoint
+        </button>
+        <input type="file" id="upload-input" accept=".gguf,.safetensors" style="display:none;">
+        <div id="upload-status"></div>
       </div>
     </div>
-    <div class="field">
-      <label>Top-p <span id="top_p-val"></span></label>
-      <div class="range-row">
-        <input type="range" id="top_p" min="0" max="1" step="0.01">
-      </div>
-    </div>
-    <div class="field">
-      <label>Top-k</label>
-      <input type="number" id="top_k" min="0" step="1">
-    </div>
-    <div class="field">
-      <label>Repeat penalty</label>
-      <input type="number" id="repeat_penalty" min="0" step="0.01">
-    </div>
-    <div class="field">
-      <label>Max tokens (n_predict)</label>
-      <input type="number" id="n_predict" min="1" step="1">
-    </div>
-
-    <div class="btn-row">
-      <button class="btn" id="save-settings">Save to server</button>
-      <button class="btn btn-secondary" id="reload-settings">Reload</button>
-    </div>
-    <div id="settings-status"></div>
 
     <div id="status-line">
       <span class="dot" id="status-dot"></span>
@@ -180,15 +464,125 @@ release cycle.
     </div>
   </aside>
 
-  <div id="chat-col">
-    <div id="messages">
-      <div class="empty-hint" id="empty-hint">Start a conversation below.</div>
+  <div id="settings-backdrop"></div>
+  <div id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+    <div class="modal-header">
+      <div class="modal-title" id="settings-title">Settings</div>
+      <button id="settings-close" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
     </div>
-    <div id="composer">
-      <div id="composer-inner">
+    <div class="modal-body">
+      <div class="section">
+        <div class="section-title">Model</div>
+        <div class="field">
+          <label for="model-select">Active model</label>
+          <select id="model-select"></select>
+        </div>
+        <div class="field">
+          <label for="system-prompt">System prompt</label>
+          <textarea id="system-prompt" rows="3" placeholder="(optional) instructions the model should always follow"></textarea>
+        </div>
+      </div>
+
+      <hr class="sep">
+
+      <div class="section">
+        <div class="section-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+          Sampling
+        </div>
+        <div class="field">
+          <label>Temperature <span class="val" id="temperature-val"></span></label>
+          <input type="range" id="temperature" min="0" max="2" step="0.05">
+          <div class="field-hint">Higher = more varied/creative. Lower = more focused and deterministic.</div>
+        </div>
+        <div class="field">
+          <label>Top-p <span class="val" id="top_p-val"></span></label>
+          <input type="range" id="top_p" min="0" max="1" step="0.01">
+          <div class="field-hint">Keeps only the most likely next words that add up to this probability mass.</div>
+        </div>
+        <div class="field">
+          <label>Top-k</label>
+          <input type="number" id="top_k" min="0" step="1">
+          <div class="field-hint">Limits each next-word choice to the k most likely candidates.</div>
+        </div>
+        <div class="field">
+          <label>Repeat penalty</label>
+          <input type="number" id="repeat_penalty" min="0" step="0.01">
+          <div class="field-hint">Above 1.0 discourages the model from repeating the same words or phrases.</div>
+        </div>
+        <div class="field">
+          <label>Max tokens</label>
+          <input type="number" id="n_predict" min="1" step="1">
+          <div class="field-hint">Hard cap on how long a single reply is allowed to get.</div>
+        </div>
+        <div class="btn-row" style="margin-top:0.85rem;">
+          <button class="btn" id="save-settings">Save</button>
+          <button class="btn btn-secondary" id="reload-settings">Reload</button>
+        </div>
+        <div id="settings-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="chat-col">
+    <div id="chat-header">
+      <button id="menu-btn" title="Toggle sidebar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
+      </button>
+      <div class="title-wrap">
+        <div id="chat-model-name">No model</div>
+        <div class="sub" id="chat-model-sub">&nbsp;</div>
+      </div>
+      <div class="spacer"></div>
+      <button id="settings-btn" title="Settings">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        Settings
+      </button>
+      <button id="clear-btn" title="Clear conversation">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg>
+        Clear
+      </button>
+    </div>
+    <div id="messages">
+      <div id="empty-state">
+        <div class="mark">
+          <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+            <circle cx="32" cy="32" r="30" fill="url(#logoGrad)"/>
+            <g stroke="rgba(255,255,255,0.55)" stroke-width="1">
+              <line x1="32" y1="6" x2="14" y2="16"/><line x1="32" y1="6" x2="50" y2="16"/>
+              <line x1="14" y1="16" x2="10" y2="32"/><line x1="50" y1="16" x2="54" y2="32"/>
+              <line x1="10" y1="32" x2="18" y2="46"/><line x1="54" y1="32" x2="46" y2="46"/>
+              <line x1="14" y1="16" x2="50" y2="16"/><line x1="10" y1="32" x2="54" y2="32"/>
+            </g>
+            <g fill="#fff">
+              <circle cx="32" cy="6" r="1.6"/><circle cx="14" cy="16" r="1.6"/><circle cx="50" cy="16" r="1.6"/>
+              <circle cx="10" cy="32" r="1.6"/><circle cx="54" cy="32" r="1.6"/>
+              <circle cx="18" cy="46" r="1.6"/><circle cx="46" cy="46" r="1.6"/>
+            </g>
+            <path d="M32 18c-6 0-10 4.6-10 10.8 0 4 1.8 7.2 5.2 10V44c0 1 .8 1.8 1.8 1.8h6c1 0 1.8-.8 1.8-1.8v-5.2c3.4-2.8 5.2-6 5.2-10C42 22.6 38 18 32 18z" fill="#fff"/>
+          </svg>
+        </div>
+        <div class="title">Start a conversation</div>
+        <div class="hint">Everything runs locally through this server's own engine — pick a model and tune sampling from Settings, or just start typing to use the default.</div>
+      </div>
+    </div>
+    <div id="composer-wrap">
+      <div id="attachment-chip" class="attachment-chip" hidden></div>
+      <div id="composer">
+        <button class="btn btn-secondary" id="attach-btn" type="button" title="Attach a text/code file">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>
+        </button>
+        <input type="file" id="attach-input" style="display:none"
+               accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.csv,.log,.c,.h,.hpp,.cpp,.cc,.cs,.java,.go,.rs,.rb,.php,.sh,.ps1,.sql,.html,.css,.xml,.ini,.toml,.cfg">
         <textarea id="prompt" placeholder="Message DesireeIA… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
-        <button class="btn" id="send-btn">Send</button>
-        <button class="btn" id="stop-btn">Stop</button>
+        <button class="btn" id="send-btn" title="Send">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
+        </button>
+        <button class="btn" id="stop-btn" title="Stop">
+          <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+        </button>
       </div>
     </div>
   </div>
@@ -200,17 +594,23 @@ release cycle.
 
   // ---- state -------------------------------------------------------
   const state = {
-    messages: [],          // [{role, content}]
+    messages: [],          // [{role, content, tool_calls?, tool_call_id?, name?}]
     controller: null,      // AbortController for the in-flight stream
     settings: null,        // last settings object fetched from /config
+    attachment: null,      // {name, content, size} pending file attached to the next message
   };
 
   const $ = (id) => document.getElementById(id);
   const el = {
+    app: $('app'),
     modelSelect: $('model-select'),
+    modelsList: $('models-list'),
+    uploadBtn: $('upload-btn'),
+    uploadInput: $('upload-input'),
+    uploadStatus: $('upload-status'),
     systemPrompt: $('system-prompt'),
     messages: $('messages'),
-    emptyHint: $('empty-hint'),
+    emptyState: $('empty-state'),
     prompt: $('prompt'),
     sendBtn: $('send-btn'),
     stopBtn: $('stop-btn'),
@@ -219,6 +619,18 @@ release cycle.
     settingsStatus: $('settings-status'),
     saveSettings: $('save-settings'),
     reloadSettings: $('reload-settings'),
+    menuBtn: $('menu-btn'),
+    sidebarBackdrop: $('sidebar-backdrop'),
+    settingsBtn: $('settings-btn'),
+    settingsModal: $('settings-modal'),
+    settingsBackdrop: $('settings-backdrop'),
+    settingsClose: $('settings-close'),
+    attachBtn: $('attach-btn'),
+    attachInput: $('attach-input'),
+    attachmentChip: $('attachment-chip'),
+    clearBtn: $('clear-btn'),
+    chatModelName: $('chat-model-name'),
+    chatModelSub: $('chat-model-sub'),
     sliders: {
       temperature: $('temperature'),
       top_p: $('top_p'),
@@ -253,6 +665,28 @@ release cycle.
     return resp.json();
   }
 
+  // ---- sidebar (mobile) -------------------------------------------------
+  function setSidebarOpen(open) {
+    el.app.classList.toggle('sidebar-open', open);
+  }
+  el.menuBtn.addEventListener('click', () => setSidebarOpen(!el.app.classList.contains('sidebar-open')));
+  el.sidebarBackdrop.addEventListener('click', () => setSidebarOpen(false));
+
+  // ---- settings modal ----------------------------------------------------
+  // A dedicated, always-centered modal rather than a sidebar section: it is
+  // reachable with one click regardless of window height or how far the
+  // sidebar itself happens to be scrolled, which a purely-in-sidebar panel
+  // is not on a short viewport.
+  function setSettingsOpen(open) {
+    el.app.classList.toggle('settings-open', open);
+  }
+  el.settingsBtn.addEventListener('click', () => setSettingsOpen(true));
+  el.settingsClose.addEventListener('click', () => setSettingsOpen(false));
+  el.settingsBackdrop.addEventListener('click', () => setSettingsOpen(false));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && el.app.classList.contains('settings-open')) setSettingsOpen(false);
+  });
+
   // ---- health / model list -------------------------------------------
   async function refreshHealth() {
     try {
@@ -263,6 +697,17 @@ release cycle.
     } catch (e) {
       setStatus('err', 'unreachable');
     }
+  }
+
+  function updateChatHeader() {
+    const opt = el.modelSelect.options[el.modelSelect.selectedIndex];
+    if (!opt || !opt.value) {
+      el.chatModelName.textContent = 'No model';
+      el.chatModelSub.innerHTML = '&nbsp;';
+      return;
+    }
+    el.chatModelName.textContent = opt.value;
+    el.chatModelSub.textContent = (opt.dataset.state || '') + (opt.dataset.replicas > 1 ? ` · ${opt.dataset.replicas} slots` : '');
   }
 
   async function refreshModels() {
@@ -281,19 +726,259 @@ release cycle.
       opt.value = '';
       el.modelSelect.appendChild(opt);
       el.modelSelect.disabled = true;
+      updateChatHeader();
       return;
     }
     el.modelSelect.disabled = false;
     for (const m of models) {
       const opt = document.createElement('option');
       opt.value = m.id;
-      opt.textContent = m.id + (m.meta && m.meta.state ? ` (${m.meta.state})` : '');
+      const state = (m.meta && m.meta.state) || '';
+      opt.textContent = m.id + (state ? ` (${state})` : '');
+      opt.dataset.state = state;
+      opt.dataset.replicas = m.replicas || 1;
       el.modelSelect.appendChild(opt);
     }
     // Keep the previous selection if it still exists; otherwise fall back
     // to whatever the server reports as loaded first.
     if (models.some(m => m.id === previous)) el.modelSelect.value = previous;
+    updateChatHeader();
   }
+  el.modelSelect.addEventListener('change', updateChatHeader);
+
+  // ---- models folder (GET/POST/DELETE /models) --------------------------
+  // Distinct from refreshModels() above: that lists models the router can
+  // actually serve right now (/v1/models, OpenAI shape), this lists FILES
+  // on disk (what could be loaded/deleted). The two overlap but aren't the
+  // same list — a file can sit here unloaded until something requests it.
+  function formatBytes(n) {
+    if (n < 1024) return n + ' B';
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = n, i = -1;
+    do { v /= 1024; i++; } while (v >= 1024 && i < units.length - 1);
+    return v.toFixed(1) + ' ' + units[i];
+  }
+
+  async function refreshModelsFolder() {
+    let data;
+    try {
+      data = await fetchJSON('/models');
+    } catch (e) {
+      el.modelsList.innerHTML = '<div class="models-empty">could not list: ' + escapeHtml(e.message) + '</div>';
+      return;
+    }
+    const models = data.models || [];
+    if (models.length === 0) {
+      el.modelsList.innerHTML = '<div class="models-empty">no checkpoints yet — upload one below</div>';
+      return;
+    }
+    el.modelsList.innerHTML = '';
+    for (const m of models) {
+      const row = document.createElement('div');
+      row.className = 'model-row';
+      const dot = document.createElement('span');
+      dot.className = 'dot-fmt' + (m.valid ? '' : ' invalid');
+      dot.title = m.valid ? m.format : 'invalid header';
+      const name = document.createElement('span');
+      name.className = 'name' + (m.valid ? '' : ' invalid');
+      name.textContent = m.name;
+      name.title = m.name;
+      const size = document.createElement('span');
+      size.className = 'size';
+      size.textContent = formatBytes(m.size_bytes);
+      const del = document.createElement('button');
+      del.className = 'del-btn';
+      del.title = 'Delete ' + m.name;
+      del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg>';
+      del.addEventListener('click', () => deleteModelFile(m.name));
+      row.appendChild(dot);
+      row.appendChild(name);
+      row.appendChild(size);
+      row.appendChild(del);
+      el.modelsList.appendChild(row);
+    }
+  }
+
+  async function deleteModelFile(name) {
+    try {
+      await fetchJSON('/models/' + encodeURIComponent(name), { method: 'DELETE' });
+      refreshModelsFolder();
+    } catch (e) {
+      el.uploadStatus.className = 'err';
+      el.uploadStatus.textContent = 'delete failed: ' + e.message;
+    }
+  }
+
+  // Uses XMLHttpRequest rather than fetch: fetch's Request body has no
+  // upload-progress event, and a multi-gigabyte checkpoint with no
+  // progress indicator reads as a hung page. The request body is the raw
+  // File (a chunked/streamed body either way — this is not a multipart
+  // form), matching what POST /models/upload expects server-side.
+  function uploadModelFile(file) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/models/upload?filename=' + encodeURIComponent(file.name));
+      xhr.upload.addEventListener('progress', (e) => {
+        if (!e.lengthComputable) return;
+        const pct = Math.round((e.loaded / e.total) * 100);
+        el.uploadStatus.innerHTML =
+          `uploading ${escapeHtml(file.name)}… ${pct}%<div class="bar"><div class="bar-fill" style="width:${pct}%"></div></div>`;
+      });
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(JSON.parse(xhr.responseText));
+        } else {
+          let msg = `HTTP ${xhr.status}`;
+          try { msg = JSON.parse(xhr.responseText).error.message; } catch (_) { /* non-JSON error body */ }
+          reject(new Error(msg));
+        }
+      });
+      xhr.addEventListener('error', () => reject(new Error('network error during upload')));
+      xhr.send(file);
+    });
+  }
+
+  el.uploadBtn.addEventListener('click', () => el.uploadInput.click());
+  el.uploadInput.addEventListener('change', async () => {
+    const file = el.uploadInput.files[0];
+    el.uploadInput.value = '';
+    if (!file) return;
+    el.uploadStatus.className = '';
+    el.uploadStatus.textContent = `uploading ${file.name}… 0%`;
+    try {
+      await uploadModelFile(file);
+      el.uploadStatus.className = 'ok';
+      el.uploadStatus.textContent = `${file.name} uploaded`;
+      refreshModelsFolder();
+      setTimeout(() => { el.uploadStatus.textContent = ''; }, 4000);
+    } catch (e) {
+      el.uploadStatus.className = 'err';
+      el.uploadStatus.textContent = 'upload failed: ' + e.message;
+    }
+  });
+
+  // Live refresh when a model is uploaded/deleted from ANY client (another
+  // browser tab, another operator). EventSource (not the fetch+reader
+  // pattern chat uses) is the right tool here: this channel is GET-only
+  // and never needs a request body, so there's no reason to give up its
+  // built-in auto-reconnect.
+  function connectModelsEvents() {
+    const es = new EventSource('/v1/models/sse');
+    es.onmessage = (e) => {
+      let payload;
+      try { payload = JSON.parse(e.data); } catch (_) { return; }
+      if (payload.event === 'models_reload') {
+        refreshModelsFolder();
+        refreshModels();
+      }
+    };
+    // onerror fires on every dropped connection, including ones
+    // EventSource is about to auto-reconnect on its own; nothing to do
+    // here beyond letting that retry happen.
+  }
+
+  // ---- chat attachments (text/code files folded into the prompt) --------
+  // Local text-only models can't see an image, so this attaches a file's
+  // TEXT CONTENT as a fenced code block appended to the message rather than
+  // uploading bytes anywhere — same request path as a normal chat message.
+  const MAX_ATTACHMENT_BYTES = 200 * 1024;
+
+  function guessLangFromName(name) {
+    const ext = (name.split('.').pop() || '').toLowerCase();
+    const map = {
+      py: 'python', js: 'javascript', ts: 'typescript', tsx: 'tsx', jsx: 'jsx',
+      json: 'json', md: 'markdown', markdown: 'markdown', sh: 'bash', ps1: 'powershell',
+      cs: 'csharp', cpp: 'cpp', cc: 'cpp', hpp: 'cpp', c: 'c', h: 'c', java: 'java',
+      go: 'go', rs: 'rust', rb: 'ruby', php: 'php', sql: 'sql', html: 'html', css: 'css',
+      yml: 'yaml', yaml: 'yaml', csv: 'csv', toml: 'toml', ini: 'ini', xml: 'xml',
+    };
+    return map[ext] || '';
+  }
+
+  function renderAttachmentChip() {
+    if (!state.attachment) { el.attachmentChip.hidden = true; el.attachmentChip.innerHTML = ''; return; }
+    el.attachmentChip.hidden = false;
+    el.attachmentChip.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">' +
+      '<path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>' +
+      `<span class="name">${escapeHtml(state.attachment.name)}</span>` +
+      `<span class="size">${formatBytes(state.attachment.size)}</span>` +
+      '<button class="remove-btn" type="button" title="Remove attachment">' +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">' +
+      '<path d="M18 6L6 18M6 6l12 12"/></svg></button>';
+  }
+
+  el.attachmentChip.addEventListener('click', (e) => {
+    if (e.target.closest('.remove-btn')) { state.attachment = null; renderAttachmentChip(); }
+  });
+
+  el.attachBtn.addEventListener('click', () => el.attachInput.click());
+  el.attachInput.addEventListener('change', async () => {
+    const file = el.attachInput.files[0];
+    el.attachInput.value = '';
+    if (!file) return;
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      alert(`"${file.name}" is ${formatBytes(file.size)} — attachments are limited to ${formatBytes(MAX_ATTACHMENT_BYTES)} of text.`);
+      return;
+    }
+    const content = await file.text();
+    state.attachment = { name: file.name, content, size: file.size };
+    renderAttachmentChip();
+  });
+
+  function composeMessageText(rawText) {
+    if (!state.attachment) return rawText;
+    const lang = guessLangFromName(state.attachment.name);
+    const fence = '```' + lang + '\n' + state.attachment.content + '\n```';
+    const prefix = rawText ? rawText + '\n\n' : '';
+    return `${prefix}Attached file: ${state.attachment.name}\n${fence}`;
+  }
+
+  // ---- built-in tools (client-side execution) ---------------------------
+  // The server only detects that the model WANTS to call a tool (see
+  // toolcalling.py) — actually running one is the client's job, same as a
+  // real OpenAI-style tool-calling client. get_weather is a genuine call to
+  // a free, no-key weather API (Open-Meteo), not a canned/fake answer.
+  const TOOLS = [{
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: 'Get the current weather (temperature, wind, sky condition) for a place name.',
+      parameters: {
+        type: 'object',
+        properties: { location: { type: 'string', description: 'City or place name, e.g. "Rome" or "Rome, Italy"' } },
+        required: ['location'],
+      },
+    },
+  }];
+
+  const WEATHER_CODES = {
+    0: 'clear sky', 1: 'mainly clear', 2: 'partly cloudy', 3: 'overcast',
+    45: 'fog', 48: 'depositing rime fog',
+    51: 'light drizzle', 53: 'moderate drizzle', 55: 'dense drizzle',
+    61: 'slight rain', 63: 'moderate rain', 65: 'heavy rain',
+    71: 'slight snow', 73: 'moderate snow', 75: 'heavy snow',
+    80: 'rain showers', 81: 'moderate rain showers', 82: 'violent rain showers',
+    95: 'thunderstorm',
+  };
+
+  async function toolGetWeather(args) {
+    const location = (args && args.location || '').trim();
+    if (!location) throw new Error('missing "location" argument');
+    const geo = await fetchJSON('https://geocoding-api.open-meteo.com/v1/search?count=1&name=' + encodeURIComponent(location));
+    const hit = geo.results && geo.results[0];
+    if (!hit) throw new Error(`location not found: "${location}"`);
+    const fc = await fetchJSON(`https://api.open-meteo.com/v1/forecast?latitude=${hit.latitude}&longitude=${hit.longitude}&current_weather=true`);
+    const cw = fc.current_weather || {};
+    return {
+      location: hit.name + (hit.country ? ', ' + hit.country : ''),
+      temperature_c: cw.temperature,
+      windspeed_kmh: cw.windspeed,
+      condition: WEATHER_CODES[cw.weathercode] || `code ${cw.weathercode}`,
+    };
+  }
+
+  const TOOL_IMPLS = { get_weather: toolGetWeather };
 
   // ---- settings panel --------------------------------------------------
   // /config's shape is {settings: {...}, path: "..."}; POST expects the same
@@ -357,20 +1042,157 @@ release cycle.
   el.saveSettings.addEventListener('click', saveSettings);
   el.reloadSettings.addEventListener('click', loadSettings);
 
+  // ---- lightweight, dependency-free markdown rendering --------------------
+  // Not CommonMark — just enough of what a code-assistant model actually
+  // produces (paragraphs, lists, headers, bold/italic, inline code, fenced
+  // code blocks, links) to look right, hand-rolled because this page loads
+  // from no CDN (has to work with zero internet access, same as the engine
+  // it talks to). HTML is escaped FIRST, and fenced code content is pulled
+  // out before any other rule runs on it, so nothing the model outputs —
+  // including deliberately hostile input — ever becomes a live tag.
+  function escapeHtml(s) {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function renderMarkdownLite(raw) {
+    const codeBlocks = [];
+    let text = escapeHtml(raw).replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push({ lang: lang.trim(), code: code.replace(/\n$/, '') });
+      return ` CODEBLOCK${idx} `;
+    });
+
+    text = text.replace(/`([^`\n]+)`/g, '<code class="inline-code">$1</code>');
+    text = text.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    text = text.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    text = text.replace(
+      /\[([^\]]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g,
+      (_, label, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${label}</a>`,
+    );
+
+    const lines = text.split('\n');
+    let html = '';
+    let listTag = null;
+    const closeList = () => { if (listTag) { html += `</${listTag}>`; listTag = null; } };
+    for (const line of lines) {
+      const heading = line.match(/^(#{1,3})\s+(.*)$/);
+      if (heading) {
+        closeList();
+        const level = heading[1].length;
+        html += `<h${level} class="md-h">${heading[2]}</h${level}>`;
+        continue;
+      }
+      const ul = line.match(/^[-*]\s+(.*)$/);
+      if (ul) {
+        if (listTag !== 'ul') { closeList(); html += '<ul>'; listTag = 'ul'; }
+        html += `<li>${ul[1]}</li>`;
+        continue;
+      }
+      const ol = line.match(/^\d+\.\s+(.*)$/);
+      if (ol) {
+        if (listTag !== 'ol') { closeList(); html += '<ol>'; listTag = 'ol'; }
+        html += `<li>${ol[1]}</li>`;
+        continue;
+      }
+      if (line.trim() === '') { closeList(); html += '<br>'; continue; }
+      closeList();
+      html += line + '<br>';
+    }
+    closeList();
+
+    html = html.replace(/ CODEBLOCK(\d+) /g, (_, i) => {
+      const block = codeBlocks[Number(i)];
+      const langLabel = block.lang ? `<span class="code-lang">${block.lang}</span>` : '<span></span>';
+      return (
+        '<div class="code-block"><div class="code-block-header">' + langLabel +
+        '<button class="copy-code-btn" type="button">' +
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>' +
+        'Copy</button></div><pre><code>' + block.code + '</code></pre></div>'
+      );
+    });
+    return html;
+  }
+
+  // Copy buttons are inside dynamically-rendered markdown, so a single
+  // delegated listener on the messages container catches all of them
+  // (present and future) instead of re-binding on every render.
+  el.messages.addEventListener('click', (e) => {
+    const codeBtn = e.target.closest('.copy-code-btn');
+    if (codeBtn) {
+      const code = codeBtn.closest('.code-block').querySelector('code').textContent;
+      copyToClipboard(code, codeBtn);
+      return;
+    }
+    const msgBtn = e.target.closest('.copy-msg-btn');
+    if (msgBtn) {
+      const idx = Number(msgBtn.closest('.msg').dataset.index);
+      copyToClipboard(state.messages[idx].content || '', msgBtn);
+    }
+  });
+
+  function copyToClipboard(text, btn) {
+    navigator.clipboard.writeText(text).then(() => {
+      const original = btn.innerHTML;
+      btn.innerHTML = 'Copied';
+      setTimeout(() => { btn.innerHTML = original; }, 1400);
+    }).catch(() => { /* clipboard permission denied or unavailable: silent no-op */ });
+  }
+
   // ---- chat rendering -------------------------------------------------
+  function buildMessageRow(m, index) {
+    const row = document.createElement('div');
+    row.className = 'msg ' + m.role;
+    row.dataset.index = String(index);
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = m.role === 'user' ? 'U' : (m.role === 'tool' ? 'T' : 'D');
+
+    const col = document.createElement('div');
+    col.className = 'bubble-col';
+
+    const bubble = document.createElement('div');
+    if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length) {
+      const call = m.tool_calls[0];
+      let argsText = call.function.arguments || '{}';
+      try { argsText = JSON.stringify(JSON.parse(argsText)); } catch (_) { /* show raw */ }
+      bubble.className = 'bubble tool-call';
+      bubble.innerHTML = '<span class="tool-tag">🔧 tool call</span>' +
+        `<code class="inline-code">${escapeHtml(call.function.name)}(${escapeHtml(argsText)})</code>`;
+    } else if (m.role === 'tool') {
+      let resultText = m.content || '';
+      try { resultText = JSON.stringify(JSON.parse(resultText)); } catch (_) { /* show raw */ }
+      bubble.className = 'bubble tool-result';
+      bubble.innerHTML = `<span class="tool-tag">✓ ${escapeHtml(m.name || 'tool')} result</span>` +
+        `<code class="inline-code">${escapeHtml(resultText)}</code>`;
+    } else {
+      bubble.className = 'bubble';
+      bubble.innerHTML = renderMarkdownLite(m.content || '');
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    actions.innerHTML =
+      '<button class="copy-msg-btn" type="button" title="Copy message">' +
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg></button>';
+
+    col.appendChild(bubble);
+    col.appendChild(actions);
+    row.appendChild(avatar);
+    row.appendChild(col);
+    return { row, bubble };
+  }
+
   function renderMessages() {
     el.messages.innerHTML = '';
     if (state.messages.length === 0) {
-      el.messages.appendChild(el.emptyHint);
+      el.messages.appendChild(el.emptyState);
       return;
     }
-    for (const m of state.messages) {
-      const row = document.createElement('div');
-      row.className = 'msg ' + m.role;
-      const bubble = document.createElement('div');
-      bubble.className = 'bubble';
-      bubble.textContent = m.content;
-      row.appendChild(bubble);
+    for (let i = 0; i < state.messages.length; i++) {
+      const m = state.messages[i];
+      if (m.role === 'system') continue; // shown via the sidebar field, not as a bubble
+      const { row } = buildMessageRow(m, i);
       el.messages.appendChild(row);
     }
     el.messages.scrollTop = el.messages.scrollHeight;
@@ -382,20 +1204,64 @@ release cycle.
     return state.messages[state.messages.length - 1];
   }
 
-  // ---- SSE streaming ---------------------------------------------------
+  el.clearBtn.addEventListener('click', () => {
+    if (state.controller) state.controller.abort();
+    state.messages = [];
+    renderMessages();
+  });
+
+  // ---- SSE streaming + tool-call loop ------------------------------------
   // Uses fetch + a manual ReadableStream reader rather than EventSource:
   // EventSource can only send GET requests, and chat needs POST with a JSON
   // body (the messages array, sampling params). The server's stream is
   // still standard SSE ("data: {...}\n\n", closed by "data: [DONE]\n\n" —
   // see chat.py's sse()/_chat_stream()), only the client transport differs.
-  async function streamChat(messages) {
+  //
+  // When the server-side model asks for a tool (see toolcalling.py), the
+  // stream ends with a delta.tool_calls chunk instead of text content. This
+  // function then actually runs the tool (TOOL_IMPLS), appends the result
+  // as a role="tool" message, and calls itself again so the model can turn
+  // that result into a real answer — a real (bounded) agentic loop, not a
+  // one-shot demo.
+  const MAX_TOOL_HOPS = 3;
+
+  function messagesForRequest() {
+    return state.messages.map((m) => {
+      const out = { role: m.role, content: m.content };
+      if (m.tool_calls) out.tool_calls = m.tool_calls;
+      if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+      if (m.name) out.name = m.name;
+      return out;
+    });
+  }
+
+  async function sendConversation(depth) {
     const controller = new AbortController();
     state.controller = controller;
     el.sendBtn.classList.add('hidden');
     el.stopBtn.classList.add('visible');
 
     const assistantMsg = addMessage('assistant', '');
-    const bubbleEls = () => el.messages.querySelectorAll('.msg.assistant .bubble');
+    const msgIndex = state.messages.length - 1;
+    let bubbleEl = el.messages.querySelector(`.msg[data-index="${msgIndex}"] .bubble`);
+
+    // Streaming re-renders markdown on every chunk (so code fences snap
+    // into a real code block as soon as the closing ``` arrives, the same
+    // way most chat UIs behave), but coalesced into one DOM write per
+    // animation frame instead of one per token — a fast stream can be
+    // dozens of chunks within a single frame, and re-parsing/re-painting
+    // for each one individually was visibly janky.
+    let renderQueued = false;
+    function queueBubbleRender() {
+      if (renderQueued || !bubbleEl) return;
+      renderQueued = true;
+      requestAnimationFrame(() => {
+        renderQueued = false;
+        if (!bubbleEl) return;
+        bubbleEl.innerHTML = renderMarkdownLite(assistantMsg.content);
+        el.messages.scrollTop = el.messages.scrollHeight;
+      });
+    }
 
     let resp;
     try {
@@ -405,8 +1271,9 @@ release cycle.
         signal: controller.signal,
         body: JSON.stringify({
           model: el.modelSelect.value || undefined,
-          messages: messages,
+          messages: messagesForRequest(),
           stream: true,
+          tools: TOOLS,
           temperature: Number(el.sliders.temperature.value),
           top_p: Number(el.sliders.top_p.value),
           top_k: parseInt(el.numbers.top_k.value, 10),
@@ -416,17 +1283,14 @@ release cycle.
       });
     } catch (e) {
       if (e.name === 'AbortError') { finishStreaming(); return; }
-      assistantMsg.content = '[request failed: ' + e.message + ']';
-      renderMessages();
+      if (bubbleEl) { bubbleEl.textContent = '[request failed: ' + e.message + ']'; bubbleEl.classList.add('error'); }
       finishStreaming();
       return;
     }
 
     if (!resp.ok) {
-      assistantMsg.content = '[' + (await errorMessage(resp)) + ']';
-      renderMessages();
-      const bubbles = bubbleEls();
-      if (bubbles.length) bubbles[bubbles.length - 1].classList.add('error');
+      const msg = await errorMessage(resp);
+      if (bubbleEl) { bubbleEl.textContent = '[' + msg + ']'; bubbleEl.classList.add('error'); }
       finishStreaming();
       return;
     }
@@ -435,12 +1299,9 @@ release cycle.
     const decoder = new TextDecoder();
     let buf = '';
     let usage = null;
+    const toolCallsAcc = {};
 
-    // Mark the bubble as actively streaming (cursor blink) until the
-    // final chunk or an abort/error ends the loop.
-    renderMessages();
-    let lastBubbles = bubbleEls();
-    if (lastBubbles.length) lastBubbles[lastBubbles.length - 1].classList.add('streaming');
+    if (bubbleEl) bubbleEl.classList.add('streaming');
 
     try {
       while (true) {
@@ -457,36 +1318,75 @@ release cycle.
           let evt;
           try { evt = JSON.parse(payload); } catch (_) { continue; }
           const choice = (evt.choices && evt.choices[0]) || {};
-          const delta = choice.delta && choice.delta.content;
-          if (delta) {
-            assistantMsg.content += delta;
-            const bubbles = bubbleEls();
-            if (bubbles.length) bubbles[bubbles.length - 1].textContent = assistantMsg.content;
-            el.messages.scrollTop = el.messages.scrollHeight;
+          const delta = choice.delta || {};
+          if (delta.content) {
+            assistantMsg.content += delta.content;
+            queueBubbleRender();
+          }
+          if (delta.tool_calls) {
+            // Merged by index rather than assumed single-shot: the wire
+            // shape is OpenAI's incremental one even though this server
+            // currently only ever emits one full chunk per call.
+            for (const tc of delta.tool_calls) {
+              const idx = tc.index || 0;
+              const acc = toolCallsAcc[idx] || (toolCallsAcc[idx] = {
+                id: '', type: 'function', function: { name: '', arguments: '' },
+              });
+              if (tc.id) acc.id = tc.id;
+              if (tc.function) {
+                if (tc.function.name) acc.function.name += tc.function.name;
+                if (tc.function.arguments) acc.function.arguments += tc.function.arguments;
+              }
+            }
           }
           if (evt.usage) usage = evt.usage;
         }
       }
     } catch (e) {
       if (e.name !== 'AbortError') {
-        assistantMsg.content += '\n[stream error: ' + e.message + ']';
-        renderMessages();
+        assistantMsg.content += '\n\n_[stream error: ' + e.message + ']_';
       }
-    } finally {
-      const bubbles = bubbleEls();
-      if (bubbles.length) {
-        const last = bubbles[bubbles.length - 1];
-        last.classList.remove('streaming');
-        last.textContent = assistantMsg.content;
-        if (usage) {
-          const meta = document.createElement('span');
-          meta.className = 'meta';
-          meta.textContent = `${usage.completion_tokens ?? '?'} tokens`;
-          last.appendChild(meta);
-        }
-      }
-      finishStreaming();
     }
+
+    if (bubbleEl) bubbleEl.classList.remove('streaming');
+
+    const toolCalls = Object.keys(toolCallsAcc).length ? Object.values(toolCallsAcc) : null;
+    if (toolCalls && depth < MAX_TOOL_HOPS) {
+      assistantMsg.content = null;
+      assistantMsg.tool_calls = toolCalls;
+      renderMessages(); // re-render this turn as a tool-call row, not a text bubble
+
+      for (const call of toolCalls) {
+        let args = {};
+        try { args = JSON.parse(call.function.arguments || '{}'); } catch (_) { /* leave {} */ }
+        const impl = TOOL_IMPLS[call.function.name];
+        let resultPayload;
+        try {
+          if (!impl) throw new Error(`unknown tool "${call.function.name}"`);
+          resultPayload = await impl(args);
+        } catch (e) {
+          resultPayload = { error: e.message };
+        }
+        state.messages.push({
+          role: 'tool', tool_call_id: call.id, name: call.function.name,
+          content: JSON.stringify(resultPayload),
+        });
+      }
+      renderMessages();
+      finishStreaming();
+      return sendConversation(depth + 1);
+    }
+
+    if (bubbleEl) {
+      bubbleEl.innerHTML = renderMarkdownLite(assistantMsg.content || '');
+      if (usage) {
+        const meta = document.createElement('span');
+        meta.className = 'meta';
+        meta.textContent = `${usage.completion_tokens ?? '?'} tokens`;
+        bubbleEl.appendChild(meta);
+      }
+    }
+    finishStreaming();
   }
 
   function finishStreaming() {
@@ -507,18 +1407,21 @@ release cycle.
   el.prompt.addEventListener('input', autoGrow);
 
   function send() {
-    const text = el.prompt.value.trim();
-    if (!text || state.controller) return;
+    const raw = el.prompt.value.trim();
+    if ((!raw && !state.attachment) || state.controller) return;
+    const text = composeMessageText(raw);
     el.prompt.value = '';
     autoGrow();
+    state.attachment = null;
+    renderAttachmentChip();
 
     if (state.messages.length === 0 && el.systemPrompt.value.trim()) {
       state.messages.push({ role: 'system', content: el.systemPrompt.value.trim() });
     }
     addMessage('user', text);
+    setSidebarOpen(false);
 
-    const history = state.messages.map(m => ({ role: m.role, content: m.content }));
-    streamChat(history);
+    sendConversation(0);
   }
 
   el.sendBtn.addEventListener('click', send);
@@ -531,13 +1434,17 @@ release cycle.
 
   // ---- boot ---------------------------------------------------------
   async function boot() {
-    await Promise.all([refreshHealth(), refreshModels(), loadSettings()]);
+    await Promise.all([refreshHealth(), refreshModels(), refreshModelsFolder(), loadSettings()]);
     renderMessages();
     // Health and the model list can change from another client (a model
     // finishing loading, /config being edited elsewhere), so both are
-    // polled rather than fetched once at load.
+    // polled rather than fetched once at load. The models FOLDER also
+    // gets live push updates via connectModelsEvents(); polling it too
+    // is a fallback for the (rare) case that connection drops silently.
     setInterval(refreshHealth, 5000);
     setInterval(refreshModels, 8000);
+    setInterval(refreshModelsFolder, 15000);
+    connectModelsEvents();
   }
   boot();
 })();
