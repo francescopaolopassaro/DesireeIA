@@ -1,4 +1,12 @@
 # DesireeIA
+[![Version](https://img.shields.io/badge/version-0.1--beta-blue.svg)](#)
+[![Status](https://img.shields.io/badge/status-stabilizing-orange.svg)](#)
+
+We are currently in **Beta 0.1**, actively building, testing, and stabilizing the platform.
+
+> **Beta 0.1 Notice:** DesireeIA is under active development. Features, APIs, and infrastructure are being continuously refined for stability, efficiency, and overall performance.
+
+---
 
 A local large language model inference engine for the .NET ecosystem: a native C++17 core exposed through a stable C ABI, with an idiomatic .NET wrapper on top.
 <img src="images/DesireeIA.jpg" />
