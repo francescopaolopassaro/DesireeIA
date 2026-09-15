@@ -1,25 +1,32 @@
-// Backend CUDA — vedi docs/CUDAPiano.md.
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+// CUDA backend - see docs/CUDAPiano.md.
 //
-// Un solo kernel, per il formato Q8_0 (il piu' semplice: nessun nibble da
-// spacchettare, i pesi sono gia' int8). Porta 1:1 la stessa matematica gia'
-// validata su CPU in matmul_q8_0 (src/core/matmul.cpp): per ogni riga,
-// somma su tutti i sotto-blocchi da 32 elementi di
-// (scala_peso[riga,blocco] * scala_attivazione[blocco] * dot_int8(pesi, attivazione)).
-// Nessun algoritmo nuovo, nessuna scelta di formato inventata — solo un
-// porting su device di un kernel gia' corretto e misurato.
+// One kernel, for the Q8_0 format (the simplest: no nibble to unpack, the
+// weights are already int8). Ports 1:1 the same math already validated on
+// CPU in matmul_q8_0 (src/core/matmul.cpp): for every row, sum over every
+// 32-element sub-block of
+// (weight_scale[row,block] * activation_scale[block] * dot_int8(weights, activation)).
+// No new algorithm, no invented format choice — just a device port of a
+// kernel already correct and measured.
 //
-// STORIA (2026-09-14): la prima versione di questo file (matmul_q8_0_cuda,
-// sotto) faceva upload dell'INTERA matrice pesi ad ogni singola chiamata
+// HISTORY (2026-09-14): the first version of this file (matmul_q8_0_cuda,
+// below) uploaded the ENTIRE weight matrix on every single call
 // (cudaMalloc + memcpy H2D + kernel + memcpy D2H + cudaFree per matvec).
-// Misurato end-to-end contro il path CPU (desireeia-cli bench, Qwen2.5-
-// Coder-3B Q8_0): 28x PIU' LENTO della CPU (0.49 vs 13.90 tok/s decode),
-// causa isolata col profiler (quasi tutto il tempo in
-// "seriale_fra_dispatch", non nel kernel stesso: overhead di trasferimento
-// PCIe + malloc/free sincrono ripetuti a ogni token, per ogni matrice
-// pesi). Aggiunte qui le funzioni "resident" (upload dei pesi UNA VOLTA,
-// riusati per tutta la sessione): stesso principio della cache pesi
-// lato CPU (LayerWeights/layer_cache_ in dense_forward.cpp), il pezzo
-// mancante gia' previsto in docs/CUDAPiano.md sezione 4.
+// Measured end to end against the CPU path (desireeia-cli bench, Qwen2.5-
+// Coder-3B Q8_0): 28x SLOWER than CPU (0.49 vs 13.90 tok/s decode), the
+// cause isolated with the profiler (almost all the time in
+// "seriale_fra_dispatch", not the kernel itself: PCIe transfer overhead
+// plus synchronous malloc/free repeated on every token, for every weight
+// matrix). Added here are the "resident" functions (upload the weights
+// ONCE, reuse them for the whole session): same principle as the CPU-side
+// weight cache (LayerWeights/layer_cache_ in dense_forward.cpp), the
+// missing piece already planned in docs/CUDAPiano.md section 4.
 
 #include "../core/engine.h"
 #include "../core/profile.h"
@@ -59,7 +66,7 @@ static __device__ __forceinline__ int desireeia_dp4a(int a, int b, int c) {
 #if __CUDA_ARCH__ >= 610
     return __dp4a(a, b, c);
 #else
-    // Fallback per architetture senza DP4A: stessa aritmetica, piu' lenta.
+    // Fallback for architectures without DP4A: same arithmetic, slower.
     const int8_t* pa = reinterpret_cast<const int8_t*>(&a);
     const int8_t* pb = reinterpret_cast<const int8_t*>(&b);
     #pragma unroll
@@ -147,11 +154,12 @@ __global__ void matmul_q8_0_kernel(const int8_t* __restrict__ w_qs,
     }
 }
 
-// Attivazione della FFN gated, fatta sul device per non dover riportare
-// gate e up sull'host. Replica ESATTAMENTE le due varianti CPU di
-// dense_forward.cpp: `ffn[i] = silu(gate[i]) * ffn[i]` e geglu_inplace
-// (gelu tanh-approssimata sul ramo gate, poi prodotto). h finisce in
-// `up_inout`, come la versione CPU che scrive in place su `ffn`.
+// Gated FFN activation, done on device so gate and up never have to come
+// back to the host. Replicates EXACTLY the two CPU variants in
+// dense_forward.cpp: `ffn[i] = silu(gate[i]) * ffn[i]` and geglu_inplace
+// (tanh-approximated GELU on the gate branch, then the product). The
+// result ends up in `up_inout`, like the CPU version that writes in place
+// onto `ffn`.
 __global__ void ffn_act_kernel(float* __restrict__ up_inout, const float* __restrict__ gate,
                                 size_t n, int act_gelu) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -168,12 +176,12 @@ __global__ void ffn_act_kernel(float* __restrict__ up_inout, const float* __rest
     up_inout[i] = a * up_inout[i];
 }
 
-// Quantizzazione Q8_0 dell'attivazione sul device: stessa formula di
-// quantize_q8_0 (core/quant.cpp) — per blocco di 32, d = max|v|/127 (0 se
-// tutto zero), q = clamp(rint(v/d), -127, 127), coda azzerata. Un warp per
-// blocco, absmax via shuffle. Serve perche' l'intermedio della FFN nasce
-// gia' su device: riportarlo sull'host solo per quantizzarlo vanificherebbe
-// tutto il guadagno.
+// Device-side Q8_0 quantization of the activation: same formula as
+// quantize_q8_0 (core/quant.cpp) — per 32-block, d = max|v|/127 (0 if
+// all-zero), q = clamp(rint(v/d), -127, 127), tail zeroed. One warp per
+// block, absmax via shuffle. Needed because the FFN intermediate is
+// already on device: bringing it back to the host just to quantize it
+// would undo the whole gain.
 __global__ void quantize_q8_0_kernel(const float* __restrict__ src, size_t n,
                                       int8_t* __restrict__ q, float* __restrict__ scales,
                                       int32_t* __restrict__ sums = nullptr) {
@@ -203,20 +211,21 @@ __global__ void quantize_q8_0_kernel(const float* __restrict__ src, size_t n,
     }
 }
 
-// Attenzione causale con GQA, un blocco per testa.
+// Causal attention with GQA, one block per head.
 //
-// Replica esattamente il ramo float (non kv_quantized_, senza ALiBi) di
-// dense_forward.cpp: per ogni testa h, hkv = h / (n_head/n_head_kv);
-//   scores[cc] = dot(q_h, k[cc][hkv]) * inv_d   per cc in [cc_start, pos]
-//   softmax stabile sulla sola finestra [cc_start, pos]
-//   out[d]    = somma_cc scores[cc] * v[cc][hkv][d]
-// Il layout della KV cache e' lo stesso dell'host:
+// Replicates exactly the float branch (non kv_quantized_, no ALiBi) of
+// dense_forward.cpp: for every head h, hkv = h / (n_head/n_head_kv);
+//   scores[cc] = dot(q_h, k[cc][hkv]) * inv_d   for cc in [cc_start, pos]
+//   stable softmax over just the [cc_start, pos] window
+//   out[d]    = sum_cc scores[cc] * v[cc][hkv][d]
+// The KV cache layout is the same as the host's:
 //   k[(layer*capacity + cc)*kv_dim + hkv*head_dim + d]
-// cosi' la copia device e' un mirror bit-per-bit di quella host e le due
-// non possono divergere nel layout.
+// so the device copy is a bit-for-bit mirror of the host one and the two
+// can never diverge in layout.
 //
-// Un solo kernel invece di tre (punteggi / softmax / accumulo V) per non
-// pagare tre lanci: le fasi sono separate da __syncthreads.
+// One kernel instead of three (scores / softmax / V accumulation) to
+// avoid paying for three launches: the phases are separated by
+// __syncthreads.
 __global__ void attention_kernel(const float* __restrict__ q,
                                   const float* __restrict__ kcache,
                                   const float* __restrict__ vcache,
@@ -1267,8 +1276,8 @@ struct Q80GroupDesc {
     uint32_t n;
 };
 
-// Lancio condiviso dai due entry point (resident e per-chiamata): stessa
-// geometria, cosi' una modifica alla griglia vale per entrambi.
+// Launch shared by the two entry points (resident and per-call): same
+// geometry, so a grid change applies to both.
 constexpr int kMatmulQ80Warps = 4;
 
 template <int nwarps>
@@ -1362,8 +1371,7 @@ void launch_matmul_q8_0(const int8_t* d_w_qs, const __half* d_w_scale,
                          const int8_t* d_x_qs, const float* d_x_scale,
                          size_t nb, size_t rows, float* d_y, cudaStream_t stream,
                          const float* d_bias = nullptr) {
-    // Ogni warp copre 2 righe (vedi il kernel), quindi un blocco ne copre
-    // nwarps*2.
+    // Each warp covers 2 rows (see the kernel), so a block covers nwarps*2.
     const dim3 block(DESIREEIA_CUDA_WARP, kMatmulQ80Warps);
     const size_t rows_per_block = (size_t) kMatmulQ80Warps * 2;
     const unsigned grid = (unsigned) ((rows + rows_per_block - 1) / rows_per_block);
@@ -1371,60 +1379,59 @@ void launch_matmul_q8_0(const int8_t* d_w_qs, const __half* d_w_scale,
         d_w_qs, d_w_scale, d_x_qs, d_x_scale, nb, rows, d_y, d_bias);
 }
 
-// Stream CUDA persistente + buffer di scratch device riutilizzati fra le
-// chiamate.
+// Persistent CUDA stream + device scratch buffers reused across calls.
 //
-// Perche': con i pesi gia' residenti su VRAM, la misura (vedi CUDAPiano.md)
-// mostrava che il tempo di decode restava dominato NON dal kernel
-// (in_dispatch=38ms su 576 chiamate) ma dall'overhead attorno: un
-// cudaMalloc + cudaFree per i buffer di attivazione/output ad OGNI matvec
-// (~36 per token) piu' il costo di submission sullo stream di default.
-// Allocare una volta e riusare elimina il malloc/free per chiamata; uno
-// stream esplicito evita la sincronizzazione implicita del null stream
-// e permette memcpy asincroni ordinati con il kernel, con un solo punto
-// di sincronizzazione a fine chiamata (il chiamante si aspetta y gia'
-// pronto al ritorno).
+// Why: with the weights already resident in VRAM, the measurement (see
+// CUDAPiano.md) showed decode time was still dominated NOT by the kernel
+// (in_dispatch=38ms over 576 calls) but by the overhead around it: a
+// cudaMalloc + cudaFree for the activation/output buffers on EVERY matvec
+// (~36 per token) plus the submission cost on the default stream.
+// Allocating once and reusing removes the malloc/free per call; an
+// explicit stream avoids the null stream's implicit synchronization and
+// allows async memcpys ordered with the kernel, with a single
+// synchronization point at the end of the call (the caller expects y
+// already ready on return).
 //
-// Thread-safety: lo stesso assunto gia' documentato per g_active_backend
-// in dense_forward.cpp — il forward chiama i matvec in sequenza da un
-// solo thread (il parallelismo CPU sta DENTRO i kernel CPU, non attorno
-// a questi dispatch). Se in futuro piu' thread dovessero lanciare kernel
-// CUDA insieme, questo stato va reso per-thread o protetto.
+// Thread safety: the same assumption already documented for
+// g_active_backend in dense_forward.cpp — the forward path calls the
+// matvecs in sequence from a single thread (CPU parallelism lives INSIDE
+// the CPU kernels, not around these dispatches). If multiple threads ever
+// need to launch CUDA kernels together, this state has to become
+// per-thread or be protected.
 struct CudaScratch {
     cudaStream_t stream = nullptr;
     bool stream_ready = false;
-    // [nb*32 byte di xq][nb float di xscale], una sola allocazione.
-    // ATTENZIONE: le due viste dentro d_stage NON si memorizzano qui.
-    // I buffer crescono e basta (nb_cap >= nb), quindi l'offset delle scale
-    // dipende dall'nb DELLA CHIAMATA, non dalla capacita': memorizzarlo al
-    // momento dell'allocazione faceva leggere al kernel le scale
-    // all'offset sbagliato per ogni matrice piu' piccola della piu' grande
-    // vista finora — output "!!!!" invece di testo, con il selftest (una
-    // sola forma) che passava lo stesso.
+    // [nb*32 bytes of xq][nb floats of xscale], a single allocation.
+    // WARNING: the two views inside d_stage are NOT stored here. The
+    // buffers only ever grow (nb_cap >= nb), so the scale offset depends
+    // on the nb OF THIS CALL, not on the capacity: storing it at
+    // allocation time made the kernel read the scales at the wrong offset
+    // for every matrix smaller than the largest one seen so far — output
+    // "!!!!" instead of text, with the self-test (a single shape) still
+    // passing.
     uint8_t* d_stage = nullptr;
     float* d_y = nullptr;
-    size_t nb_cap = 0;    // capacita' in blocchi da 32 dell'attivazione
-    size_t rows_cap = 0;  // capacita' in righe dell'output
-    // Buffer host per la quantizzazione: riusati fra le chiamate, cosi'
-    // quantize_q8_0 non rialloca tre vector ad ogni matvec (252 per token).
+    size_t nb_cap = 0;    // capacity in 32-blocks of the activation
+    size_t rows_cap = 0;  // capacity in output rows
+    // Host buffers for quantization: reused across calls, so quantize_q8_0
+    // doesn't reallocate three vectors on every matvec (252 per token).
     std::vector<int8_t> xq;
     std::vector<float> xscale;
     std::vector<uint8_t> signs;
-    // Buffer della FFN fusa: gate, up/h, h quantizzato e uscita restano
-    // tutti su device per l'intero blocco FFN (vedi
-    // matmul_q8_0_cuda_ffn_gated).
+    // Fused-FFN buffers: gate, up/h, quantized h and the output all stay
+    // on device for the whole FFN block (see matmul_q8_0_cuda_ffn_gated).
     float* d_gate = nullptr;
     float* d_up = nullptr;
     int8_t* d_hq = nullptr;
     float* d_hscale = nullptr;
     float* d_out = nullptr;
-    size_t ff_cap = 0;    // capacita' in elementi di d_gate/d_up/d_hq
-    size_t out_cap = 0;   // capacita' in elementi di d_out
-    // KV cache su device: MIRROR bit-per-bit di k_cache_/v_cache_ host,
-    // stesso layout [layer][pos][kv_head][head_dim]. Essendo uno specchio
-    // scritto nell'unico punto di scrittura esistente (write_kv_cache),
-    // non puo' divergere dall'originale: qualunque percorso (prefill,
-    // decode, fallback CPU) passa comunque di li'.
+    size_t ff_cap = 0;    // capacity in elements of d_gate/d_up/d_hq
+    size_t out_cap = 0;   // capacity in elements of d_out
+    // Device KV cache: bit-for-bit MIRROR of the host k_cache_/v_cache_,
+    // same layout [layer][pos][kv_head][head_dim]. Being a mirror written
+    // at the single existing write point (write_kv_cache), it cannot
+    // diverge from the original: every path (prefill, decode, CPU
+    // fallback) goes through there regardless.
     uint8_t* d_kcache = nullptr;
     uint8_t* d_vcache = nullptr;
     size_t kv_bytes = 0;   // bytes allocated for each of the two
@@ -1545,35 +1552,36 @@ void invalidate_graphs() {
 
 cudaStream_t scratch_stream() {
     if (!g_scratch.stream_ready) {
-        // Attesa attiva invece del blocking di default: il decode fa ~108
-        // sincronizzazioni per token (una per gruppo di matvec), ciascuna
-        // su un lavoro GPU di poche decine di microsecondi. Con lo
-        // scheduling bloccante il costo di addormentare e risvegliare il
-        // thread e' dello stesso ordine del lavoro atteso; con lo spin il
-        // thread resta sul core e la latenza per sincronizzazione crolla.
-        // Il trade-off (un core occupato ad aspettare) e' accettabile qui:
-        // quel thread non avrebbe comunque altro da fare fino al risultato.
+        // Active spin instead of the default blocking wait: decode does
+        // ~108 synchronizations per token (one per matvec group), each on
+        // a few tens of microseconds of GPU work. With blocking scheduling
+        // the cost of putting the thread to sleep and waking it up is the
+        // same order of magnitude as the work being waited on; with a spin
+        // the thread stays on the core and per-synchronization latency
+        // collapses. The trade-off (one core busy waiting) is acceptable
+        // here: that thread would have nothing else to do until the
+        // result anyway.
         cudaSetDeviceFlags(cudaDeviceScheduleSpin);
         if (cudaStreamCreate(&g_scratch.stream) != cudaSuccess) {
-            g_scratch.stream = nullptr; // ricade sul null stream: corretto, solo piu' lento
+            g_scratch.stream = nullptr; // falls back to the null stream: correct, just slower
         }
         g_scratch.stream_ready = true;
     }
     return g_scratch.stream;
 }
 
-// Cresce i buffer di scratch solo quando servono piu' grandi (le forme
-// sono stabili per modello: dopo i primi token ogni matrice ha gia'
-// trovato la sua capacita' e non si rialloca piu').
+// Grows the scratch buffers only when a larger one is needed (shapes are
+// stable per model: after the first few tokens every matrix has already
+// found its capacity and never reallocates again).
 bool scratch_reserve(size_t nb, size_t rows) {
     if (nb > g_scratch.nb_cap || rows > g_scratch.rows_cap) invalidate_graphs();
     if (nb > g_scratch.nb_cap) {
         if (g_scratch.d_stage) cudaFree(g_scratch.d_stage);
         g_scratch.d_stage = nullptr;
         g_scratch.nb_cap = 0;
-        // Un'unica allocazione device con lo stesso layout dello staging
-        // host ([xq][xscale]), cosi' la H2D e' una sola copia contigua.
-        // nb*32 e' multiplo di 4, quindi la parte float resta allineata.
+        // A single device allocation with the same layout as the host
+        // staging ([xq][xscale]), so the H2D is one contiguous copy.
+        // nb*32 is a multiple of 4, so the float part stays aligned.
         if (cudaMalloc(&g_scratch.d_stage, nb * 32 + nb * sizeof(float)) != cudaSuccess) return false;
         g_scratch.nb_cap = nb;
     }
@@ -1645,7 +1653,7 @@ bool scratch_reserve_sums(size_t nb) {
     return true;
 }
 
-// Buffer della FFN fusa. Stessa politica grow-only degli altri.
+// Fused-FFN buffers. Same grow-only policy as the others.
 bool scratch_reserve_ffn(size_t n_ff, size_t n_embd) {
     if (n_ff > g_scratch.ff_cap || n_embd > g_scratch.out_cap) invalidate_graphs();
     if (n_ff > g_scratch.ff_cap) {
@@ -1673,11 +1681,10 @@ bool scratch_reserve_ffn(size_t n_ff, size_t n_embd) {
     return true;
 }
 
-// Spacchetta i byte block_q8_0 nativi (fp16 scale + 32 int8 qs, come letti
-// dal GGUF) in due array piatti device-friendly: qs int8 contigui e scale
-// gia' convertite fp16->fp32. Stessa logica sia per l'upload one-shot
-// (resident) che per il path per-chiamata (fallback), fattorizzata qui per
-// non duplicarla.
+// Unpacks the native block_q8_0 bytes (fp16 scale + 32 int8 qs, as read
+// from the GGUF) into two flat device-friendly arrays: contiguous int8 qs
+// and scales. Same logic for both the one-shot (resident) upload and the
+// per-call (fallback) path, factored out here to avoid duplicating it.
 // Weight scales are kept in fp16, exactly as they are on disk, rather
 // than widened to float. They are read once per (row, block), i.e. one
 // value per 32 weights: at float that is 385 MB of the 3.47 GB a token
@@ -1702,19 +1709,19 @@ void unpack_q8_0(const uint8_t* q8_data, size_t rows, size_t nb,
 
 } // namespace
 
-// Libera un buffer device allocato da una qualunque funzione qui sotto.
-// Firma generica (void*) cosi' da poter essere usata come deleter di uno
-// std::shared_ptr<void> lato C++ (dense_forward.h/.cpp) senza dover
-// includere cuda_runtime.h li'.
+// Frees a device buffer allocated by any function below. Generic (void*)
+// signature so it can be used as the deleter of a std::shared_ptr<void>
+// on the C++ side (dense_forward.h/.cpp) without having to include
+// cuda_runtime.h there.
 void cuda_free_device(void* p) {
     if (p) cudaFree(p);
 }
 
-// Rilascia stream e buffer di scratch persistenti. Chiamata dal
-// distruttore di DenseForward: senza, caricare piu' modelli nello stesso
-// processo (la CLI e i test lo fanno) lascerebbe in giro uno stream e i
-// buffer del modello precedente, dimensionati per forme che non servono
-// piu'.
+// Releases the persistent stream and scratch buffers. Called from
+// DenseForward's destructor: without this, loading multiple models in the
+// same process (the CLI and the tests both do this) would leave a
+// dangling stream and the previous model's buffers, sized for shapes no
+// longer needed.
 void cuda_backend_shutdown() {
     invalidate_graphs();
     if (g_scratch.d_stage) { cudaFree(g_scratch.d_stage); g_scratch.d_stage = nullptr; }
@@ -1753,12 +1760,6 @@ void cuda_backend_shutdown() {
     g_scratch.stream_ready = false;
 }
 
-// Upload one-shot dei pesi Q8_0 di UNA matrice su device: ritorna due
-// puntatori device (qs int8*, scale float*) da tenere per tutta la
-// sessione e riusare ad ogni token via matmul_q8_0_cuda_resident, invece
-// di ricaricarli da capo ogni volta (vedi nota in testa al file). Chiamata
-// una sola volta per tensore, dal punto dove il peso entra nella cache
-// persistente (DenseForward::load_matrix, solo se cache_enabled_).
 // Uploads a weight matrix to VRAM in the representation its format wants.
 //
 // Q8_0 is split into a contiguous int8 array plus an fp16 scale array,
@@ -1844,12 +1845,11 @@ bool matmul_q8_0_cuda_upload_weights(const uint8_t* q8_data, size_t rows, size_t
     return true;
 }
 
-// Come matmul_q8_0_cuda (sotto) ma con i pesi GIA' su device (da una
-// precedente matmul_q8_0_cuda_upload_weights): ad ogni chiamata si
-// quantizza e carica solo l'attivazione (poche decine di KB, non l'intera
-// matrice pesi) e si scarica solo il risultato — il costo dominante
-// misurato nella versione precedente (upload pesi ripetuto ogni token)
-// sparisce.
+// Like matmul_q8_0_cuda (below) but with the weights ALREADY on device
+// (from an earlier matmul_q8_0_cuda_upload_weights): every call quantizes
+// and uploads only the activation (a few tens of KB, not the whole weight
+// matrix) and downloads only the result — the dominant cost measured in
+// the earlier version (weight upload repeated every token) disappears.
 int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows, size_t cols,
                                const float* x, float* y) {
     if (!d_qs || !d_scale || cols == 0 || cols % 32 != 0 || rows == 0) {
@@ -1859,12 +1859,12 @@ int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows
     profile_counters().calls_cuda_resident.fetch_add(1, std::memory_order_relaxed);
     const size_t nb = cols / 32;
 
-    // Buffer riusati fra le chiamate (nessun cudaMalloc/cudaFree qui) e
-    // stream persistente: vedi la nota su CudaScratch in testa al file.
+    // Buffers reused across calls (no cudaMalloc/cudaFree here) and a
+    // persistent stream: see the note on CudaScratch at the top of the file.
     if (!scratch_reserve(nb, rows)) return DESIREEIA_ERR_IO;
 
-    // I vector di quantizzazione vivono nello scratch: quantize_q8_0 li
-    // ridimensiona solo la prima volta, poi riusa la capacita' gia' presente.
+    // The quantization vectors live in scratch: quantize_q8_0 only resizes
+    // them the first time, then reuses the capacity already there.
     quantize_q8_0(x, cols, g_scratch.xq, g_scratch.xscale, g_scratch.signs);
     if (g_scratch.xq.size() != nb * 32 || g_scratch.xscale.size() != nb) {
         return DESIREEIA_ERR_NOT_SUPPORTED;
@@ -1872,11 +1872,11 @@ int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows
 
     cudaStream_t stream = scratch_stream();
 
-    // Viste calcolate sull'nb di QUESTA chiamata (vedi la nota su d_stage).
-    // Due copie H2D direttamente dai vector, agli offset giusti dentro
-    // l'unica allocazione: misurato piu' veloce dello staging in memoria
-    // pinned (una sola copia ma preceduta da due memcpy host), che su
-    // questi volumi costava piu' di quanto facesse risparmiare.
+    // Views computed on THIS call's nb (see the note on d_stage). Two H2D
+    // copies straight from the vectors, at the right offsets inside the
+    // single allocation: measured faster than staging through pinned
+    // memory (one copy, but preceded by two host memcpys), which at these
+    // volumes cost more than it saved.
     int8_t* d_xq = reinterpret_cast<int8_t*>(g_scratch.d_stage);
     float* d_xscale = reinterpret_cast<float*>(g_scratch.d_stage + nb * 32);
     cudaMemcpyAsync(d_xq, g_scratch.xq.data(), nb * 32, cudaMemcpyHostToDevice, stream);
@@ -1888,8 +1888,8 @@ int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows
     if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
 
     cudaMemcpyAsync(y, g_scratch.d_y, rows * sizeof(float), cudaMemcpyDeviceToHost, stream);
-    // Unico punto di sincronizzazione: le operazioni sopra sono gia'
-    // ordinate fra loro dallo stream, il chiamante si aspetta y pronto.
+    // Single synchronization point: the operations above are already
+    // ordered relative to each other by the stream, the caller expects y ready.
     if (cudaStreamSynchronize(stream) != cudaSuccess) return DESIREEIA_ERR_IO;
     return DESIREEIA_OK;
 }
@@ -2028,9 +2028,9 @@ int matmul_kquant_cuda_resident(int format, const void* d_w, size_t rows, size_t
     return DESIREEIA_OK;
 }
 
-// Gruppo di matvec sulla stessa attivazione: una quantizzazione, una H2D,
-// n kernel, n D2H asincrone, UNA sola sincronizzazione. Vedi la nota su
-// CudaQ80Job in engine.h per il perche'.
+// Group of matvecs over the same activation: one quantization, one H2D,
+// n kernels, n async D2H, ONE synchronization. See the note on CudaQ80Job
+// in engine.h for why.
 int matmul_q8_0_cuda_resident_group(const CudaQ80Job* jobs, size_t n, size_t cols, const float* x) {
     if (!jobs || n == 0 || cols == 0 || cols % 32 != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
     size_t rows_total = 0;
@@ -2040,12 +2040,12 @@ int matmul_q8_0_cuda_resident_group(const CudaQ80Job* jobs, size_t n, size_t col
     }
 
     ScopedTimer prof_t(profile_counters().ns_cuda_resident);
-    // Contate come n chiamate, non una: cosi' il confronto con le misure
-    // precedenti (us per matvec) resta leggibile.
+    // Counted as n calls, not one: this keeps the comparison with earlier
+    // measurements (us per matvec) readable.
     profile_counters().calls_cuda_resident.fetch_add((int64_t) n, std::memory_order_relaxed);
 
     const size_t nb = cols / 32;
-    // d_y ospita le uscite di TUTTI i job, una dopo l'altra.
+    // d_y holds the outputs of ALL the jobs, one after another.
     if (!scratch_reserve(nb, rows_total)) return DESIREEIA_ERR_IO;
 
     quantize_q8_0(x, cols, g_scratch.xq, g_scratch.xscale, g_scratch.signs);
@@ -2079,11 +2079,11 @@ int matmul_q8_0_cuda_resident_group(const CudaQ80Job* jobs, size_t n, size_t col
     return DESIREEIA_OK;
 }
 
-// --- KV cache su device (mirror di quella host) ---
+// --- Device KV cache (mirror of the host one) ---
 
-// (Ri)alloca la KV cache device. Chiamata quando la capacita' host cambia
-// (grow_cache): il contenuto valido viene ricaricato subito dopo con
-// cuda_kv_cache_upload, cosi' lo specchio riparte allineato.
+// (Re)allocates the device KV cache. Called when the host capacity
+// changes (grow_cache): the valid content is reloaded right after with
+// cuda_kv_cache_upload, so the mirror starts back aligned.
 bool cuda_kv_cache_reserve(size_t total_bytes) {
     if (total_bytes <= g_scratch.kv_bytes && g_scratch.d_kcache) return true;
     if (g_scratch.d_kcache) cudaFree(g_scratch.d_kcache);
@@ -2102,7 +2102,7 @@ bool cuda_kv_cache_reserve(size_t total_bytes) {
     return true;
 }
 
-// Ricarica l'intera cache host su device (dopo una crescita/reset).
+// Reloads the whole host cache onto device (after a grow/reset).
 bool cuda_kv_cache_upload(const void* k_host, const void* v_host, size_t total_bytes) {
     if (!g_scratch.d_kcache || total_bytes > g_scratch.kv_bytes) return false;
     cudaStream_t stream = scratch_stream();
@@ -2111,9 +2111,9 @@ bool cuda_kv_cache_upload(const void* k_host, const void* v_host, size_t total_b
     return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
-// Specchia una singola posizione (k e v di un layer). Asincrona sullo
-// stream condiviso: l'ordine con il kernel di attenzione che la legge e'
-// garantito dallo stream, quindi non serve sincronizzare qui.
+// Mirrors a single position (k and v of a layer). Async on the shared
+// stream: ordering with the attention kernel that reads it is guaranteed
+// by the stream, so no synchronization is needed here.
 bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v, size_t bytes) {
     if (!g_scratch.d_kcache || byte_off + bytes > g_scratch.kv_bytes) return false;
     cudaStream_t stream = scratch_stream();
@@ -2122,10 +2122,10 @@ bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v, size_t b
     return true;
 }
 
-// Attenzione + proiezione di output in un solo episodio: q sale una volta,
-// l'attenzione legge la KV cache gia' su device, e l'uscita
-// dell'attenzione alimenta direttamente il matvec di `wo` senza mai
-// tornare all'host. Scende solo `proj`.
+// Attention + output projection in a single episode: q goes up once,
+// attention reads the KV cache already on device, and the attention
+// output feeds `wo`'s matvec directly without ever going back to the
+// host. Only `proj` comes down.
 int cuda_attention_out(const void* d_wo_qs, const void* d_wo_scale,
                         const float* q, uint32_t n_head, uint32_t heads_per_kv,
                         uint32_t head_dim, uint32_t kv_dim,
@@ -2197,8 +2197,8 @@ int cuda_attention_out(const void* d_wo_qs, const void* d_wo_scale,
             cc_start, pos, inv_d);
     }
 
-    // L'uscita dell'attenzione e' gia' su device: si quantizza li' e si
-    // passa direttamente al matvec di wo, senza scendere e risalire.
+    // The attention output is already on device: it gets quantized there
+    // and passed straight to wo's matvec, with no round trip to the host.
     int8_t* d_xq = reinterpret_cast<int8_t*>(g_scratch.d_stage);
     float* d_xscale = reinterpret_cast<float*>(g_scratch.d_stage + nb_attn * 32);
     quantize_q8_0_kernel<<<(unsigned) nb_attn, 32, 0, stream>>>(g_scratch.d_attn, q_dim,
@@ -2660,10 +2660,11 @@ int cuda_qkv_attention_out(const CudaQkvAttnArgs& a) {
 // dell'intermedio e proiezione down, con UNA sola H2D (l'attivazione in
 // ingresso), UNA D2H (il risultato) e UNA sincronizzazione.
 //
-// Prima questo blocco costava, per layer: 2 D2H da n_ff float (gate e up),
-// l'attivazione e la riquantizzazione dell'intermedio su CPU, una H2D da
-// n_ff, e 2 sincronizzazioni. L'intermedio (n_ff = 11008 sul modello di
-// prova) non serve mai all'host: nasce e muore dentro la FFN.
+// Before this, the block cost, per layer: 2 D2H of n_ff floats (gate and
+// up), the activation and requantization of the intermediate on CPU, one
+// H2D of n_ff, and 2 synchronizations. The intermediate (n_ff = 11008 on
+// the test model) is never needed by the host: it's born and dies inside
+// the FFN.
 int matmul_q8_0_cuda_ffn_gated(const void* d_up_qs, const void* d_up_scale,
                                 const void* d_gate_qs, const void* d_gate_scale,
                                 const void* d_down_qs, const void* d_down_scale,
@@ -2701,7 +2702,7 @@ int matmul_q8_0_cuda_ffn_gated(const void* d_up_qs, const void* d_up_scale,
     // graph, so the graph's inputs are fixed addresses.
     cudaMemcpyAsync(g_scratch.d_xin, x, n_embd * sizeof(float), cudaMemcpyHostToDevice, stream);
 
-    // up e gate leggono la stessa attivazione appena caricata.
+    // up and gate read the same activation just uploaded.
     // The five kernels of this episode always run with the same
     // parameters for a given layer, so they are recorded once into a
     // graph and replayed afterwards as a single submission.
@@ -2748,13 +2749,12 @@ int matmul_q8_0_cuda_ffn_gated(const void* d_up_qs, const void* d_up_scale,
     return DESIREEIA_OK;
 }
 
-// Path originale (Fase 1 PoC): upload dell'intera matrice pesi ad ogni
-// chiamata. Tenuto come fallback per i tensori NON coperti dalla cache
-// pesi persistente (streaming/scratch_, weight cache disabilitata: in
-// quel caso i pesi cambiano/vengono riletti ad ogni step comunque, quindi
-// la residenza su device non avrebbe nulla da riusare) — corretto ma
-// lento per lo stesso motivo diagnosticato sopra, usato solo quando
-// matmul_q8_0_cuda_resident non e' applicabile.
+// Original path (Phase 1 PoC): uploads the entire weight matrix on every
+// call. Kept as a fallback for tensors NOT covered by the persistent
+// weight cache (streaming/scratch_, weight cache disabled: in that case
+// the weights change/get reread every step anyway, so device residency
+// would have nothing to reuse) — correct but slow for the same reason
+// diagnosed above, used only when matmul_q8_0_cuda_resident doesn't apply.
 int matmul_q8_0_cuda(const uint8_t* q8_data, size_t rows, size_t cols, const float* x, float* y) {
     if (cols == 0 || cols % 32 != 0 || rows == 0) return DESIREEIA_ERR_NOT_SUPPORTED;
     ScopedTimer prof_t(profile_counters().ns_cuda_upload);
