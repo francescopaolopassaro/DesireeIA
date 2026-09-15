@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "desireeia/abi.h"
 #include "core/engine.h"
 #include "core/arch_tags.h"
@@ -437,9 +444,9 @@ int main(int argc, char** argv) {
         std::printf("  worker_count=%zu\n", pool.worker_count());
         bool tp_ok = true;
 
-        // Ogni slot scrive nel proprio intervallo disgiunto: verifica che
-        // ogni elemento venga scritto esattamente una volta col valore
-        // atteso, niente race/elementi persi/doppi.
+        // Each slot writes to its own disjoint range: verifies that every
+        // element gets written exactly once with the expected value, no
+        // races/lost/duplicate elements.
         for (int trial = 0; trial < 20; ++trial) {
             const size_t n = 5000 + (size_t) trial;
             std::vector<int64_t> out(n, -1);
@@ -452,8 +459,8 @@ int main(int argc, char** argv) {
             if (!tp_ok) break;
         }
 
-        // Chiamate consecutive non devono lasciare stato sporco fra loro
-        // (generazione/pending riazzerati correttamente ogni volta).
+        // Consecutive calls must not leave dirty state behind between them
+        // (generation/pending correctly reset every time).
         for (int trial = 0; trial < 50 && tp_ok; ++trial) {
             std::atomic<int64_t> sum{0};
             const size_t n = 10000;
@@ -466,8 +473,8 @@ int main(int argc, char** argv) {
             if (sum.load() != expected) { tp_ok = false; }
         }
 
-        // n=0 e n piccolo (sotto soglia, eseguito sul thread chiamante) non
-        // devono ne' crashare ne' saltare il lavoro.
+        // n=0 and small n (below the threshold, run on the calling thread)
+        // must neither crash nor skip the work.
         {
             std::vector<int> tiny(3, -1);
             pool.parallel_for((size_t) 3, [&](size_t s, size_t e) {
@@ -483,28 +490,28 @@ int main(int argc, char** argv) {
 
     std::printf("--- moe_route (router top-k, softmax+rinormalizzazione) ---\n");
     {
-        // 4 esperti, logit noti: expert 2 il piu' probabile, poi 0, poi 3, poi 1.
+        // 4 experts, known logits: expert 2 the most probable, then 0, then 3, then 1.
         std::vector<float> logits = {1.0f, -2.0f, 3.0f, 0.5f};
         bool moe_ok = true;
 
-        // top-2 con rinormalizzazione: attesi expert {2,0} in quell'ordine,
-        // pesi che sommano a 1.
+        // top-2 with renormalization: expected experts {2,0} in that order,
+        // weights that sum to 1.
         {
             auto sel = desireeia::moe_route(logits, 2, /*norm_w=*/true, /*w_scale=*/1.0f);
             if (sel.size() != 2 || sel[0].first != 2 || sel[1].first != 0) moe_ok = false;
             float wsum = sel.empty() ? 0.0f : sel[0].second + sel[1].second;
             if (!approx(wsum, 1.0f, 1e-5f)) moe_ok = false;
-            if (sel.size() == 2 && sel[0].second <= sel[1].second) moe_ok = false; // expert 2 ha logit maggiore
+            if (sel.size() == 2 && sel[0].second <= sel[1].second) moe_ok = false; // expert 2 has the larger logit
         }
-        // senza rinormalizzazione: la somma dei pesi selezionati e' la
-        // probabilita' softmax cumulativa dei soli top-2 (< 1).
+        // without renormalization: the sum of the selected weights is the
+        // cumulative softmax probability of just the top-2 (< 1).
         {
             auto sel = desireeia::moe_route(logits, 2, /*norm_w=*/false, /*w_scale=*/1.0f);
             float wsum = 0.0f;
             for (auto& s : sel) wsum += s.second;
             if (!(wsum > 0.0f && wsum < 1.0f)) moe_ok = false;
         }
-        // n_expert_used >= n_expert: satura a tutti gli esperti, non crasha.
+        // n_expert_used >= n_expert: saturates to all experts, doesn't crash.
         {
             auto sel = desireeia::moe_route(logits, 10, true, 1.0f);
             if (sel.size() != logits.size()) moe_ok = false;
@@ -515,7 +522,7 @@ int main(int argc, char** argv) {
 
     std::printf("--- matmul_q4_0 fuso (int4 x int8) vs dequant+float ---\n");
     {
-        const size_t rows = 5, cols = 64; // cols multiplo di 32, righe non multiplo per testare tail-free path
+        const size_t rows = 5, cols = 64; // cols a multiple of 32, rows not a multiple to test the tail-free path
         std::vector<float> w((size_t)(rows * cols));
         std::vector<float> x(cols);
         uint32_t rng = 777u;
@@ -553,8 +560,8 @@ int main(int argc, char** argv) {
         bool mm_ok = (rc == DESIREEIA_OK);
         if (mm_ok) {
             for (size_t r = 0; r < rows; ++r) {
-                // tolleranza piu' larga del round-trip puro: l'attivazione e'
-                // anch'essa quantizzata in int8 (errore aggiuntivo atteso).
+                // wider tolerance than a pure round-trip: the activation is
+                // also quantized to int8 (additional expected error).
                 float tol = std::max(0.05f, std::fabs(yref[r]) * 0.05f);
                 if (!approx(yfused[r], yref[r], tol)) {
                     std::printf("  mismatch riga %zu: fused=%.5f ref=%.5f tol=%.5f\n",
@@ -566,10 +573,10 @@ int main(int argc, char** argv) {
         std::printf("  matmul_q4_0: %s\n", mm_ok ? "PASS" : "FAIL");
         if (!mm_ok) failed++;
 
-        // Fase 8: matmul_q4_0_batch deve dare, per costruzione, esattamente
-        // lo stesso risultato di n_tok chiamate separate a matmul_q4_0 (il
-        // batching riordina solo l'ordine di lettura/decodifica dei pesi,
-        // non la formula per singola colonna).
+        // Phase 8: matmul_q4_0_batch must, by construction, give exactly
+        // the same result as n_tok separate calls to matmul_q4_0 (batching
+        // only reorders the order in which weights are read/decoded, not
+        // the per-column formula).
         const size_t n_tok = 3;
         std::vector<float> xb(n_tok * cols);
         for (auto& v : xb) v = next_f();
@@ -644,9 +651,9 @@ int main(int argc, char** argv) {
         std::printf("  matmul_q8_0: %s\n", mm_ok ? "PASS" : "FAIL");
         if (!mm_ok) failed++;
 
-        // n_tok=7 (non multiplo di 4, > rows) per esercitare sia il tile
-        // 2x4 completo che i due rami di resto (righe e token) del GEMM a
-        // blocchi.
+        // n_tok=7 (not a multiple of 4, > rows) to exercise both the full
+        // 2x4 tile and the two remainder branches (rows and tokens) of the
+        // blocked GEMM.
         const size_t n_tok = 7;
         std::vector<float> xb(n_tok * cols);
         for (auto& v : xb) v = next_f();
@@ -666,13 +673,153 @@ int main(int argc, char** argv) {
         }
         std::printf("  matmul_q8_0_batch: %s\n", batch_ok ? "PASS" : "FAIL");
         if (!batch_ok) failed++;
+
+#ifdef DESIREEIA_CUDA_ENABLED
+        // CUDA backend Phase 1 (docs/CUDAPiano.md): compares the device
+        // kernel against matmul_q8_0 already validated above, same data.
+        // NOT run in CI/selftest when DESIREEIA_ENABLE_CUDA is OFF
+        // (default): only compiles when the CMake flag is turned on, on a
+        // machine with the CUDA Toolkit.
+        {
+            std::vector<float> ycuda(rows, 0.0f);
+            int rcc = desireeia::matmul_q8_0_cuda(raw.data(), rows, cols, x.data(), ycuda.data());
+            bool cuda_ok = (rcc == DESIREEIA_OK);
+            if (cuda_ok) {
+                for (size_t r = 0; r < rows; ++r) {
+                    if (!approx(ycuda[r], yfused[r], std::max(1e-3f, std::fabs(yfused[r]) * 1e-4f))) {
+                        std::printf("  cuda mismatch riga %zu: cuda=%.6f cpu=%.6f\n", r, ycuda[r], yfused[r]);
+                        cuda_ok = false;
+                    }
+                }
+            }
+            std::printf("  matmul_q8_0_cuda vs matmul_q8_0: %s\n", cuda_ok ? "PASS" : "FAIL");
+            if (!cuda_ok) failed++;
+        }
+        // Device-resident path (weights uploaded once, reused across
+        // multiple calls): same arithmetic as the per-call kernel above,
+        // checked both against matmul_q8_0 (CPU) and, reusing the same
+        // upload, against a second, different activation vector — verifies
+        // that the weights stay correct across two consecutive calls, not
+        // just the first (the easiest bug to introduce with residency: a
+        // stale device pointer or one freed too early).
+        {
+            void* d_qs = nullptr;
+            void* d_scale = nullptr;
+            bool up_ok = desireeia::matmul_q8_0_cuda_upload_weights(raw.data(), rows, cols, &d_qs, &d_scale);
+            bool res_ok = up_ok;
+            if (up_ok) {
+                std::vector<float> y1(rows, 0.0f);
+                int rc1 = desireeia::matmul_q8_0_cuda_resident(d_qs, d_scale, rows, cols, x.data(), y1.data());
+                res_ok = (rc1 == DESIREEIA_OK);
+                if (res_ok) {
+                    for (size_t r = 0; r < rows; ++r) {
+                        if (!approx(y1[r], yfused[r], std::max(1e-3f, std::fabs(yfused[r]) * 1e-4f))) {
+                            std::printf("  resident mismatch (1a chiamata) riga %zu: resident=%.6f cpu=%.6f\n", r, y1[r], yfused[r]);
+                            res_ok = false;
+                        }
+                    }
+                }
+                if (res_ok) {
+                    std::vector<float> x2(cols);
+                    for (auto& v : x2) v = next_f();
+                    std::vector<float> yref2(rows);
+                    for (size_t r = 0; r < rows; ++r) {
+                        double acc = 0.0;
+                        for (size_t c = 0; c < cols; ++c) acc += (double) w[r * cols + c] * x2[c];
+                        yref2[r] = (float) acc;
+                    }
+                    std::vector<float> y2(rows, 0.0f);
+                    int rc2 = desireeia::matmul_q8_0_cuda_resident(d_qs, d_scale, rows, cols, x2.data(), y2.data());
+                    res_ok = (rc2 == DESIREEIA_OK);
+                    if (res_ok) {
+                        for (size_t r = 0; r < rows; ++r) {
+                            float tol = std::max(0.05f, std::fabs(yref2[r]) * 0.05f);
+                            if (!approx(y2[r], yref2[r], tol)) {
+                                std::printf("  resident mismatch (2a chiamata, pesi riusati) riga %zu: resident=%.6f cpu_ref=%.6f\n", r, y2[r], yref2[r]);
+                                res_ok = false;
+                            }
+                        }
+                    }
+                }
+                desireeia::cuda_free_device(d_qs);
+                desireeia::cuda_free_device(d_scale);
+            }
+            std::printf("  matmul_q8_0_cuda_resident (upload una volta, 2 chiamate): %s\n", res_ok ? "PASS" : "FAIL");
+            if (!res_ok) failed++;
+        }
+        // Regression: a LARGE shape followed by a SMALLER one.
+        // The device scratch buffers only ever grow, so a matrix narrower
+        // than the widest one seen so far still has to read its own scales
+        // at the right offset. A real bug here (offset computed from the
+        // capacity instead of from the call's own nb) produced "!!!!"
+        // output in the engine while the single-shape test still passed:
+        // exercising TWO different shapes is required to catch it.
+        {
+            auto build = [&](size_t rws, size_t cls, std::vector<uint8_t>& raw_out,
+                              std::vector<float>& w_out) {
+                const size_t nb = cls / 32;
+                raw_out.assign(rws * nb * sizeof(block_q8_0), 0);
+                w_out.assign(rws * cls, 0.0f);
+                for (size_t r = 0; r < rws; ++r) {
+                    for (size_t b = 0; b < nb; ++b) {
+                        block_q8_0 blk;
+                        float maxv = 0.0f, vals[32];
+                        for (int j = 0; j < 32; ++j) { vals[j] = next_f(); maxv = std::max(maxv, std::fabs(vals[j])); }
+                        const float d = maxv > 0.0f ? maxv / 127.0f : 1.0f;
+                        blk.d = desireeia_fp32_to_fp16(d);
+                        for (int j = 0; j < 32; ++j) {
+                            int q = (int) std::lround(vals[j] / d);
+                            q = std::min(127, std::max(-127, q));
+                            blk.qs[j] = (int8_t) q;
+                            w_out[r * cls + b * 32 + j] = (float) q * d;
+                        }
+                        std::memcpy(raw_out.data() + (r * nb + b) * sizeof(block_q8_0), &blk, sizeof(blk));
+                    }
+                }
+            };
+
+            struct Shape { size_t rows; size_t cols; };
+            const Shape big{64, 512}, small{32, 64};
+            bool order_ok = true;
+            for (const Shape& s : { big, small }) {   // large FIRST, then small
+                std::vector<uint8_t> raw_s;
+                std::vector<float> w_s;
+                build(s.rows, s.cols, raw_s, w_s);
+                std::vector<float> xs(s.cols);
+                for (auto& v : xs) v = next_f();
+                std::vector<float> ycpu(s.rows, 0.0f), ygpu(s.rows, 0.0f);
+                desireeia::matmul_q8_0(raw_s.data(), s.rows, s.cols, xs.data(), ycpu.data());
+
+                void* dq = nullptr;
+                void* ds = nullptr;
+                if (!desireeia::matmul_q8_0_cuda_upload_weights(raw_s.data(), s.rows, s.cols, &dq, &ds)) {
+                    order_ok = false;
+                    break;
+                }
+                const int rcs = desireeia::matmul_q8_0_cuda_resident(dq, ds, s.rows, s.cols, xs.data(), ygpu.data());
+                if (rcs != DESIREEIA_OK) order_ok = false;
+                for (size_t r = 0; r < s.rows && order_ok; ++r) {
+                    if (!approx(ygpu[r], ycpu[r], std::max(1e-3f, std::fabs(ycpu[r]) * 1e-4f))) {
+                        std::printf("  mismatch forma %zux%zu riga %zu: gpu=%.6f cpu=%.6f\n",
+                                    s.rows, s.cols, r, ygpu[r], ycpu[r]);
+                        order_ok = false;
+                    }
+                }
+                desireeia::cuda_free_device(dq);
+                desireeia::cuda_free_device(ds);
+                if (!order_ok) break;
+            }
+            std::printf("  matmul_q8_0_cuda_resident (forma grande poi piccola): %s\n", order_ok ? "PASS" : "FAIL");
+            if (!order_ok) failed++;
+        }
+#endif
     }
 
     std::printf("--- matmul_q4_k fuso (super-block, int4 x int8) vs dequant+float ---\n");
     {
-        const size_t rows = 3, cols = 256; // 1 super-blocco per riga
-        // scale_i = min_i = i+1 (i=0..7), tutti <16 -> bit alti a 0, encoding
-        // diretto senza dover invertire l'incastro a 6 bit di get_scale_min_k4.
+        const size_t rows = 3, cols = 256; // 1 super-block per row
+        // scale_i = min_i = i+1 (i=0..7), all <16 -> high bits at 0, direct
+        // encoding without having to invert get_scale_min_k4's 6-bit packing.
         uint8_t scales[12] = { 1, 2, 3, 4,  1, 2, 3, 4,  0x55, 0x66, 0x77, 0x88 };
 
         std::vector<uint8_t> raw(rows * sizeof(block_q4_K));
@@ -724,7 +871,7 @@ int main(int argc, char** argv) {
         std::printf("  matmul_q4_k: %s\n", mm_ok ? "PASS" : "FAIL");
         if (!mm_ok) failed++;
 
-        const size_t n_tok = 7; // esercita sia il tile 2x4 che i resti (righe e token)
+        const size_t n_tok = 7; // exercises both the 2x4 tile and the remainders (rows and tokens)
         std::vector<float> xb(n_tok * cols);
         for (auto& v : xb) v = next_f();
         std::vector<float> yb_ref(n_tok * rows), yb_fused(n_tok * rows, 0.0f);
@@ -734,11 +881,11 @@ int main(int argc, char** argv) {
         int rcb = desireeia::matmul_q4_k_batch(raw.data(), rows, cols, xb.data(), n_tok, yb_fused.data());
         bool batch_ok = (rcb == DESIREEIA_OK);
         if (batch_ok) {
-            // Tolleranza relativa: il GEMM a blocchi 2x4 combina i termini
-            // acc/min_acc in un ordine diverso (una sola addizione invece
-            // di due accumulatori separati sommati alla fine) — stesso
-            // riordino in virgola mobile gia' visto e tollerato altrove
-            // (Q6_K batch), non un errore di formula.
+            // Relative tolerance: the 2x4 blocked GEMM combines the
+            // acc/min_acc terms in a different order (a single addition
+            // instead of two separate accumulators summed at the end) —
+            // the same floating-point reordering already seen and
+            // tolerated elsewhere (Q6_K batch), not a formula error.
             for (size_t i = 0; i < n_tok * rows; ++i) {
                 float tol = std::max(1e-3f, std::fabs(yb_ref[i]) * 1e-4f);
                 if (!approx(yb_fused[i], yb_ref[i], tol)) {
@@ -1023,13 +1170,13 @@ int main(int argc, char** argv) {
         bool mm_ok = (rc == DESIREEIA_OK);
         if (mm_ok) {
             for (size_t r = 0; r < rows; ++r) {
-                // Verificato con un caso isolato a quantizzazione esatta
-                // (x=1.0 costante): fused == ref bit-per-bit, formula
-                // corretta. Su dati casuali serve una tolleranza piu'
-                // larga del 5% usato per Q4_K/Q6_K perche' il rumore di
-                // quantizzazione int8 dell'attivazione, sommato su un
-                // range di pesi a 5 bit (0..31, piu' ampio di Q4_K's 0..15),
-                // puo' avvicinarsi al 5-6% su singole righe casuali.
+                // Verified with an isolated case using exact quantization
+                // (constant x=1.0): fused == ref bit-for-bit, formula
+                // correct. On random data a wider tolerance is needed than
+                // the 5% used for Q4_K/Q6_K, because the int8 quantization
+                // noise of the activation, summed over a 5-bit weight
+                // range (0..31, wider than Q4_K's 0..15), can approach
+                // 5-6% on individual random rows.
                 float tol = std::max(0.15f, std::fabs(yref[r]) * 0.08f);
                 if (!approx(yfused[r], yref[r], tol)) {
                     std::printf("  mismatch riga %zu: fused=%.5f ref=%.5f tol=%.5f\n", r, yfused[r], yref[r], tol);
@@ -1064,7 +1211,7 @@ int main(int argc, char** argv) {
 
     std::printf("--- matmul_q6_k fuso (super-block, int4/6 x int8) vs dequant+float ---\n");
     {
-        const size_t rows = 3, cols = 256; // 1 super-blocco per riga
+        const size_t rows = 3, cols = 256; // 1 super-block per row
         std::vector<uint8_t> raw(rows * sizeof(block_q6_K));
         std::vector<float> w(rows * cols);
         uint32_t rng = 99u;
@@ -1076,7 +1223,7 @@ int main(int argc, char** argv) {
             block_q6_K blk;
             std::memset(&blk, 0, sizeof(blk));
             blk.d = desireeia_fp32_to_fp16(0.8f + 0.1f * (float) r);
-            for (int s = 0; s < 16; ++s) blk.scales[s] = (int8_t) (s - 8); // valori con segno, alcuni negativi
+            for (int s = 0; s < 16; ++s) blk.scales[s] = (int8_t) (s - 8); // signed values, some negative
             for (int b = 0; b < 128; ++b) blk.ql[b] = (uint8_t) ((b * 7 + (int) r) & 0xFF);
             for (int b = 0; b < 64; ++b) blk.qh[b] = (uint8_t) ((b * 13 + (int) r * 3) & 0xFF);
             std::memcpy(raw.data() + r * sizeof(block_q6_K), &blk, sizeof(blk));
@@ -1110,7 +1257,7 @@ int main(int argc, char** argv) {
         std::printf("  matmul_q6_k: %s\n", mm_ok ? "PASS" : "FAIL");
         if (!mm_ok) failed++;
 
-        const size_t n_tok = 7; // esercita sia il tile 2x4 che i resti (righe e token)
+        const size_t n_tok = 7; // exercises both the 2x4 tile and the remainders (rows and tokens)
         std::vector<float> xb(n_tok * cols);
         for (auto& v : xb) v = next_f();
         std::vector<float> yb_ref(n_tok * rows), yb_fused(n_tok * rows, 0.0f);
@@ -1120,11 +1267,12 @@ int main(int argc, char** argv) {
         int rcb = desireeia::matmul_q6_k_batch(raw.data(), rows, cols, xb.data(), n_tok, yb_fused.data());
         bool batch_ok = (rcb == DESIREEIA_OK);
         if (batch_ok) {
-            // Tolleranza relativa: la versione batch somma i contributi per
-            // sotto-blocco nello stesso ordine della non-batch, ma passa
-            // per dot8_16 (float) invece di dot8_16_i32 (int32 esatto), con
-            // un riarrotondamento in piu' -> rumore atteso di riordino in
-            // virgola mobile su valori ~O(500), non un errore di formula.
+            // Relative tolerance: the batch version sums the per-sub-block
+            // contributions in the same order as the non-batch version,
+            // but goes through dot8_16 (float) instead of dot8_16_i32
+            // (exact int32), with one extra re-rounding -> expected
+            // floating-point reordering noise on values ~O(500), not a
+            // formula error.
             for (size_t i = 0; i < n_tok * rows; ++i) {
                 float tol = std::max(1e-3f, std::fabs(yb_ref[i]) * 1e-4f);
                 if (!approx(yb_fused[i], yb_ref[i], tol)) {
@@ -1197,7 +1345,7 @@ int main(int argc, char** argv) {
                     }
                     if (!moe_ok) break;
                 }
-                // idx fuori range deve fallire, non leggere fuori tensore
+                // out-of-range idx must fail, not read past the tensor
                 std::vector<float> oob;
                 if (rd->read_expert(0, (uint32_t) n_expert, desireeia::ExpertPart::Gate, oob)) moe_ok = false;
             }
@@ -1248,6 +1396,87 @@ int main(int argc, char** argv) {
         std::remove(path.c_str());
         std::printf("  safetensors single-file: %s\n", st_ok ? "PASS" : "FAIL");
         if (!st_ok) failed++;
+    }
+
+    std::printf("--- safetensors read_expert (Mixtral naming, sintetico) ---\n");
+    {
+        // Convention verified against the conversion module of the
+        // external desireeialmn project (MixtralModel.modify_tensors
+        // class): separate expert tensors
+        // "model.layers.{layer}.block_sparse_moe.experts.{idx}.{wid}.weight"
+        // with wid in {w1=gate, w2=down, w3=up}. Layer 0, 2 experts, values
+        // recognizable per expert/part.
+        const int64_t rows = 3, cols = 2;
+        const int64_t n_per_tensor = rows * cols;
+        const int n_expert = 2;
+        auto fill = [&](int e, int wid_idx) {
+            std::vector<float> v((size_t) n_per_tensor);
+            for (size_t i = 0; i < v.size(); ++i) {
+                v[i] = 1000.0f * (float) wid_idx + 100.0f * (float) e + (float) i;
+            }
+            return v;
+        };
+
+        std::vector<std::pair<std::string, std::vector<float>>> entries;
+        const char* wids[3] = {"w1", "w2", "w3"};
+        for (int e = 0; e < n_expert; ++e) {
+            for (int w = 0; w < 3; ++w) {
+                std::string name = "model.layers.0.block_sparse_moe.experts." +
+                                    std::to_string(e) + "." + wids[w] + ".weight";
+                entries.emplace_back(name, fill(e, w));
+            }
+        }
+
+        std::ostringstream header;
+        header << "{";
+        uint64_t off = 0;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            const auto& v = entries[i].second;
+            uint64_t start = off, end = off + v.size() * 4;
+            header << "\"" << entries[i].first << "\":{\"dtype\":\"F32\",\"shape\":["
+                   << rows << "," << cols << "],\"data_offsets\":[" << start << "," << end << "]}";
+            if (i + 1 < entries.size()) header << ",";
+            off = end;
+        }
+        header << "}";
+        std::string h = header.str();
+
+        const std::string path = "desireeia_rt_moe.safetensors";
+        {
+            std::ofstream of(path, std::ios::binary);
+            uint64_t hlen = h.size();
+            of.write((const char*)&hlen, 8);
+            of.write(h.data(), (std::streamsize) h.size());
+            for (const auto& kv : entries) {
+                of.write((const char*)kv.second.data(), (std::streamsize)(kv.second.size() * 4));
+            }
+        }
+
+        bool moe_st_ok = true;
+        {
+            std::unique_ptr<desireeia::ModelReader> rd(desireeia::make_st_reader());
+            desireeia::ModelMeta meta;
+            if (!rd || !rd->open(path, meta) || meta.format != DESIREEIA_FORMAT_SAFETENSORS) {
+                moe_st_ok = false;
+            } else {
+                struct { desireeia::ExpertPart part; int wid_idx; } parts[3] = {
+                    {desireeia::ExpertPart::Gate, 0}, {desireeia::ExpertPart::Down, 1}, {desireeia::ExpertPart::Up, 2}
+                };
+                for (int e = 0; e < n_expert && moe_st_ok; ++e) {
+                    for (const auto& p : parts) {
+                        std::vector<float> got;
+                        if (!rd->read_expert(0, (uint32_t) e, p.part, got)) { moe_st_ok = false; break; }
+                        std::vector<float> expect = fill(e, p.wid_idx);
+                        if (got != expect) { moe_st_ok = false; break; }
+                    }
+                }
+                std::vector<float> oob;
+                if (rd->read_expert(0, (uint32_t) n_expert, desireeia::ExpertPart::Gate, oob)) moe_st_ok = false;
+            }
+        }
+        std::remove(path.c_str());
+        std::printf("  safetensors read_expert (Mixtral): %s\n", moe_st_ok ? "PASS" : "FAIL");
+        if (!moe_st_ok) failed++;
     }
 
     std::printf("--- real GGUF open ---\n");

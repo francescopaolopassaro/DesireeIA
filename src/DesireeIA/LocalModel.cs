@@ -1,10 +1,17 @@
-﻿using System.Runtime.CompilerServices;
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using DesireeIA.Native;
 
 namespace DesireeIA;
 
-/// <summary>Corrisponde a desireeia_special_token in abi.h.</summary>
+/// <summary>Corresponds to desireeia_special_token in abi.h.</summary>
 public enum SpecialToken
 {
     Bos = 0,
@@ -14,35 +21,35 @@ public enum SpecialToken
 }
 
 /// <summary>
-/// Parametri di campionamento. I default riproducono il comportamento
-/// precedente (greedy, deterministico): serve alzare <see cref="Temperature"/>
-/// per avere generazione campionata.
+/// Sampling parameters. The defaults reproduce the previous behavior
+/// (greedy, deterministic): raise <see cref="Temperature"/> to get sampled
+/// generation.
 /// </summary>
 public sealed class SamplingOptions
 {
-    /// <summary>0 o meno = greedy (argmax), deterministico.</summary>
+    /// <summary>0 or less = greedy (argmax), deterministic.</summary>
     public float Temperature { get; init; }
 
-    /// <summary>Considera solo i K token piu' probabili. 0 o meno = disattivato.</summary>
+    /// <summary>Consider only the K most probable tokens. 0 or less = disabled.</summary>
     public int TopK { get; init; } = 40;
 
-    /// <summary>Massa di probabilita' cumulata da tenere. 1 o piu' = disattivato.</summary>
+    /// <summary>Cumulative probability mass to keep. 1 or more = disabled.</summary>
     public float TopP { get; init; } = 0.95f;
 
     /// <summary>
-    /// Penalita' sui token gia' comparsi di recente. 1 = disattivata.
-    /// Serve a evitare i cicli ripetitivi in cui la decodifica greedy
-    /// finisce su generazioni lunghe.
+    /// Penalty on tokens that appeared recently. 1 = disabled.
+    /// Helps avoid the repetitive loops that greedy decoding tends to fall
+    /// into on long generations.
     /// </summary>
     public float PenaltyRepeat { get; init; } = 1.0f;
 
     public float PenaltyFrequency { get; init; }
     public float PenaltyPresence { get; init; }
 
-    /// <summary>Quanti token indietro guardare per le penalita'.</summary>
+    /// <summary>How many tokens back to look at for the penalties.</summary>
     public int PenaltyLastN { get; init; } = 64;
 
-    /// <summary>Seme del generatore. 0 = seme casuale.</summary>
+    /// <summary>Generator seed. 0 = random seed.</summary>
     public uint Seed { get; init; }
 }
 
@@ -116,9 +123,9 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Tokenizza il testo con il tokenizer del modello (SentencePiece o BPE,
-    /// auto-rilevato). Restituisce null se il modello non ha un tokenizer
-    /// riconosciuto (vedi <see cref="HasTokenizer"/>).
+    /// Tokenizes the text with the model's tokenizer (SentencePiece or BPE,
+    /// auto-detected). Returns null if the model does not have a recognized
+    /// tokenizer (see <see cref="HasTokenizer"/>).
     /// </summary>
     public int[]? Tokenize(string text, bool addBos = true)
     {
@@ -137,8 +144,8 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Restituisce il testo del token, o null se il modello non ha un
-    /// tokenizer riconosciuto o l'id non e' valido.
+    /// Returns the token's text, or null if the model does not have a
+    /// recognized tokenizer or the id is not valid.
     /// </summary>
     public string? TokenPiece(int id)
     {
@@ -153,11 +160,10 @@ public sealed class LocalModel : IDisposable
     public bool HasTokenizer => Tokenize(string.Empty, addBos: false) is not null;
 
     /// <summary>
-    /// Encoder BERT: embedding per token (non aggregato/normalizzato — il
-    /// pooling e' una scelta dell'applicazione). Restituisce null se il
-    /// modello caricato non e' un encoder BERT. Ogni riga del risultato
-    /// corrisponde a un token in ordine, larghezza = dimensione embedding
-    /// del modello.
+    /// BERT encoder: per-token embedding (not aggregated/normalized — pooling
+    /// is left as an application choice). Returns null if the loaded model
+    /// is not a BERT encoder. Each row of the result corresponds to a token
+    /// in order, width = the model's embedding dimension.
     /// </summary>
     public float[][]? Embed(int[] tokens)
     {
@@ -186,8 +192,8 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Id del token speciale richiesto (BOS/EOS/UNK/PAD), o null se il
-    /// modello non lo definisce o non ha un vocabolario riconosciuto.
+    /// Id of the requested special token (BOS/EOS/UNK/PAD), or null if the
+    /// model does not define it or does not have a recognized vocabulary.
     /// </summary>
     public int? SpecialTokenId(SpecialToken which)
     {
@@ -198,18 +204,19 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Id del token di fine sequenza (EOS), o null se non definito. Usato
-    /// da chi genera per sapere quando fermarsi (vedi Fase 0,
-    /// docs/engine_gap_analysis.md: prima di questo il ciclo di generate
-    /// non si fermava mai da solo, andava sempre a --max-tokens).
+    /// Id of the end-of-sequence token (EOS), or null if undefined. Used by
+    /// callers that generate text to know when to stop (see Phase 0,
+    /// docs/engine_gap_analysis.md: before this, the generate loop never
+    /// stopped on its own, it always ran to --max-tokens).
     /// </summary>
     public int? EosId => SpecialTokenId(SpecialToken.Eos);
 
     /// <summary>
-    /// True se il token e' di FINE GENERAZIONE. Non basta confrontare con
-    /// <see cref="EosId"/>: i modelli chat chiudono il turno con token
-    /// dedicati (gemma usa &lt;end_of_turn&gt;), e fermarsi solo su EOS
-    /// lascia il modello a ripeterli all'infinito dopo aver risposto.
+    /// True if the token marks END OF GENERATION. Comparing against
+    /// <see cref="EosId"/> alone is not enough: chat models close the turn
+    /// with dedicated tokens (gemma uses &lt;end_of_turn&gt;), and stopping
+    /// only on EOS leaves the model repeating them indefinitely after it has
+    /// answered.
     /// </summary>
     public bool IsEndOfGeneration(int tokenId)
     {
@@ -219,23 +226,23 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Applica il formato di chat rilevato per il modello (dal
-    /// tokenizer.chat_template del GGUF, o da un default per architettura)
-    /// a una sequenza di messaggi (role, content), producendo il prompt da
-    /// tokenizzare. Copre le famiglie di modelli piu' diffuse (ChatML/Qwen,
-    /// Llama 2/3/3.1/3.2/3.3/4, Mistral in tutte le varianti storiche,
-    /// Gemma 2/3, Phi 3/4, DeepSeek V2/V3/R1, Command-R, ChatGLM3/4,
-    /// MiniCPM, Zephyr, Falcon3, Exaone3) — non piu' solo gemma cablata qui
-    /// nella CLI. Formati non riconosciuti ricadono su ChatML.
+    /// Applies the chat format detected for the model (from the GGUF's
+    /// tokenizer.chat_template, or a per-architecture default) to a sequence
+    /// of messages (role, content), producing the prompt to tokenize. Covers
+    /// the most widespread model families (ChatML/Qwen, Llama
+    /// 2/3/3.1/3.2/3.3/4, Mistral in all its historical variants, Gemma 2/3,
+    /// Phi 3/4, DeepSeek V2/V3/R1, Command-R, ChatGLM3/4, MiniCPM, Zephyr,
+    /// Falcon3, Exaone3) — no longer just gemma hardcoded here in the CLI.
+    /// Unrecognized formats fall back to ChatML.
     /// </summary>
     public string ApplyChatTemplate(IReadOnlyList<(string Role, string Content)> messages, bool addAssistant = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        // string[] con ArraySubType=LPUTF8Str non marshala su questo
-        // runtime: si allocano a mano puntatori UTF-8 NUL-terminati (come
-        // farebbe Marshal.StringToCoTaskMemUTF8, riscritto qui per
-        // controllare l'encoding esplicitamente) e si passano come IntPtr[].
+        // string[] with ArraySubType=LPUTF8Str doesn't marshal on this
+        // runtime: NUL-terminated UTF-8 pointers are allocated by hand (the
+        // way Marshal.StringToCoTaskMemUTF8 would, rewritten here to control
+        // the encoding explicitly) and passed as IntPtr[].
         var roleHandles = new IntPtr[messages.Count];
         var contentHandles = new IntPtr[messages.Count];
         try
@@ -281,7 +288,7 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Imposta i parametri di campionamento. Ha effetto dal token successivo.
+    /// Sets the sampling parameters. Takes effect from the next token onward.
     /// </summary>
     public void SetSampling(SamplingOptions options)
     {
@@ -305,7 +312,7 @@ public sealed class LocalModel : IDisposable
         }
     }
 
-    /// <summary>Parametri di campionamento correnti.</summary>
+    /// <summary>Current sampling parameters.</summary>
     public SamplingOptions GetSampling()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -328,16 +335,16 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Carica un adapter Recover-LoRA in formato GGUF (convenzione
-    /// desireeialmn: tensori "&lt;nome_base&gt;.lora_a"/".lora_b", metadato
-    /// "adapter.lora.alpha"), applicato a runtime senza toccare i pesi base
-    /// quantizzati. Puo' essere chiamato piu' volte per caricare piu'
-    /// adapter contemporaneamente: i contributi si sommano. Copre
-    /// attenzione, FFN densa/MLA/shared-expert; non copre gli esperti MoE
-    /// instradati. Va chiamato prima della prima generazione per applicarsi
-    /// a tutti i layer di un modello con weight-cache abilitata (layer gia'
-    /// generati vengono comunque ricaricati automaticamente al prossimo
-    /// accesso, ma solo da quel punto in poi).
+    /// Loads a Recover-LoRA adapter in GGUF format (desireeialmn convention:
+    /// tensors "&lt;base_name&gt;.lora_a"/".lora_b", metadata
+    /// "adapter.lora.alpha"), applied at runtime without touching the
+    /// quantized base weights. Can be called multiple times to load several
+    /// adapters at once: their contributions add up. Covers attention,
+    /// dense/MLA/shared-expert FFN; does not cover routed MoE experts. Must
+    /// be called before the first generation to apply to every layer of a
+    /// model with weight-cache enabled (layers already generated are still
+    /// reloaded automatically on their next access, but only from that point
+    /// onward).
     /// </summary>
     public void LoadLoraAdapter(string loraGgufPath, float scale = 1.0f)
     {
@@ -349,7 +356,7 @@ public sealed class LocalModel : IDisposable
         }
     }
 
-    /// <summary>Rimuove tutti gli adapter LoRA caricati sul contesto.</summary>
+    /// <summary>Removes all LoRA adapters loaded on the context.</summary>
     public void ClearLoraAdapters()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -361,17 +368,16 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Carica una testa di previsione del routing prerouter (formato GGUF,
-    /// convenzione propria di questo motore: tensori
-    /// "prerouter.&lt;N&gt;.fc1/fc2/linear_init.weight" per layer "owner"
-    /// N). Predice quali esperti instradera' il layer N+1 dai dati del
-    /// layer N, cosi' i loro pesi possono essere precaricati in background
-    /// un layer prima del calcolo reale del router. Non ha mai effetto
-    /// sulla correttezza: una previsione sbagliata o assente lascia
-    /// semplicemente girare il percorso di lettura gia' esistente.
-    /// Nessuna testa addestrata e' oggi disponibile pubblicamente per
-    /// nessun modello supportato: vedi <see cref="SetPrerouterHeuristic"/>
-    /// per un fallback euristico che non richiede alcun file.
+    /// Loads a prerouter routing-prediction head (GGUF format, a convention
+    /// specific to this engine: tensors
+    /// "prerouter.&lt;N&gt;.fc1/fc2/linear_init.weight" for "owner" layer
+    /// N). Predicts which experts layer N+1 will route to from layer N's
+    /// data, so their weights can be prefetched in the background one layer
+    /// ahead of the router's actual computation. Never affects correctness:
+    /// a wrong or missing prediction simply leaves the existing read path
+    /// running as-is. No trained head is publicly available today for any
+    /// supported model: see <see cref="SetPrerouterHeuristic"/> for a
+    /// heuristic fallback that requires no file at all.
     /// </summary>
     public void LoadPrerouter(string path)
     {
@@ -383,7 +389,7 @@ public sealed class LocalModel : IDisposable
         }
     }
 
-    /// <summary>Rimuove tutte le teste prerouter caricate.</summary>
+    /// <summary>Removes all loaded prerouter heads.</summary>
     public void ClearPrerouter()
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -395,10 +401,10 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Attiva/disattiva l'euristica di fallback ("il layer N+1 instrada
-    /// agli stessi esperti appena usati dal layer N") per i layer owner
-    /// senza una testa prerouter addestrata caricata. Spenta di default;
-    /// dichiaratamente un placeholder, non una previsione accurata.
+    /// Enables/disables the fallback heuristic ("layer N+1 routes to the
+    /// same experts layer N just used") for owner layers without a trained
+    /// prerouter head loaded. Off by default; deliberately a placeholder,
+    /// not an accurate prediction.
     /// </summary>
     public void SetPrerouterHeuristic(bool enabled)
     {
@@ -411,20 +417,20 @@ public sealed class LocalModel : IDisposable
     }
 
     // ============================================================
-    // Streaming generation (async, con stop sequences)
+    // Streaming generation (async, with stop sequences)
     // ============================================================
 
     /// <summary>
-    /// Genera in streaming a partire da un prompt gia' tokenizzato,
-    /// restituendo i pezzi di testo non appena decodificati e fermandosi a
-    /// EOS/end-of-turn, al limite <see cref="GenerateOptions.MaxTokens"/>, o
-    /// alla prima occorrenza di una delle <see cref="GenerateOptions.StopSequences"/>
-    /// (che non viene incluse nell'output, come nelle API stile Ollama/OpenAI).
-    /// Le chiamate al motore nativo sono sincrone (un mutex per ctx le
-    /// serializza comunque): lo await Task.Yield() fra un token e il
-    /// successivo serve a lasciare il chiamante libero di intercalare altro
-    /// lavoro asincrono e osservare la cancellazione token per token, non a
-    /// far girare l'inferenza su un altro thread.
+    /// Generates in streaming fashion from an already-tokenized prompt,
+    /// returning text pieces as soon as they're decoded and stopping at
+    /// EOS/end-of-turn, at the <see cref="GenerateOptions.MaxTokens"/> limit,
+    /// or on the first occurrence of one of the
+    /// <see cref="GenerateOptions.StopSequences"/> (which is not included in
+    /// the output, as in Ollama/OpenAI-style APIs). Calls into the native
+    /// engine are synchronous (a per-ctx mutex serializes them anyway): the
+    /// await Task.Yield() between one token and the next is there to leave
+    /// the caller free to interleave other async work and observe
+    /// cancellation token by token, not to run inference on another thread.
     /// </summary>
     public async IAsyncEnumerable<string> StreamAsync(int[] promptTokens, GenerateOptions? options = null,
         [EnumeratorCancellation] CancellationToken ct = default)
@@ -453,9 +459,9 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Come <see cref="StreamAsync"/> ma a partire da una conversazione
-    /// (role, content): applica il chat template del modello e tokenizza il
-    /// prompt risultante prima di generare.
+    /// Like <see cref="StreamAsync"/> but starting from a conversation
+    /// (role, content): applies the model's chat template and tokenizes the
+    /// resulting prompt before generating.
     /// </summary>
     public IAsyncEnumerable<string> ChatStreamAsync(IReadOnlyList<(string Role, string Content)> messages,
         GenerateOptions? options = null, bool addAssistant = true, CancellationToken ct = default)
@@ -486,8 +492,8 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// True se il modello caricato ha un encoder visivo (vision) integrato
-    /// nel GGUF (codec CLIP/SigLIP con clip.vision.*).
+    /// True if the loaded model has a vision encoder built into the GGUF
+    /// (CLIP/SigLIP codec with clip.vision.*).
     /// </summary>
     public bool HasVision
     {
@@ -531,7 +537,7 @@ public sealed class LocalModel : IDisposable
         return embd;
     }
 
-    /// <summary>Numero di vector di embedding visivo per immagine.</summary>
+    /// <summary>Number of vision embedding vectors per image.</summary>
     public int VisionTokenCount
     {
         get
@@ -543,7 +549,7 @@ public sealed class LocalModel : IDisposable
         }
     }
 
-    /// <summary>Id del token placeholder immagine, o null se non risolvibile.</summary>
+    /// <summary>Id of the image placeholder token, or null if it cannot be resolved.</summary>
     public int? VisionImageToken
     {
         get
@@ -556,11 +562,11 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Prefill multimodale: identico a <see cref="Predict"/> ma il flusso
-    /// token deve contenere <see cref="VisionTokenCount"/> occorrenze del
-    /// token placeholder, e <paramref name="embd"/> deve essere il risultato
-    /// di <see cref="EncodeImage"/> (le embeddings visive, in ordine).
-    /// Passare imageToken = -1 per usare il placeholder auto-risolto.
+    /// Multimodal prefill: identical to <see cref="Predict"/> but the token
+    /// stream must contain <see cref="VisionTokenCount"/> occurrences of the
+    /// placeholder token, and <paramref name="embd"/> must be the result of
+    /// <see cref="EncodeImage"/> (the vision embeddings, in order). Pass
+    /// imageToken = -1 to use the auto-resolved placeholder.
     /// </summary>
     public int PredictWithImage(int[] tokens, float[] embd, int imageToken = -1)
     {

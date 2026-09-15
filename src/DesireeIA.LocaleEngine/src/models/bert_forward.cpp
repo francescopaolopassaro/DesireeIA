@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "bert_forward.h"
 #include "core/thread_pool.h"
 #include <algorithm>
@@ -9,12 +16,12 @@ namespace desireeia {
 
 namespace {
 
-// Semplificazione voluta (prima passata di correttezza, nessun GGUF BERT
-// reale disponibile per testare): pesi tenuti interamente in float, senza
-// i kernel quantizzati diretti di DenseForward. I modelli BERT per
-// embedding sono tipicamente piccoli (da poche decine a poche centinaia di
-// MB anche non quantizzati): gap noto, documentato, non il collo di
-// bottiglia critico che sarebbe per un modello generativo grande.
+// Deliberate simplification (first correctness pass, no real BERT GGUF
+// available to test against): weights kept entirely in float, without
+// DenseForward's direct quantized kernels. BERT embedding models are
+// typically small (a few tens to a few hundred MB even unquantized): a
+// known, documented gap, not the critical bottleneck it would be for a
+// large generative model.
 void matvec_f32(const float* w, size_t r, size_t c, const float* x, float* y) {
     ThreadPool::global().parallel_for(r, [&](size_t j0, size_t j1) {
         for (size_t j = j0; j < j1; ++j) {
@@ -33,8 +40,8 @@ float gelu_tanh(float x) {
     return 0.5f * x * (1.0f + tanhf(0.7978845608028654f * (x + 0.044715f * x * x * x)));
 }
 
-// LayerNorm classico (media + varianza di popolazione, poi peso e bias),
-// stessa formula di dense_forward.cpp::layer_norm_vec.
+// Classic LayerNorm (population mean + variance, then weight and bias),
+// the same formula as dense_forward.cpp::layer_norm_vec.
 void layer_norm_vec(const float* x, const float* w, const float* b, float* y, size_t n, float eps) {
     double mean = 0.0;
     for (size_t i = 0; i < n; ++i) mean += x[i];
@@ -170,7 +177,7 @@ bool BertForward::encode(ModelReader& /*rd*/, const int32_t* tokens, size_t n_to
             for (uint32_t i = 0; i < n_embd; ++i) xp[i] += pe[i];
         }
     }
-    // Norm iniziale sugli embedding, UNA volta sola prima del primo layer.
+    // Initial norm on the embeddings, applied ONCE before the first layer.
     for (size_t p = 0; p < n_tokens; ++p) {
         float* xp = x.data() + p * n_embd;
         layer_norm_vec(xp, tok_norm_.data(), tok_norm_b_.data(), xp, n_embd, cfg_.eps);
@@ -186,11 +193,11 @@ bool BertForward::encode(ModelReader& /*rd*/, const int32_t* tokens, size_t n_to
     for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
         const BertLayerWeights& lw = layers_[l];
 
-        // Nessun pre-norm: Q/K/V calcolati direttamente sull'input grezzo
-        // del layer (verificato su bert.cpp: `cur = inpL;` senza alcuna
-        // build_norm prima dell'attenzione — topologia interamente
-        // post-norm, diversa sia dal pre-norm classico sia dal
-        // no_pre_norm+sandwich di olmo2/exaone4).
+        // No pre-norm: Q/K/V computed directly on the layer's raw input
+        // (verified against bert.cpp: `cur = inpL;` with no build_norm
+        // before attention — an entirely post-norm topology, different
+        // both from classic pre-norm and from olmo2/exaone4's
+        // no_pre_norm+sandwich).
         for (size_t p = 0; p < n_tokens; ++p) {
             const float* xp = x.data() + p * n_embd;
             matvec_f32(lw.wq.data(), q_dim, n_embd, xp, q.data() + p * q_dim);
@@ -232,7 +239,7 @@ bool BertForward::encode(ModelReader& /*rd*/, const int32_t* tokens, size_t n_to
             matvec_f32(lw.wo.data(), n_embd, q_dim, attn_out.data() + p * q_dim, proj.data() + p * n_embd);
             float* pr = proj.data() + p * n_embd;
             const float* xp = x.data() + p * n_embd;
-            for (uint32_t i = 0; i < n_embd; ++i) pr[i] += lw.bo[i] + xp[i]; // +bias, poi residuo sull'input GREZZO del layer
+            for (uint32_t i = 0; i < n_embd; ++i) pr[i] += lw.bo[i] + xp[i]; // +bias, then residual onto the layer's RAW input
             layer_norm_vec(pr, lw.attn_out_norm.data(), lw.attn_out_norm_b.data(), pr, n_embd, cfg_.eps);
         }
 
@@ -243,7 +250,7 @@ bool BertForward::encode(ModelReader& /*rd*/, const int32_t* tokens, size_t n_to
             for (uint32_t i = 0; i < cfg_.n_ff; ++i) fp[i] = gelu_tanh(fp[i] + lw.ffn_up_b[i]);
             float* fo = fout.data() + p * n_embd;
             matvec_f32(lw.ffn_down.data(), n_embd, cfg_.n_ff, fp, fo);
-            for (uint32_t i = 0; i < n_embd; ++i) fo[i] += lw.ffn_down_b[i] + pr[i]; // residuo sul post-attn-norm (ffn_inp)
+            for (uint32_t i = 0; i < n_embd; ++i) fo[i] += lw.ffn_down_b[i] + pr[i]; // residual onto the post-attn-norm value (ffn_inp)
             layer_norm_vec(fo, lw.layer_out_norm.data(), lw.layer_out_norm_b.data(), fo, n_embd, cfg_.eps);
         }
 

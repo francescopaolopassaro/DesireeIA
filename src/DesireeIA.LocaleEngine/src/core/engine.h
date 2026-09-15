@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_ENGINE_H
 #define DESIREEIA_ENGINE_H
 
@@ -23,29 +30,29 @@ namespace desireeia {
 #define DESIREEIA_INTERNAL
 #endif
 
-// Divide `rows` righe indipendenti fra i worker del pool di thread globale
-// (vedi thread_pool.h) e chiama fn(start,end) su ciascun sotto-intervallo.
-// Usato dai kernel di matmul: ogni riga di output e' indipendente dalle
-// altre (stesso W/x in lettura, y[start..end) in scrittura esclusiva),
-// quindi la parallelizzazione non cambia il risultato, solo come il lavoro
-// e' distribuito. I thread sono persistenti (creati una sola volta per
-// processo): niente overhead di spawn/join a ogni chiamata matmul.
+// Splits `rows` independent rows across the global thread pool's workers
+// (see thread_pool.h) and calls fn(start,end) on each sub-range. Used by
+// the matmul kernels: every output row is independent of the others (same
+// W/x read, exclusive write to y[start..end)), so parallelizing doesn't
+// change the result, only how the work is distributed. The threads are
+// persistent (created once per process): no spawn/join overhead on every
+// matmul call.
 template <typename Fn>
 void parallel_rows(size_t rows, Fn&& fn) {
     ThreadPool::global().parallel_for(rows, std::forward<Fn>(fn));
 }
 
-// Come parallel_rows, ma per un numero PICCOLO di unita' grosse e
-// indipendenti — tipicamente le teste dell'attenzione (8 o 16), dove ogni
-// unita' vale millisecondi.
+// Like parallel_rows, but for a SMALL number of large, independent units —
+// typically attention heads (8 or 16), where each unit is worth
+// milliseconds.
 //
-// parallel_rows non va bene in quel caso per due motivi, entrambi corretti
-// qui: esegue in linea sotto le 64 unita' (soglia pensata per non pagare il
-// dispatch su matmul minuscole), e arrotonda le fette a 16 per allineare le
-// scritture di y[] alla cache line — con 8 teste finirebbero tutte in
-// un'unica fetta, cioe' su un thread solo. Qui la fetta e' una unita' e non
-// c'e' falso sharing perche' ogni testa scrive un blocco separato di
-// head_dim float.
+// parallel_rows doesn't fit that case, for two reasons, both correct here:
+// it runs inline below 64 units (a threshold meant to avoid paying dispatch
+// cost on tiny matmuls), and it rounds slices up to 16 to align y[]
+// writes to the cache line — with 8 heads they'd all land in a single
+// slice, i.e. on one thread only. Here the slice is one unit, and there's
+// no false sharing because each head writes a separate block of head_dim
+// floats.
 template <typename Fn>
 void parallel_units(size_t units, Fn&& fn) {
     ThreadPool::global().parallel_for_units(units, std::forward<Fn>(fn));
@@ -72,11 +79,11 @@ struct ModelMeta {
     bool expert_model = false;
 };
 
-// Vocabolario e metadati tokenizer letti dai KV del formato (es. GGUF
-// tokenizer.ggml.*). tokenizer_tag e' il valore grezzo dichiarato dal file
-// (es. il tag standard di terze parti per SentencePiece); la mappatura su un
-// algoritmo interno avviene altrove (vedi core/arch_tags.h) per rispettare
-// la regola di denominazione.
+// Vocabulary and tokenizer metadata read from the format's KV pairs (e.g.
+// GGUF tokenizer.ggml.*). tokenizer_tag is the raw value declared by the
+// file (e.g. the standard third-party tag for SentencePiece); the mapping
+// onto an internal algorithm happens elsewhere (see core/arch_tags.h) to
+// respect the naming rule.
 struct VocabData {
     std::vector<std::string> tokens;
     std::vector<float> scores;
@@ -90,9 +97,9 @@ struct VocabData {
     bool add_bos = true;
 };
 
-// Un esperto MoE non e' un blob unico ma 3 matrici distinte (gate/up/down
-// del suo FFN, stessa struttura del FFN denso ma una per esperto). ExpertPart
-// seleziona quale delle 3 leggere/cachare.
+// A MoE expert isn't a single blob but 3 distinct matrices (gate/up/down of
+// its FFN, same structure as the dense FFN but one per expert). ExpertPart
+// selects which of the 3 to read/cache.
 enum class ExpertPart : uint32_t { Gate = 0, Up = 1, Down = 2 };
 
 class ModelReader {
@@ -113,16 +120,25 @@ public:
         (void)key; (void)out;
         return false;
     }
+    // Small numeric arrays from the metadata (bool/int arrays), e.g. a
+    // per-layer flag list. Only short arrays are kept by the reader: the
+    // huge tokenizer arrays have their own dedicated path and never reach
+    // this accessor. Every element is widened to uint32_t, which covers
+    // the bool and small-integer element types these keys actually use.
+    virtual bool meta_u32_array(const std::string& key, std::vector<uint32_t>& out) {
+        (void)key; (void)out;
+        return false;
+    }
     virtual bool read_vocab(VocabData& out) {
         (void)out;
         return false;
     }
-    // Legge i byte del tensore cosi' come sono su disco (ancora
-    // quantizzati, nessuna dequantizzazione), piu' tipo e shape. Serve ai
-    // kernel di matmul che operano direttamente sul formato quantizzato
-    // (es. Q4_0 fuso con attivazioni int8, vedi core/matmul.cpp) invece di
-    // passare per il dequant-a-float di read_tensor. Non tutti i reader lo
-    // implementano (default: fallisce, il chiamante ricade su read_tensor).
+    // Reads the tensor's bytes exactly as they are on disk (still
+    // quantized, no dequantization), plus type and shape. Used by the
+    // matmul kernels that operate directly on the quantized format (e.g.
+    // Q4_0 fused with int8 activations, see core/matmul.cpp) instead of
+    // going through read_tensor's dequant-to-float path. Not every reader
+    // implements it (default: fails, the caller falls back to read_tensor).
     virtual bool read_tensor_raw(const std::string& name, std::vector<uint8_t>& raw,
                                   int& quant_type, uint64_t& ne0, uint64_t& rows) {
         (void) name; (void) raw; (void) quant_type; (void) ne0; (void) rows;
@@ -157,8 +173,8 @@ public:
     ExpertStore(const ExpertStore&) = delete;
     ExpertStore& operator=(const ExpertStore&) = delete;
 
-    // Il reader non e' posseduto: deve restare valido per tutta la vita
-    // di ExpertStore (in ctx.cpp entrambi vivono dentro lo stesso EngineState).
+    // The reader is not owned: it must stay valid for ExpertStore's whole
+    // lifetime (in ctx.cpp both live inside the same EngineState).
     void set_reader(ModelReader* reader) { reader_ = reader; }
     void set_hybrid_tier(HybridTier* tier) { hybrid_tier_ = tier; }
     bool fetch(uint32_t layer, uint32_t idx, ExpertPart part, std::vector<float>& out);
@@ -166,17 +182,17 @@ public:
                      std::vector<const float*>& out_ptrs);
     void prefetch_layer(uint32_t layer, const std::vector<uint32_t>& idxs);
 
-    // Overlap reale (a differenza di prefetch_layer sopra, che nessuno
-    // chiama mai oggi): accoda gli indici richiesti per `layer` a un
-    // worker in background dedicato, che li carica (Gate/Up/Down) mentre
-    // il chiamante continua a calcolare. Non blocca. Un solo slot in
-    // sospeso: una richiesta piu' recente rimpiazza quella precedente non
-    // ancora iniziata (conta solo la previsione piu' fresca). Sicuro da
-    // chiamare insieme a fetch()/fetch_union() dallo stesso thread
-    // "principale" mentre il worker gira: le strutture cache condividono
-    // mtx_, le letture fisiche condividono reader_mtx_ (mai due letture
-    // concorrenti sullo stesso reader, ma la metadata-cache e il calcolo
-    // del chiamante non aspettano mai l'I/O del worker).
+    // Real overlap (unlike prefetch_layer above, which nobody ever calls
+    // today): queues the indices requested for `layer` to a dedicated
+    // background worker, which loads them (Gate/Up/Down) while the caller
+    // keeps computing. Non-blocking. Only one pending slot: a more recent
+    // request replaces the previous one if it hasn't started yet (only the
+    // freshest prediction counts). Safe to call together with
+    // fetch()/fetch_union() from the same "main" thread while the worker
+    // runs: the cache structures share mtx_, the physical reads share
+    // reader_mtx_ (never two concurrent reads on the same reader, but the
+    // metadata cache and the caller's computation never wait on the
+    // worker's I/O).
     void prefetch_async(uint32_t layer, const std::vector<uint32_t>& idxs);
 
     void set_prefetch_depth(int32_t depth) { prefetch_depth_ = depth > 0 ? depth : 1; }
@@ -191,21 +207,21 @@ private:
         uint32_t hits;
         bool pinned;
     };
-    // layer (16 bit) | idx (32 bit) | part (2 bit): margini ampi per non
-    // collidere su modelli reali (migliaia di layer/esperti, 3 sole parti).
+    // layer (16 bit) | idx (32 bit) | part (2 bit): wide margins to avoid
+    // collisions on real models (thousands of layers/experts, only 3 parts).
     static uint64_t make_key(uint32_t layer, uint32_t idx, ExpertPart part) {
         return (static_cast<uint64_t>(layer) << 48) | (static_cast<uint64_t>(idx) << 8) |
                static_cast<uint64_t>(part);
     }
-    // Legge (I/O reale) SENZA tenere mtx_: solo reader_mtx_, cosi' non
-    // blocca mai le operazioni sulla cache dell'altro thread durante una
-    // lettura lenta. Ogni chiamante re-acquisisce mtx_ per inserire il
-    // risultato in map_/order_ dopo il ritorno.
+    // Reads (real I/O) WITHOUT holding mtx_: only reader_mtx_, so it never
+    // blocks the other thread's cache operations during a slow read. Each
+    // caller re-acquires mtx_ to insert the result into map_/order_ after
+    // returning.
     bool load_data(uint64_t key, std::vector<float>& out);
-    // Inserisce (o aggiorna) `key` in map_/order_ con eviction LRU che
-    // salta le entry pinnate — stessa politica del ramo "miss" di fetch(),
-    // fattorizzata qui perche' sia fetch() sia il worker di prefetch_async
-    // ne hanno bisogno. Il chiamante deve gia' tenere mtx_.
+    // Inserts (or updates) `key` into map_/order_ with LRU eviction that
+    // skips pinned entries — the same policy as fetch()'s "miss" branch,
+    // factored out here because both fetch() and the prefetch_async worker
+    // need it. The caller must already hold mtx_.
     void insert_locked(uint64_t key, std::vector<float>&& data);
     void prefetch_worker_loop();
 
@@ -217,20 +233,21 @@ private:
     std::string usage_file_;
     LogFn log_;
 
-    // Protegge map_/order_/usage_. Mai tenuto durante una lettura (I/O).
+    // Protects map_/order_/usage_. Never held during a read (I/O).
     std::mutex mtx_;
     std::list<Entry> order_;
     std::unordered_map<uint64_t, std::list<Entry>::iterator> map_;
     std::unordered_map<uint64_t, uint32_t> usage_;
 
-    // Serializza le letture fisiche (reader_/hybrid_tier_) fra il thread
-    // chiamante e il worker di prefetch: nessuna lettura concorrente sullo
-    // stesso reader, per non dover verificare/garantire la thread-safety
-    // di GgufReader/HybridTier internamente. Il guadagno e' l'overlap fra
-    // I/O del worker e calcolo del chiamante, non I/O parallelo fra loro.
+    // Serializes the physical reads (reader_/hybrid_tier_) between the
+    // calling thread and the prefetch worker: no concurrent read on the
+    // same reader, so GgufReader/HybridTier's internal thread-safety
+    // doesn't need to be verified/guaranteed. The gain is the overlap
+    // between the worker's I/O and the caller's computation, not parallel
+    // I/O between the two of them.
     std::mutex reader_mtx_;
 
-    // Worker in background per prefetch_async: un solo slot in sospeso.
+    // Background worker for prefetch_async: only one pending slot.
     std::thread worker_;
     std::mutex qmtx_;
     std::condition_variable qcv_;
@@ -326,20 +343,20 @@ bool engine_tokenize(desireeia_ctx* ctx, const std::string& text, bool add_bos, 
 bool engine_token_piece(desireeia_ctx* ctx, int32_t id, std::string& out);
 // which: 0=BOS 1=EOS 2=UNK 3=PAD (desireeia_special_token in abi.h).
 bool engine_special_token_id(const desireeia_ctx* ctx, int which, int32_t& out_id);
-// true se `id` e' un token di fine generazione (EOS, <end_of_turn>, ...).
+// true if `id` is an end-of-generation token (EOS, <end_of_turn>, ...).
 bool engine_is_eog_token(const desireeia_ctx* ctx, int32_t id);
 
-// BERT (encoder-only, ArchKind::Bert): embedding per token dell'intera
-// sequenza in una sola chiamata (nessuno stato fra chiamate, a differenza
-// di engine_predict/engine_next_token). out_embd riempito con
-// n_tokens*embd_dim float; out_embd_dim riceve la larghezza embedding del
-// modello (per permettere al chiamante di trovare i confini per-token).
-// false se il modello caricato non e' un encoder BERT (DESIREEIA_ERR_NOT_SUPPORTED
-// nell'ABI) o se ctx/tokens non sono validi.
+// BERT (encoder-only, ArchKind::Bert): per-token embedding for the whole
+// sequence in a single call (no state between calls, unlike
+// engine_predict/engine_next_token). out_embd filled with
+// n_tokens*embd_dim floats; out_embd_dim receives the model's embedding
+// width (so the caller can find the per-token boundaries).
+// false if the loaded model is not a BERT encoder (DESIREEIA_ERR_NOT_SUPPORTED
+// in the ABI) or if ctx/tokens are not valid.
 bool engine_embed(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
                    std::vector<float>& out_embd, uint32_t& out_embd_dim);
 
-// Campionamento (vedi core/sampler.h e desireeia_sampling in abi.h).
+// Sampling (see core/sampler.h and desireeia_sampling in abi.h).
 bool engine_set_sampling(desireeia_ctx* ctx, const desireeia_sampling& params);
 bool engine_get_sampling(const desireeia_ctx* ctx, desireeia_sampling& out);
 
@@ -356,10 +373,10 @@ bool engine_load_prerouter(desireeia_ctx* ctx, const char* path, std::string& er
 bool engine_clear_prerouter(desireeia_ctx* ctx);
 bool engine_set_prerouter_heuristic(desireeia_ctx* ctx, bool enabled);
 
-// Template di chat (vedi core/chat_template.h). Applica il formato
-// rilevato al caricamento del modello ai messaggi passati, producendo il
-// testo da tokenizzare. Ritorna false solo se ctx e' invalido: un
-// formato non riconosciuto ricade comunque su ChatML (mai un errore).
+// Chat template (see core/chat_template.h). Applies the format detected
+// at model load time to the messages passed in, producing the text to
+// tokenize. Returns false only if ctx is invalid: an unrecognized format
+// still falls back to ChatML (never an error).
 bool engine_apply_chat_template(const desireeia_ctx* ctx,
                                 const char** roles, const char** contents, size_t n_messages,
                                 bool add_assistant, std::string& out);
@@ -379,14 +396,177 @@ DESIREEIA_INTERNAL void quantize_q8_0(const float* src, size_t n, std::vector<in
 DESIREEIA_INTERNAL int matmul_q4_0(const uint8_t* q4_data, size_t rows, size_t cols,
                                  const float* x, float* y);
 
-// Come matmul_q4_0 ma per Q8_0: nessun nibble da spacchettare, i pesi sono
-// gia' int8 (blocchi da 32, 1 scala fp16 per blocco) — dot diretto con
-// l'attivazione anch'essa quantizzata Q8_0, stesso schema. Aggiunta perche'
-// scoperta via profiler (Fase 9): i tensori Q8_0 (es. Qwen2.5-Coder in
-// Q8_0) ricadevano sul fallback float (matmul_f32, ~3x piu' lento),
-// nessun kernel dedicato esisteva. cols deve essere multiplo di 32.
+// Like matmul_q4_0 but for Q8_0: no nibble to unpack, the weights are
+// already int8 (32-wide blocks, 1 fp16 scale per block) — direct dot
+// product with the activation, also quantized Q8_0, same scheme. Added
+// because it was discovered via the profiler (Phase 9): Q8_0 tensors
+// (e.g. Qwen2.5-Coder in Q8_0) were falling back to the float path
+// (matmul_f32, ~3x slower), no dedicated kernel existed. cols must be a
+// multiple of 32.
 DESIREEIA_INTERNAL int matmul_q8_0(const uint8_t* q8_data, size_t rows, size_t cols,
                                  const float* x, float* y);
+
+#ifdef DESIREEIA_CUDA_ENABLED
+// CUDA backend (see docs/CUDAPiano.md and src/cuda/backend_cuda.cu).
+// matmul_q8_0_cuda: same contract/same math as matmul_q8_0, executed on
+// device, uploading the ENTIRE weight matrix on every call — measured 28x
+// slower than the CPU (see log in CUDAPiano.md), kept only as a fallback
+// for tensors outside the persistent weight cache.
+DESIREEIA_INTERNAL int matmul_q8_0_cuda(const uint8_t* q8_data, size_t rows, size_t cols,
+                                      const float* x, float* y);
+
+// Device-resident Q8_0 weights: uploaded ONCE (when the tensor enters the
+// persistent weight cache, see DenseForward::load_matrix), then reused for
+// the whole session by matmul_q8_0_cuda_resident instead of being
+// reloaded on every token. Returns false if the device allocation/upload
+// fails (out_d_qs/out_d_scale stay nullptr); the pointers must be freed
+// with cuda_free_device when the tensor leaves the cache.
+DESIREEIA_INTERNAL bool matmul_q8_0_cuda_upload_weights(const uint8_t* q8_data, size_t rows, size_t cols,
+                                                       void** out_d_qs, void** out_d_scale);
+
+// Formats the CUDA backend can decode directly in VRAM, kept as small
+// integers so the header does not have to depend on MatVecFormat.
+#define DESIREEIA_CUDA_FMT_Q4_0 1
+#define DESIREEIA_CUDA_FMT_Q4_1 2
+#define DESIREEIA_CUDA_FMT_Q5_0 3
+#define DESIREEIA_CUDA_FMT_Q5_1 4
+#define DESIREEIA_CUDA_FMT_Q4_K 5
+#define DESIREEIA_CUDA_FMT_Q5_K 6
+#define DESIREEIA_CUDA_FMT_Q6_K 7
+
+// Uploads a weight matrix in whatever representation its format wants:
+// K-quants keep their native packed blocks (out_d_scale stays null), Q8_0
+// goes through matmul_q8_0_cuda_upload_weights above.
+DESIREEIA_INTERNAL bool cuda_upload_weights(int format, const uint8_t* data, size_t rows, size_t cols,
+                                           void** out_d_qs, void** out_d_scale);
+DESIREEIA_INTERNAL int matmul_kquant_cuda_resident(int format, const void* d_w, size_t rows, size_t cols,
+                                                  const float* x, float* y);
+DESIREEIA_INTERNAL void cuda_free_device(void* p);
+DESIREEIA_INTERNAL void cuda_backend_shutdown();
+DESIREEIA_INTERNAL int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows, size_t cols,
+                                                const float* x, float* y);
+
+// Group of matvecs that share the SAME activation (Q/K/V read attn_norm's
+// output, gate/up read ffn_norm's). Running them one at a time costs a
+// synchronization each: here the activation is quantized and uploaded
+// ONCE, n kernels are launched on the same stream, and there's ONLY ONE
+// synchronization at the end. With 252 matvecs per token, the fixed
+// per-call latency (~40 us, measured) is one of the dominant costs, so
+// reducing the NUMBER of synchronizations matters more than making the
+// single kernel faster.
+struct CudaQ80Job {
+    const void* d_qs;   // weights already on device (MatVec::cuda_qs)
+    const void* d_scale;
+    size_t rows;
+    float* y;           // host destination
+};
+DESIREEIA_INTERNAL int matmul_q8_0_cuda_resident_group(const CudaQ80Job* jobs, size_t n,
+                                                      size_t cols, const float* x);
+
+// Gated FFN block entirely on device: up and gate, activation (act_gelu=0
+// -> silu, 1 -> gelu tanh, the same two variants as the CPU path), Q8_0
+// requantization of the intermediate, and the down projection. One single
+// H2D, one D2H, one synchronization. The intermediate (n_ff elements)
+// never comes back to the host: it's born and dies inside the FFN.
+DESIREEIA_INTERNAL int matmul_q8_0_cuda_ffn_gated(const void* d_up_qs, const void* d_up_scale,
+                                                 const void* d_gate_qs, const void* d_gate_scale,
+                                                 const void* d_down_qs, const void* d_down_scale,
+                                                 size_t n_ff, size_t n_embd,
+                                                 const float* x, float* out, int act_gelu);
+
+// --- KV cache on device (mirror of k_cache_/v_cache_) ---
+// Same layout as the host, [layer][pos][kv_head][head_dim]: the device
+// copy is written at the single existing write point
+// (DenseForward::write_kv_cache), so it can never diverge regardless of
+// which path (prefill, decode, CPU fallback) produced k and v.
+DESIREEIA_INTERNAL bool cuda_kv_cache_reserve(size_t total_bytes);
+DESIREEIA_INTERNAL bool cuda_kv_cache_upload(const void* k_host, const void* v_host,
+                                            size_t total_bytes);
+DESIREEIA_INTERNAL bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v,
+                                           size_t bytes);
+
+// Causal attention (GQA) + output projection in a single episode: q goes
+// up once, attention reads the KV cache already on device and its output
+// feeds wo's matvec without returning to the host. Only proj comes down.
+// Arguments for the fused attention episode: Q/K/V projections, biases,
+// RoPE, KV-cache write, attention and output projection, all on device,
+// with a single host synchronisation. Weight pointers are the resident
+// device copies (MatVec::cuda_qs / cuda_scale). Bias pointers may be null.
+struct CudaQkvAttnArgs {
+    const void* wq_qs; const void* wq_scale;
+    const void* wk_qs; const void* wk_scale;
+    const void* wv_qs; const void* wv_scale;
+    const void* wo_qs; const void* wo_scale;
+    const float* bq; const float* bk; const float* bv;   // optional
+    const float* attn_in;      // host, n_embd (already normalised)
+    const float* rope_cache;   // host, n_rot; null disables RoPE
+    float* proj;               // host, n_embd (output)
+    uint8_t* host_k_row;       // host KV cache slot for this position
+    uint8_t* host_v_row;       // kept in sync with the device copy
+    size_t n_embd; size_t q_dim; size_t kv_dim;
+    uint32_t n_head; uint32_t n_head_kv; uint32_t heads_per_kv;
+    uint32_t head_dim; uint32_t n_rot;
+    size_t kv_layer_off;       // byte offset of this layer in the KV cache
+    uint32_t cc_start; uint32_t pos;
+};
+DESIREEIA_INTERNAL int cuda_qkv_attention_out(const CudaQkvAttnArgs& args);
+
+// A whole dense layer on device, captured once per layer as a CUDA graph:
+// norms, Q/K/V, RoPE, KV write, attention, output projection, both
+// residuals and the gated feed-forward. Only x goes up and only the new x
+// comes down. One submission and one synchronisation per layer.
+struct CudaLayerArgs {
+    const void* wq_qs; const void* wq_scale;
+    const void* wk_qs; const void* wk_scale;
+    const void* wv_qs; const void* wv_scale;
+    const void* wo_qs; const void* wo_scale;
+    const void* wgate_qs; const void* wgate_scale;
+    const void* wup_qs; const void* wup_scale;
+    const void* wdown_qs; const void* wdown_scale;
+    // Optional per-head attention gate (one matrix ROW per head). Null
+    // when the architecture has none, which is every architecture but the
+    // hybrid sliding-window one.
+    const void* wag_qs; const void* wag_scale;
+    const float* bq; const float* bk; const float* bv;   // optional
+    const float* attn_norm_w; const float* ffn_norm_w;
+    // Optional per-layer norms: QK-norm on Q and K before RoPE, and the
+    // sandwich norms applied to the attention and FFN outputs before their
+    // residuals. Null when the architecture does not use them.
+    const float* q_norm_w; const float* k_norm_w;
+    const float* post_attn_norm_w; const float* post_ffn_norm_w;
+    const float* x;            // host, n_embd (layer input)
+    const float* rope_cache;   // host, n_rot; null disables RoPE
+    float* x_out;              // host, n_embd (layer output)
+    size_t n_embd; size_t q_dim; size_t kv_dim; size_t n_ff;
+    uint32_t n_head; uint32_t n_head_kv; uint32_t heads_per_kv;
+    uint32_t head_dim; uint32_t n_rot;
+    size_t kv_layer_off;
+    uint32_t cc_start; uint32_t pos;
+    float rms_eps; int act_gelu;
+    // Per-matrix device format id (0 = Q8_0, otherwise DESIREEIA_CUDA_FMT_*).
+    // Models mix formats — a Q4_K_M file typically has Q4_K for most
+    // tensors and Q6_K for a few — so each matrix carries its own.
+    int fmt_q; int fmt_k; int fmt_v; int fmt_o;
+    int fmt_gate; int fmt_up; int fmt_down; int fmt_ag;
+    // x is uploaded only for the first layer of a token and downloaded
+    // only after the last: in between it stays on device, so the layers
+    // chain with a single synchronisation per token.
+    int upload_x; int download_x;
+    // Set when this layer's pos/cc_start and RoPE table must be sent:
+    // once per token for a uniform model, per layer when sliding-window
+    // layers give different windows or RoPE bases.
+    int upload_dyn;
+};
+DESIREEIA_INTERNAL int cuda_layer_forward(const CudaLayerArgs& args);
+
+DESIREEIA_INTERNAL int cuda_attention_out(const void* d_wo_qs, const void* d_wo_scale,
+                                         const float* q, uint32_t n_head, uint32_t heads_per_kv,
+                                         uint32_t head_dim, uint32_t kv_dim,
+                                         size_t layer_off, uint32_t cc_start, uint32_t pos,
+                                         size_t n_embd, size_t q_dim, float* proj,
+                                         int kv_quantized, size_t row_bytes);
+#endif
+
 DESIREEIA_INTERNAL int matmul_q8_0_batch(const uint8_t* q8_data, size_t rows, size_t cols,
                                        const float* x, size_t n_tok, float* y);
 
@@ -403,66 +583,68 @@ DESIREEIA_INTERNAL int matmul_q5_0_batch(const uint8_t* data, size_t rows, size_
 DESIREEIA_INTERNAL int matmul_q5_1(const uint8_t* data, size_t rows, size_t cols, const float* x, float* y);
 DESIREEIA_INTERNAL int matmul_q5_1_batch(const uint8_t* data, size_t rows, size_t cols, const float* x, size_t n_tok, float* y);
 
-// Q8_K: super-blocco da 256, un'unica scala float per blocco (no fp16, no
-// min), pesi gia' int8 — il piu' semplice dei K-quant.
+// Q8_K: 256-wide super-block, a single float scale per block (no fp16, no
+// min term), weights already int8 — the simplest of the K-quants.
 DESIREEIA_INTERNAL int matmul_q8_k(const uint8_t* data, size_t rows, size_t cols, const float* x, float* y);
 DESIREEIA_INTERNAL int matmul_q8_k_batch(const uint8_t* data, size_t rows, size_t cols, const float* x, size_t n_tok, float* y);
 
-// Q2_K: super-blocco da 256, pesi a 2 bit, scala+min a 4 bit per
-// sotto-blocco da 16 (asimmetrico, stesso principio scale/min di Q4_K ma
-// granularita' piu' fine e senza il trucco a 6 bit di get_scale_min_k4).
+// Q2_K: 256-wide super-block, 2-bit weights, 4-bit scale+min per 16-wide
+// sub-block (asymmetric, same scale/min principle as Q4_K but finer
+// granularity and without Q4_K's 6-bit get_scale_min_k4 trick).
 DESIREEIA_INTERNAL int matmul_q2_k(const uint8_t* data, size_t rows, size_t cols, const float* x, float* y);
 DESIREEIA_INTERNAL int matmul_q2_k_batch(const uint8_t* data, size_t rows, size_t cols, const float* x, size_t n_tok, float* y);
 
-// Q3_K: super-blocco da 256, pesi a 3 bit (2 bit da qs + 1 bit da hmask,
-// -4 se il bit hmask e' spento), scala a 6 bit per sotto-blocco da 16
-// (simmetrico, offset -32, nessun termine min). Formula di unpacking delle
-// scale (12 byte -> 16 valori a 6 bit) verificata contro
-// dequantize_row_q3_K in quant.cpp, non reinventata.
+// Q3_K: 256-wide super-block, 3-bit weights (2 bits from qs + 1 bit from
+// hmask, -4 when the hmask bit is off), 6-bit scale per 16-wide sub-block
+// (symmetric, offset -32, no min term). The scale-unpacking formula (12
+// bytes -> 16 6-bit values) was verified against dequantize_row_q3_K in
+// quant.cpp, not reinvented.
 DESIREEIA_INTERNAL int matmul_q3_k(const uint8_t* data, size_t rows, size_t cols, const float* x, float* y);
 DESIREEIA_INTERNAL int matmul_q3_k_batch(const uint8_t* data, size_t rows, size_t cols, const float* x, size_t n_tok, float* y);
 
-// Come matmul_q4_0 ma per il formato super-block Q4_K (blocchi da 256
-// pesi, scale+min a 6 bit per sotto-blocco da 32, quantizzazione
-// asimmetrica). cols deve essere multiplo di 256.
+// Like matmul_q4_0 but for the Q4_K super-block format (256-weight
+// blocks, 6-bit scale+min per 32-wide sub-block, asymmetric
+// quantization). cols must be a multiple of 256.
 DESIREEIA_INTERNAL int matmul_q4_k(const uint8_t* q4k_data, size_t rows, size_t cols,
                                  const float* x, float* y);
 
-// Come matmul_q4_k ma per il formato super-block Q6_K (256 pesi/blocco,
-// quantizzazione simmetrica a 6 bit, scala int8 per sotto-blocco da 16,
-// niente termine "min"). cols deve essere multiplo di 256.
+// Like matmul_q4_k but for the Q6_K super-block format (256 weights per
+// block, symmetric 6-bit quantization, int8 scale per 16-wide sub-block,
+// no "min" term). cols must be a multiple of 256.
 DESIREEIA_INTERNAL int matmul_q6_k(const uint8_t* q6k_data, size_t rows, size_t cols,
                                  const float* x, float* y);
 
-// Come matmul_q4_k ma per il formato super-block Q5_K (256 pesi/blocco,
-// scale+min a 6 bit per sotto-blocco da 32 come Q4_K, ma pesi a 5 bit:
-// 4 bit da qs + 1 bit alto da qh). cols deve essere multiplo di 256.
+// Like matmul_q4_k but for the Q5_K super-block format (256 weights per
+// block, 6-bit scale+min per 32-wide sub-block like Q4_K, but 5-bit
+// weights: 4 bits from qs + 1 high bit from qh). cols must be a multiple
+// of 256.
 DESIREEIA_INTERNAL int matmul_q5_k(const uint8_t* q5k_data, size_t rows, size_t cols,
                                  const float* x, float* y);
 DESIREEIA_INTERNAL int matmul_q5_k_batch(const uint8_t* q5k_data, size_t rows, size_t cols,
                                        const float* x, size_t n_tok, float* y);
 
-// Quantizzazione attivazione stile Q8_K (una scala float per super-blocco
-// da 256, vedi la nota in matmul.cpp) condivisa da Q4_K/Q5_K/Q6_K:
-// esposta per permettere a dense_forward.cpp di quantizzare UNA VOLTA
-// l'attivazione in ingresso a un layer e riusarla per tutte le matrici
-// K-quant di quel layer che leggono dalla stessa attivazione (wq/wk/wv/wo,
-// ffn_gate/ffn_up), invece di farlo ridondantemente in ogni matmul_qX_k.
+// Q8_K-style activation quantization (one float scale per 256-wide
+// super-block, see the note in matmul.cpp) shared by Q4_K/Q5_K/Q6_K:
+// exposed so dense_forward.cpp can quantize a layer's input activation
+// ONCE and reuse it for all of that layer's K-quant matrices that read
+// from the same activation (wq/wk/wv/wo, ffn_gate/ffn_up), instead of
+// doing it redundantly inside every matmul_qX_k call.
 DESIREEIA_INTERNAL void quantize_q8_k_super(const float* x, size_t cols, std::vector<int8_t>& q, std::vector<float>& dscale);
 
-// Quantizzazione Q8_K dell'attivazione (una scala ogni 256) esposta con gli
-// array per-32 attesi dai kernel: la scala e' replicata nelle 8 caselle del
-// super-blocco. E' il prerequisito dell'accumulazione intera in
-// matmul_q4_k_core — vedi il commento esteso sulla definizione in matmul.cpp.
+// Q8_K activation quantization (one scale every 256) exposed with the
+// per-32 arrays expected by the kernels: the scale is replicated across
+// the super-block's 8 slots. This is the prerequisite for the integer
+// accumulation in matmul_q4_k_core — see the extended comment on its
+// definition in matmul.cpp.
 DESIREEIA_INTERNAL void quantize_act_q8k_rep(const float* x, size_t cols, std::vector<int8_t>& q,
                                           std::vector<float>& xscale32, std::vector<int32_t>& xsum32);
 
-// Varianti "pre-quantizzate" (Fase "elimina ri-quantizzazione ridondante",
-// 2026-09-07): come matmul_q4_k/matmul_q6_k ma prendono l'attivazione
-// gia' quantizzata (quantize_q8_k_super) invece di quantizzarla al loro
-// interno. xsum (solo per Q4_K, che ha il termine "min") e' la somma
-// delle attivazioni quantizzate per sotto-blocco da 32, calcolabile con
-// lo stesso schema gia' usato in matmul_q4_k.
+// "Pre-quantized" variants (Phase "eliminate redundant re-quantization",
+// 2026-09-07): like matmul_q4_k/matmul_q6_k but take the activation
+// already quantized (quantize_q8_k_super) instead of quantizing it
+// internally. xsum (Q4_K only, which has the "min" term) is the sum of
+// the quantized activations per 32-wide sub-block, computable with the
+// same scheme already used in matmul_q4_k.
 // One matrix in a fused group (see matmul_fused_pq). All jobs in a group share
 // the same pre-quantized activation and write to disjoint outputs.
 enum class FusedPqFormat { Q4_K, Q6_K };
@@ -525,15 +707,15 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
                            const float* embd, size_t n_embd, int32_t image_token,
                            int32_t& out_token);
 
-// Varianti "batch" (Fase 8, prefill): come le matmul_qX_k sopra ma con
-// n_tok colonne di attivazione invece di una sola. x e' n_tok blocchi
-// contigui da `cols` float (un token dopo l'altro), y e' n_tok blocchi
-// contigui da `rows` float. Il guadagno rispetto a chiamare la versione a
-// singola colonna n_tok volte: i byte grezzi del peso (e il loro decode
-// nibble->int8) vengono letti/decodificati UNA SOLA volta per riga e
-// riusati per tutte le colonne, invece di essere ricaricati dalla
-// memoria/decodificati n_tok volte. Matematicamente identico alla stessa
-// chiamata ripetuta n_tok volte (nessun riordino fra colonne diverse).
+// "Batch" variants (Phase 8, prefill): like the matmul_qX_k above but
+// with n_tok activation columns instead of just one. x is n_tok
+// contiguous blocks of `cols` floats (one token after another), y is
+// n_tok contiguous blocks of `rows` floats. The gain over calling the
+// single-column version n_tok times: the raw weight bytes (and their
+// nibble->int8 decode) are read/decoded ONCE per row and reused for every
+// column, instead of being reloaded from memory/decoded n_tok times.
+// Mathematically identical to the same call repeated n_tok times (no
+// reordering across different columns).
 DESIREEIA_INTERNAL int matmul_q4_0_batch(const uint8_t* q4_data, size_t rows, size_t cols,
                                        const float* x, size_t n_tok, float* y);
 DESIREEIA_INTERNAL int matmul_q4_k_batch(const uint8_t* q4k_data, size_t rows, size_t cols,

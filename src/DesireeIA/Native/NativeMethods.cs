@@ -1,4 +1,11 @@
-﻿using System.Runtime.InteropServices;
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+using System.Runtime.InteropServices;
 
 namespace DesireeIA.Native;
 
@@ -143,8 +150,8 @@ internal static class NativeMethods
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_token_piece(IntPtr ctx, int id, byte[] outBuf, nuint bufSize);
 
-    // BERT (encoder-only): embedding per token, convenzione query-size come
-    // desireeia_tokenize (outEmbd=null per interrogare outLen/outEmbdDim).
+    // BERT (encoder-only): per-token embedding, same query-size convention as
+    // desireeia_tokenize (outEmbd=null to query outLen/outEmbdDim).
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_embed(IntPtr ctx,
                                               int[] tokens,
@@ -161,7 +168,7 @@ internal static class NativeMethods
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_is_eog_token(IntPtr ctx, int id, out int outIsEog);
 
-    /// <summary>Corrisponde a desireeia_sampling in abi.h (layout sequenziale).</summary>
+    /// <summary>Corresponds to desireeia_sampling in abi.h (sequential layout).</summary>
     [StructLayout(LayoutKind.Sequential)]
     internal struct Sampling
     {
@@ -198,10 +205,10 @@ internal static class NativeMethods
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_set_prerouter_heuristic(IntPtr ctx, int enabled);
 
-    // string[] con ArraySubType=LPUTF8Str non e' un marshaling supportato su
-    // questo runtime ("Invalid managed/unmanaged type combination"): gli
-    // array di stringhe passano come IntPtr[] a puntatori UTF-8 allocati a
-    // mano (vedi LocalModel.ApplyChatTemplate, che li costruisce e libera).
+    // string[] with ArraySubType=LPUTF8Str isn't supported marshaling on
+    // this runtime ("Invalid managed/unmanaged type combination"): string
+    // arrays are passed as IntPtr[] to manually allocated UTF-8 pointers
+    // (see LocalModel.ApplyChatTemplate, which builds and frees them).
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_apply_chat_template(
         IntPtr ctx,

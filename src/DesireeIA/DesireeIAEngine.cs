@@ -1,4 +1,11 @@
-﻿namespace DesireeIA;
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+namespace DesireeIA;
 
 using System.Runtime.InteropServices;
 
@@ -78,11 +85,11 @@ public static class DesireeIAEngine
     }
 
     /// <summary>
-    /// Riga leggibile col tempo cumulativo per tipo di kernel matmul
-    /// (quantizzazione attivazione, Q4_0/Q4_K/Q6_K, fallback float).
-    /// Contatori globali di processo: usare <see cref="ProfileReset"/>
-    /// prima di una misura per isolarla a una finestra (es. solo il ciclo
-    /// di decode di un benchmark).
+    /// Human-readable line with the cumulative time per matmul kernel type
+    /// (activation quantization, Q4_0/Q4_K/Q6_K, float fallback).
+    /// These are process-global counters: use <see cref="ProfileReset"/>
+    /// before a measurement to isolate it to a window (e.g. just the decode
+    /// loop of a benchmark).
     /// </summary>
     public static string ProfileDump()
     {

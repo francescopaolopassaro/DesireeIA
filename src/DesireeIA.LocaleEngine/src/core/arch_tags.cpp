@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "arch_tags.h"
 
 namespace desireeia {
@@ -98,6 +105,9 @@ ArchKind detect_arch(const std::string& tag) {
     // Same parallel topology as above, but with QKV fused into one tensor
     // (see DenseQuirks::fused_qkv and ArchKind::Falcon).
     if (tag == "falcon") return ArchKind::Falcon;
+
+    // --- hybrid sliding-window attention with a per-head output gate ---
+    if (tag == "spark2_5") return ArchKind::Spark25;
 
     // --- absolute position / ALiBi (no RoPE) ---
     // Checked one by one: none of the three ever apply a rotary position
@@ -236,6 +246,15 @@ DenseQuirks quirks_for(ArchKind kind) {
             q.qkv_bias = false; // fused QKV tensor, no separate bias tensor
             q.ffn_gated = false;
             q.ffn_act = DenseQuirks::PlainFfnAct::Gelu;
+            break;
+        case ArchKind::Spark25:
+            // RMSNorm, sequential topology, gated FFN with GELU, QKV fused
+            // into one tensor with no bias, plus the per-head output gate
+            // (see DenseQuirks::attn_gate). No QK-norm and no sandwich norm.
+            q.gelu_tanh = true;
+            q.fused_qkv = true;
+            q.qkv_bias = false;
+            q.attn_gate = true;
             break;
         case ArchKind::Gpt2:
             q.layer_norm = true;

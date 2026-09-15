@@ -1,4 +1,11 @@
-﻿#include "thread_pool.h"
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+#include "thread_pool.h"
 #include "profile.h"
 #include <algorithm>
 #include <chrono>
@@ -10,10 +17,10 @@
 
 namespace desireeia {
 
-// Hint "sto girando a vuoto" per il core. Su x86 e' _mm_pause (riduce il
-// consumo e libera risorse all'altro thread SMT dello stesso core fisico);
-// altrove si ripiega su yield. Il progetto deve girare su Windows, Linux e
-// macOS, quindi niente intrinseche x86 senza guardia.
+// "I'm spinning idle" hint for the core. On x86 it's _mm_pause (reduces
+// power draw and frees resources for the other SMT thread on the same
+// physical core); elsewhere it falls back to yield. The project has to
+// run on Windows, Linux and macOS, so no x86 intrinsics without a guard.
 static inline void desireeia_cpu_relax() {
 #if defined(DESIREEIA_HAS_PAUSE)
     _mm_pause();
@@ -23,7 +30,7 @@ static inline void desireeia_cpu_relax() {
 }
 
 size_t& ThreadPool::desired_threads() {
-    static size_t v = 0; // 0 = non configurato, usa il default hardware
+    static size_t v = 0; // 0 = not configured, use the hardware default
     return v;
 }
 
@@ -41,22 +48,24 @@ ThreadPool& ThreadPool::global() {
     // caller.
     size_t n_total = override_n > 0 ? override_n : hw;
 
-    // MAI occupare tutti i processori logici. Misurato su questa macchina
-    // (22 logici) col regime MANY di bench/kernel_bench.cpp, che riproduce
-    // le ~240 matmul per token del decode reale:
-    //     20 thread -> 5,51 ms     22 thread -> 46,67 ms
-    // cioe' un crollo di 8,5x fra 20 e 22. Con ogni processore logico
-    // occupato da un thread del pool in attesa attiva, il sistema operativo
-    // non ha dove schedulare nient'altro: basta che un worker venga tolto
-    // dalla CPU perche' la barriera resti bloccata per un intero quanto di
-    // scheduling, e questo accade a OGNI dispatch.
-    // Il tetto vale anche per un override esplicito: chiedere 22 thread su 22
-    // logici non e' una scelta di prestazioni, e' un modo per farsi male.
+    // NEVER occupy every logical processor. Measured on this machine (22
+    // logical) with the MANY regime of bench/kernel_bench.cpp, which
+    // reproduces the ~240 matmuls per token of real decode:
+    //     20 threads -> 5.51 ms     22 threads -> 46.67 ms
+    // i.e. an 8.5x collapse between 20 and 22. With every logical
+    // processor occupied by a pool thread actively spinning, the OS has
+    // nowhere to schedule anything else: it only takes one worker being
+    // descheduled for the barrier to stay blocked for an entire
+    // scheduling quantum, and this happens on EVERY dispatch.
+    // The cap also applies to an explicit override: asking for 22 threads
+    // on 22 logical processors isn't a performance choice, it's a way to
+    // hurt yourself.
     //
-    // Il precipizio e' netto e sta fra 20 e 21 su 22 logici (5,51 ms -> 44,47
-    // ms), quindi non basta lasciarne libero uno: se ne lasciano DUE. Il
-    // thread che manda in esecuzione, il logger e il runtime .NET devono
-    // poter girare senza contendere un core a un worker in spin.
+    // The cliff is sharp and sits between 20 and 21 out of 22 logical
+    // (5.51 ms -> 44.47 ms), so leaving just one free isn't enough: TWO
+    // are left free. The thread that dispatches, the logger, and the .NET
+    // runtime all need to be able to run without contending a core with a
+    // spinning worker.
     const size_t cap = hw > 4 ? hw - 2 : (hw > 1 ? hw - 1 : 1);
     if (n_total > cap) n_total = cap;
 
@@ -64,8 +73,8 @@ ThreadPool& ThreadPool::global() {
     // in the work (it acts as worker 0), so only n_total-1 additional
     // workers get created.
     const size_t n = n_total > 1 ? n_total - 1 : 0;
-    // Allocato una volta e mai distrutto (vedi commento in thread_pool.h):
-    // niente join() dei worker durante lo smontaggio del processo/DLL.
+    // Allocated once and never destroyed (see the comment in
+    // thread_pool.h): no join() on the workers during process/DLL teardown.
     static ThreadPool* pool = new ThreadPool(n);
     return *pool;
 }
@@ -86,9 +95,9 @@ void ThreadPool::run_raw(size_t total, TaskFn fn, void* ctx,
         return;
     }
 
-    // Misura delle transizioni seriale/parallelo. Il tempo fra la fine del
-    // dispatch precedente e l'inizio di questo e' esattamente il tratto in cui
-    // gira un solo thread mentre gli altri sono fermi.
+    // Measures serial/parallel transitions. The time between the end of
+    // the previous dispatch and the start of this one is exactly the
+    // stretch where only one thread runs while the others are idle.
     auto& pc = profile_counters();
     const auto t_enter = std::chrono::steady_clock::now();
     if (have_last_end_) {
@@ -103,15 +112,15 @@ void ThreadPool::run_raw(size_t total, TaskFn fn, void* ctx,
         task_fn_ = fn;
         task_ctx_ = ctx;
         total_ = total;
-        // Fette abbastanza piccole da bilanciare (~8 per worker) ma non tanto
-        // da far pesare la fetch_add atomica sul lavoro utile.
+        // Slices small enough to balance well (~8 per worker) but not so
+        // small that the atomic fetch_add weighs on the useful work.
         //
-        // ARROTONDATE A MULTIPLI DI 16: l'uscita y e' un array di float, e
-        // una cache line da 64 byte ne contiene 16. Con fette da 8 righe ogni
-        // linea di y veniva scritta da DUE thread diversi, e ogni linea
-        // rimbalzava avanti e indietro fra i core a ogni scrittura (false
-        // sharing). Allineando le fette alla cache line ogni linea di y
-        // appartiene a un solo thread.
+        // ROUNDED TO MULTIPLES OF 16: the output y is a float array, and a
+        // 64-byte cache line holds 16 of them. With 8-row slices, every
+        // line of y was being written by TWO different threads, and every
+        // line bounced back and forth between cores on every write (false
+        // sharing). Aligning the slices to the cache line means every
+        // line of y belongs to a single thread.
         if (grain_override > 0) {
             grain_ = grain_override;
         } else {
@@ -126,12 +135,13 @@ void ThreadPool::run_raw(size_t total, TaskFn fn, void* ctx,
     }
     cv_start_.notify_all();
 
-    // Il chiamante lavora anche lui invece di attendere a vuoto.
+    // The caller also does its share of the work instead of waiting idle.
     run_chunks();
 
-    // Da qui in poi il chiamante ha finito il proprio lavoro utile: tutto
-    // quello che segue e' puro costo di sincronizzazione (attesa che i worker
-    // arrivino alla barriera), ed e' la voce da confrontare col lavoro vero.
+    // From here on the caller has finished its own useful work: everything
+    // that follows is pure synchronization cost (waiting for the workers
+    // to reach the barrier), and it's the figure to compare against the
+    // real work.
     const auto t_barrier = std::chrono::steady_clock::now();
     while (pending_.load(std::memory_order_acquire) != 0) {
         desireeia_cpu_relax();
@@ -156,39 +166,40 @@ void ThreadPool::run_chunks() {
 }
 
 void ThreadPool::worker_loop(size_t worker_id) {
-    // Provato uno spin-wait breve prima di cv_start_.wait() (come il
-    // polling opzionale di ggml): misurato PEGGIO su questa macchina (21
-    // worker che fanno _mm_pause() in parallelo competono per le risorse
-    // dei core con hyperthreading, rallentando il lavoro vero) â€” 5-6 tok/s
-    // invece di 9.6-10 col solo condition_variable. Rimosso: il dato
-    // misurato conta piu' dell'aspettativa teorica (vedi
-    // docs/engine_gap_analysis.md).
-    (void) worker_id; // le fette non dipendono piu' dall'id: sono dinamiche
+    // Tried a short spin-wait before cv_start_.wait() (like ggml's
+    // optional polling): measured WORSE on this machine (21 workers doing
+    // _mm_pause() in parallel compete for hyperthreading core resources,
+    // slowing down the real work) — 5-6 tok/s instead of 9.6-10 with plain
+    // condition_variable. Removed: the measured data outweighs the
+    // theoretical expectation (see docs/engine_gap_analysis.md).
+    (void) worker_id; // slices no longer depend on the id: they're dynamic
 
-    // Quanti giri di attesa attiva prima di addormentarsi davvero. Il decode
-    // fa ~240 matmul per token, quindi il dispatch successivo arriva quasi
-    // sempre entro pochi microsecondi: dormire e risvegliarsi ogni volta
-    // costava piu' del lavoro stesso. Misurato con il regime "MANY" di
-    // bench/kernel_bench.cpp: gli stessi byte totali spezzati in 200
-    // chiamate piccole rendevano 7,6 GB/s contro 53,7 GB/s in una sola
-    // chiamata grande, cioe' ~166 us di puro overhead per matmul.
+    // How many rounds of active waiting before actually going to sleep.
+    // Decode does ~240 matmuls per token, so the next dispatch almost
+    // always arrives within a few microseconds: sleeping and waking up
+    // every time cost more than the work itself. Measured with the
+    // "MANY" regime of bench/kernel_bench.cpp: the same total bytes split
+    // into 200 small calls yielded 7.6 GB/s against 53.7 GB/s in a
+    // single large call, i.e. ~166 us of pure overhead per matmul.
     //
-    // Nota storica: uno spin era gia' stato provato e misurato PEGGIO. Quella
-    // versione pero' spinnava con 21 worker (oltre i core fisici, quindi due
-    // worker per core SMT che si rubavano le risorse a vicenda) e comunque
-    // richiedeva il mutex per leggere la task. Qui lo spin e' limitato, usa
-    // pause, e soprattutto NON prende il mutex: la generazione si legge da un
-    // atomico. Se lo spin scade si torna a dormire sulla condition variable,
-    // cosi' un pool inattivo non brucia CPU.
-    // Spin BREVE, deliberatamente. Provato ad allungarlo a 32768 giri (~350
-    // us, abbastanza da coprire il lavoro seriale fra una matmul e l'altra e
-    // quindi da non addormentarsi mai durante un token): misurato PEGGIO,
-    // 8,73 tok/s contro 9,84. La latenza di risveglio non era dunque il costo
-    // dominante; i worker in attesa attiva rubano invece risorse SMT e budget
-    // di turbo al thread che in quel momento fa il lavoro seriale, e su un
-    // portatile 15 core che spinnano tengono giu' le frequenze di tutti.
-    // Restano pochi giri, utili solo a catturare i dispatch consecutivi
-    // (wq/wk/wv, ffn_gate/ffn_up) senza passare dal sistema operativo.
+    // Historical note: a spin had already been tried and measured WORSE.
+    // That version, however, spun with 21 workers (more than the physical
+    // cores, so two workers per SMT core stealing resources from each
+    // other) and still needed the mutex to read the task. Here the spin
+    // is bounded, uses pause, and crucially does NOT take the mutex: the
+    // generation is read from an atomic. If the spin expires, it goes
+    // back to sleeping on the condition variable, so an idle pool doesn't
+    // burn CPU.
+    // Spin SHORT, deliberately. Tried extending it to 32768 rounds (~350
+    // us, enough to cover the serial work between one matmul and the next
+    // and so never fall asleep during a token): measured WORSE, 8.73
+    // tok/s against 9.84. Wake-up latency was therefore not the dominant
+    // cost; actively-waiting workers instead steal SMT resources and
+    // turbo budget from the thread doing the serial work at that moment,
+    // and on a 15-core laptop, spinning workers hold down everyone's
+    // frequencies. Only a few rounds remain, useful only to catch
+    // back-to-back dispatches (wq/wk/wv, ffn_gate/ffn_up) without going
+    // through the OS.
     constexpr int kSpinRounds = 512;
 
     uint64_t local_gen = 0;
@@ -198,9 +209,9 @@ void ThreadPool::worker_loop(size_t worker_id) {
             if (generation_.load(std::memory_order_acquire) != local_gen) break;
             if (++spins >= kSpinRounds) {
                 std::unique_lock<std::mutex> lk(mtx_);
-                // Il predicato ricontrolla generation_ sotto mutex: se run_raw
-                // ha pubblicato mentre stavamo per addormentarci, wait ritorna
-                // subito e non si perde il risveglio.
+                // The predicate re-checks generation_ under the mutex: if
+                // run_raw published while we were about to fall asleep,
+                // wait returns immediately and the wake-up isn't missed.
                 cv_start_.wait(lk, [this, local_gen] {
                     return stop_ || generation_.load(std::memory_order_acquire) != local_gen;
                 });
@@ -211,10 +222,10 @@ void ThreadPool::worker_loop(size_t worker_id) {
         }
         local_gen = generation_.load(std::memory_order_acquire);
 
-        // task_fn_/task_ctx_ non vengono copiate ne' lette sotto mutex: sono
-        // scritte da run_raw() prima di incrementare generation_ e restano
-        // valide finche' run_raw() non ritorna, cosa che accade solo quando
-        // pending_ e' tornato a zero, cioe' dopo la riga sotto.
+        // task_fn_/task_ctx_ are neither copied nor read under the mutex:
+        // they're written by run_raw() before incrementing generation_ and
+        // stay valid until run_raw() returns, which only happens once
+        // pending_ has gone back to zero, i.e. after the line below.
         run_chunks();
 
         pending_.fetch_sub(1, std::memory_order_acq_rel);

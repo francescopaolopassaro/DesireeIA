@@ -29,6 +29,10 @@ Dense causal transformers (RoPE, grouped-query attention, gated/non-gated feed-f
 - Olmo2, Exaone4 (post-norm topology)
 - Cohere2, Falcon (parallel attention/FFN topology, fused QKV)
 - GPT-2, BLOOM, MPT (absolute position embeddings / ALiBi, no RoPE)
+- Spark2_5 (hybrid sliding-window attention: per-layer flag array rather
+  than a fixed period, dual RoPE — full rotation with one base on
+  sliding-window layers, partial rotation with a different base on full
+  layers — fused QKV, and a per-head sigmoid output gate)
 
 Beyond the dense family:
 
@@ -273,6 +277,56 @@ Backends are probed and the strongest available one is selected automatically, i
 4. Metal (Apple Silicon)
 5. CPU (always available — scalar fallback if AVX2 isn't present)
 
+### CUDA backend
+
+No external library is required to *use* CUDA acceleration — the whole
+backend is compiled into `DesireeIALocaleEngine.dll`/`.so` itself
+(`DESIREEIA_ENABLE_CUDA` build flag). Nothing needs to be installed beyond
+an NVIDIA driver; the engine detects a compatible device at startup and
+switches backend automatically, with the CPU path always kept as the
+correct, always-available fallback.
+
+**What it does, entirely on the GPU, per token:**
+
+- Every quantized weight format used by real GGUF checkpoints has a direct
+  device kernel — no dequantize-then-multiply detour: Q4_0, Q4_1, Q5_0,
+  Q5_1, Q8_0, Q4_K, Q5_K, Q6_K.
+- Weights are **device-resident**: uploaded once at load time, never
+  re-transferred per token.
+- The KV cache lives on the device (Q8_0-quantized), mirrored to the host
+  only where the rest of the engine needs to read it.
+- **One CUDA Graph per transformer layer** — attention, both projections,
+  RoPE, the KV-cache write and the gated FFN captured as a single graph
+  node chain. `x` crosses the whole stack of layers on device with a
+  single host↔device round trip per generated token, instead of one per
+  kernel.
+- Multiple small matrix-vector products that share an activation (Q/K/V,
+  the FFN's gate+up pair, a per-head attention gate where the architecture
+  has one) are dispatched as **one grouped kernel launch** rather than
+  several small ones — a small projection alone doesn't fill a modern GPU,
+  grouping does.
+- Every one of the above is validated against the CPU reference path in
+  this project's self-test; a CUDA kernel that cannot be validated for a
+  given shape falls back to CPU automatically rather than producing an
+  unchecked result.
+
+**Measured** (RTX 1000 Ada, 6 GB, 96-bit memory bus — a laptop-class GPU,
+not a data-center card; streaming bandwidth measured directly at 164 GB/s
+against a 192 GB/s spec sheet, which is the real ceiling decode speed is
+bound by):
+
+| Model | Quantization | CPU decode | CUDA decode | Speedup |
+| --- | --- | --- | --- | --- |
+| Gemma 2B IT | Q4_K_M | 27.2 tok/s | **82.5 tok/s** | 3.0x |
+| Spark-X2.5 4B | Q4_K_M | 17.2 tok/s | **50.2 tok/s** | 2.9x |
+
+Force a backend explicitly with `--backend cpu|cuda` on the CLI, or leave
+it on auto-detection (the default).
+
+```powershell
+desireeia-cli bench model.gguf --backend cuda --tokens 32
+```
+
 ## Generation features
 
 Beyond plain `Predict`/`NextToken`, the .NET wrapper offers:
@@ -307,24 +361,82 @@ await foreach (var piece in model.ChatStreamAsync(messages,
 }
 ```
 
+## Download and run (no build required)
+
+Pre-built, self-contained CLI bundles live in `Build/` — download, unzip,
+run. No .NET install, no CUDA Toolkit install: everything needed is
+inside the archive, and a compatible NVIDIA GPU is detected and used
+automatically at startup (falls back to CPU cleanly when there isn't
+one). See `Build/README.md` for exactly what's built for which platform
+today and why the rest are placeholders.
+
+| Platform | Archive | Run |
+| --- | --- | --- |
+| Windows x64 | `Build/dist/DesireeIA-<version>-win-x64.zip` | `desireeia-cli.exe chat model.gguf ...` |
+| Linux x64 | `Build/dist/DesireeIA-<version>-linux-x64.zip` | `./desireeia-cli chat model.gguf ...` |
+| macOS (x64 / Apple Silicon) | not yet built from this environment — build from source (below) | — |
+
+Building your own archives:
+
+```powershell
+Build\build.ps1     # builds the native engine + self-contained CLI for every platform this machine can produce
+Build\pack.ps1      # zips the results into Build\dist\
+```
+
+`Build\build.ps1` auto-detects the CUDA Toolkit and MSVC on Windows and
+builds with CUDA support when both are present (falling back to a
+CPU-only build otherwise); it cross-builds linux-x64 through Docker
+(CPU-only — no CUDA toolkit in that build image); macOS needs an actual
+macOS host with Xcode command line tools, which this environment does not
+have. Full details, including what a from-scratch build needs on each OS,
+are in `Build/README.md`.
+
 ## Requirements
 
 - .NET 10 SDK
-- C++17 compiler and CMake for the native core (MSVC on Windows, clang on macOS, gcc/clang on Linux)
+- C++17 compiler and CMake for the native core
 - AVX2-capable CPU for the accelerated 64-bit build (scalar fallback otherwise)
+- Optional, for CUDA acceleration: an NVIDIA GPU, the CUDA Toolkit at
+  build time (nothing extra needed at *run* time beyond the driver — see
+  "CUDA backend" above)
 
 The managed GGUF reader and inspector are pure .NET and run without a native build on any platform.
+
+### Per-OS build requirements
+
+| OS | C++ toolchain | Notes |
+| --- | --- | --- |
+| **Windows** | MSVC (Visual Studio Build Tools, C++ workload) | CUDA build needs `nvcc` + MSVC's `cl.exe` together — nvcc cannot use MinGW as its host compiler. `Build\build.ps1` auto-detects both and picks the right generator. |
+| **macOS** | clang (Xcode command line tools) | CPU-only — no CUDA on Apple hardware; the engine still auto-detects Metal at the probe level but has no Metal compute kernel yet (see `Build/README.md`). |
+| **Linux** | gcc or clang | CUDA build needs the CUDA Toolkit installed in that same environment (a plain `gcc:12` container, as used for this project's own cross-build, has no toolkit — see `.docker-linux-x64/`); without it, CMake produces a CPU-only `.so`. |
 
 ## Building
 
 ```powershell
-# native core
+# native core (CPU-only)
 cmake -S src/DesireeIA.LocaleEngine -B native/out -DCMAKE_BUILD_TYPE=Release
 cmake --build native/out --config Release
+
+# native core, with CUDA (Windows: run from a "x64 Native Tools Command Prompt for VS", or vcvars64.bat first)
+cmake -S src/DesireeIA.LocaleEngine -B native/out-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DDESIREEIA_ENABLE_CUDA=ON
+cmake --build native/out-cuda --target DesireeIALocaleEngine
 
 # .NET library
 dotnet build DesireeIA.slnx
 ```
+
+For a ready-to-run, self-contained CLI (no dotnet/cmake commands needed
+at all — download, unzip, run) see "Download and run" above and
+`Build/README.md`.
+
+## Source policy
+
+The full rules are in `docs/CONTRIBUTING.md`; the one that matters most
+for anyone touching this codebase: **every comment, in every file, is
+written in English** — never Italian, never any other language, no
+exceptions, going forward as much as retroactively. The same document
+also covers how design reasoning gets written down without citing or
+copying another project's internals.
 
 ## Testing
 
@@ -351,14 +463,45 @@ dotnet run --project cli/DesireeIA.Cli -- tokenize <model.gguf> "<text>"
 dotnet run --project cli/DesireeIA.Cli -- generate <model.gguf> "<text>" [--max-tokens N] [--chat] [--temp T] [--top-k K] [--top-p P] [--stop "<s>"]... [--json [--schema "<json-schema>"]]
 dotnet run --project cli/DesireeIA.Cli -- embed <model.gguf> "<text>"   (BERT encoders only)
 dotnet run --project cli/DesireeIA.Cli -- bench <model.gguf> [--tokens N] [--warmup N] [--prompt "<text>"]
-dotnet run --project cli/DesireeIA.Cli -- chat <model.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]
+dotnet run --project cli/DesireeIA.Cli -- chat <model.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N] [--backend cpu|cuda]
                                           (in-session: /image <path> [question], /save <path>, /saveb64 <path>)
-
-
-
-EXAMPLE FOR TEST IN WINDOWS CMD
-C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\Users\fpassaro\AppData\Local\Kodinn\google_gemma-3-4b-it-Q4_K_M.gguf" --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
 ```
+
+### Tested models — ready-to-run commands
+
+These are the exact commands used to validate this engine end to end
+(generation quality, self-test parity, and — where noted — the CUDA
+backend), built as a self-contained CLI executable on Windows:
+
+```cmd
+:: Gemma 3 (4B) — recommended chat sampling
+C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\Users\fpassaro\AppData\Local\Kodinn\google_gemma-3-4b-it-Q4_K_M.gguf" --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
+
+:: Gemma 2B — same sampling, force the CUDA backend explicitly
+C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\Users\fpassaro\Desktop\JOBS\dwn\gemma-2b-it.Q4_K_M.gguf" --backend cuda --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
+
+:: Qwen2.5-Coder (3B, Q8_0) — coding-oriented sampling
+C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\path\to\Qwen2.5-Coder-3B-Q8_0.gguf" --temp 0.3 --top-k 40 --top-p 0.9 --max-tokens 2048
+
+:: Spark-X2.5 4B — hybrid sliding-window attention architecture
+C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\Users\fpassaro\Downloads\Spark-X2.5-4B-Q4_K_M.gguf" --backend cuda --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
+```
+
+`--backend` is optional on every command above — omitting it lets the
+engine auto-detect the strongest hardware backend available, which is
+CUDA whenever a compatible device is present. It's shown explicitly here
+only to make it easy to force one side or the other for comparison.
+
+## Third-party notices
+
+`src/DesireeIA.LocaleEngine/src/vision/` bundles three single-file public-domain
+libraries by Sean Barrett and contributors, unmodified, used as-is for image
+decoding/resizing/encoding in the vision pipeline. They retain their own
+public-domain declaration and are not covered by this project's license below:
+
+- **stb_image.h** v2.28 — image loader — http://nothings.org/stb
+- **stb_image_resize.h** v0.90 — image resizing — Jorge L. Rodriguez (@VinoBS), 2014 — http://github.com/nothings/stb
+- **stb_image_write.h** v1.16 — PNG/BMP/TGA/JPEG/HDR writer — Sean Barrett, 2010–2015
 
 ## License
 PREAMBLE & VISION

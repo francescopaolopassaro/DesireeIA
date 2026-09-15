@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_TOKENIZER_H
 #define DESIREEIA_TOKENIZER_H
 
@@ -10,8 +17,9 @@
 
 namespace desireeia {
 
-// Wrapper uniforme sui due tokenizer implementati (SentencePiece Unigram e
-// BPE byte-level), selezionato in base a detect_tokenizer(vocab.tokenizer_tag).
+// Uniform wrapper over the two implemented tokenizers (SentencePiece
+// Unigram and byte-level BPE), selected based on
+// detect_tokenizer(vocab.tokenizer_tag).
 class DESIREEIA_INTERNAL Tokenizer {
 public:
     bool load(const VocabData& vocab);

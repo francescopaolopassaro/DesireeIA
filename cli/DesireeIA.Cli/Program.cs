@@ -1,4 +1,11 @@
-﻿using System.Diagnostics;
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+using System.Diagnostics;
 using System.Linq;
 using System.Collections.Generic;
 using DesireeIA;
@@ -75,19 +82,19 @@ try
 }
 catch (DllNotFoundException ex)
 {
-    Console.Error.WriteLine($"libreria nativa non trovata: {ex.Message}");
-    Console.Error.WriteLine("compilare prima il motore nativo (cmake + compilatore C++17).");
+    Console.Error.WriteLine($"native library not found: {ex.Message}");
+    Console.Error.WriteLine("build the native engine first (cmake + C++17 compiler).");
     return 2;
 }
 catch (Exception ex)
 {
-    Console.Error.WriteLine($"errore: {ex.Message}");
+    Console.Error.WriteLine($"error: {ex.Message}");
     return 1;
 }
 
 static int Unknown(string cmd)
 {
-    Console.Error.WriteLine($"comando sconosciuto: {cmd}");
+    Console.Error.WriteLine($"unknown command: {cmd}");
     PrintUsage();
     return 1;
 }
@@ -95,40 +102,40 @@ static int Unknown(string cmd)
 static void PrintUsage()
 {
     Console.WriteLine("""
-        DesireeIA CLI - client di test per il motore nativo
+        DesireeIA CLI - test client for the native engine
 
-        Uso:
+        Usage:
           desireeia-cli hw
-          desireeia-cli info <modello.gguf>
-          desireeia-cli tokenize <modello.gguf> "<testo>"
-          desireeia-cli embed <modello.gguf> "<testo>"  (solo encoder BERT)
-          desireeia-cli generate <modello.gguf> "<testo>" [--max-tokens N] [--chat]
+          desireeia-cli info <model.gguf>
+          desireeia-cli tokenize <model.gguf> "<text>"
+          desireeia-cli embed <model.gguf> "<text>"  (BERT encoder only)
+          desireeia-cli generate <model.gguf> "<text>" [--max-tokens N] [--chat]
                      [--temp T] [--top-k K] [--top-p P]
                      [--repeat-penalty R] [--repeat-last-n N] [--seed S]
-                     [--stop "<s>"]...  (ripetibile: ferma la generazione alla prima occorrenza,
-                                         esclusa dall'output - vedi GenerateOptions.StopSequences)
-                     [--json [--schema "<json-schema>"]]  (best-effort: istruisce il modello a
-                                         rispondere solo con JSON e ne estrae il blocco valido;
-                                         non e' grammar-constrained decoding)
-                     [--lora <adapter.gguf>] [--lora-scale S]  (Recover-LoRA, vedi README)
-                     [--prerouter <file.gguf>] [--prerouter-heuristic]  (vedi README)
-          desireeia-cli bench <modello.gguf> [--tokens N] [--warmup N] [--prompt "<testo>"] [--threads N]
+                     [--stop "<s>"]...  (repeatable: stops generation at the first occurrence,
+                                         excluded from the output - see GenerateOptions.StopSequences)
+                     [--json [--schema "<json-schema>"]]  (best-effort: instructs the model to
+                                         respond with JSON only and extracts the valid block;
+                                         not grammar-constrained decoding)
+                     [--lora <adapter.gguf>] [--lora-scale S]  (Recover-LoRA, see README)
+                     [--prerouter <file.gguf>] [--prerouter-heuristic]  (see README)
+          desireeia-cli bench <model.gguf> [--tokens N] [--warmup N] [--prompt "<text>"] [--threads N]
                      [--lora <adapter.gguf>] [--lora-scale S]
                      [--prerouter <file.gguf>] [--prerouter-heuristic]
-          desireeia-cli chat <modello.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]
+          desireeia-cli chat <model.gguf> [--temp T] [--top-k K] [--top-p P] [--max-tokens N]
                      [--lora <adapter.gguf>] [--lora-scale S]
                      [--prerouter <file.gguf>] [--prerouter-heuristic]
 
         Chat session:
-          desireeia-cli chat <modello.gguf>  (interactive multi-turn conversation)
+          desireeia-cli chat <model.gguf>  (interactive multi-turn conversation)
           /image <path>   load image file and inject into context (base64)
           /save <path>    save last assistant response to file
           /saveb64 <path> decode last base64 block and save as binary file
 
-        Campionamento: senza --temp la generazione e' greedy (deterministica).
-        --temp 0.8 --repeat-penalty 1.1 e' un punto di partenza ragionevole;
-        la penalita' di ripetizione serve a evitare i cicli in cui la
-        decodifica greedy finisce su generazioni lunghe.
+        Sampling: without --temp, generation is greedy (deterministic).
+        --temp 0.8 --repeat-penalty 1.1 is a reasonable starting point;
+        the repeat penalty helps avoid the loops that greedy decoding
+        tends to fall into on long generations.
         """);
 }
 
@@ -147,9 +154,24 @@ static (LocalModel model, ExecutionPlan plan) Open(string modelPath, int? thread
 {
     if (!File.Exists(modelPath))
     {
-        throw new FileNotFoundException($"modello non trovato: {modelPath}");
+        throw new FileNotFoundException($"model not found: {modelPath}");
     }
-    var overrides = threads is int t ? new ExecutionPlan { ThreadCount = t } : null;
+    // --backend forces the backend instead of letting it auto-detect
+    // (ExecutionPlan.Backend defaults to Unconfigured precisely so it
+    // doesn't interfere when not explicitly requested): used to compare
+    // CPU and CUDA on the same model/hardware in the benchmark.
+    var backendOpt = args is not null ? GetStringOption(args, "--backend", null) : null;
+    InferenceBackend? backend = backendOpt?.ToLowerInvariant() switch
+    {
+        null => null,
+        "cpu" => InferenceBackend.Cpu,
+        "cuda" => InferenceBackend.Cuda,
+        _ => throw new ArgumentException($"unknown --backend: {backendOpt} (use cpu or cuda)")
+    };
+    ExecutionPlan? overrides = null;
+    if (threads is int t && backend is InferenceBackend b) overrides = new ExecutionPlan { ThreadCount = t, Backend = b };
+    else if (threads is int t2) overrides = new ExecutionPlan { ThreadCount = t2 };
+    else if (backend is InferenceBackend b2) overrides = new ExecutionPlan { Backend = b2 };
     var plan = DesireeIAEngine.BuildPlan(modelPath, overrides);
     Action<string>? logger = Environment.GetEnvironmentVariable("DESIREEIA_VERBOSE") == "1"
         ? (msg => Console.Error.WriteLine($"[native] {msg}"))
@@ -194,7 +216,7 @@ static int CmdInfo(string[] rest)
 {
     if (rest.Length < 1)
     {
-        Console.Error.WriteLine("uso: desireeia-cli info <modello.gguf>");
+        Console.Error.WriteLine("usage: desireeia-cli info <model.gguf>");
         return 1;
     }
 
@@ -203,8 +225,8 @@ static int CmdInfo(string[] rest)
     {
         Console.WriteLine($"path        = {model.ModelPath}");
         Console.WriteLine($"plan        = {plan}");
-        Console.WriteLine($"tokenizer   = {(model.HasTokenizer ? "riconosciuto (SPM o BPE)" : "non riconosciuto")}");
-        Console.WriteLine($"context_size = {model.ContextSize()} byte (0 prima del primo Predict)");
+        Console.WriteLine($"tokenizer   = {(model.HasTokenizer ? "recognized (SPM or BPE)" : "not recognized")}");
+        Console.WriteLine($"context_size = {model.ContextSize()} bytes (0 before the first Predict)");
     }
     return 0;
 }
@@ -213,7 +235,7 @@ static int CmdTokenize(string[] rest)
 {
     if (rest.Length < 2)
     {
-        Console.Error.WriteLine("uso: desireeia-cli tokenize <modello.gguf> \"<testo>\"");
+        Console.Error.WriteLine("usage: desireeia-cli tokenize <model.gguf> \"<text>\"");
         return 1;
     }
 
@@ -223,7 +245,7 @@ static int CmdTokenize(string[] rest)
         var ids = model.Tokenize(rest[1]);
         if (ids is null)
         {
-            Console.Error.WriteLine("il modello non ha un tokenizer riconosciuto (ne' SentencePiece ne' BPE).");
+            Console.Error.WriteLine("the model does not have a recognized tokenizer (neither SentencePiece nor BPE).");
             return 1;
         }
         foreach (var id in ids)
@@ -231,7 +253,7 @@ static int CmdTokenize(string[] rest)
             var piece = model.TokenPiece(id) ?? "?";
             Console.WriteLine($"{id}\t{piece}");
         }
-        Console.WriteLine($"({ids.Length} token)");
+        Console.WriteLine($"({ids.Length} tokens)");
     }
     return 0;
 }
@@ -240,7 +262,7 @@ static int CmdEmbed(string[] rest)
 {
     if (rest.Length < 2)
     {
-        Console.Error.WriteLine("uso: desireeia-cli embed <modello.gguf> \"<testo>\"");
+        Console.Error.WriteLine("usage: desireeia-cli embed <model.gguf> \"<text>\"");
         return 1;
     }
 
@@ -250,16 +272,16 @@ static int CmdEmbed(string[] rest)
         var ids = model.Tokenize(rest[1]);
         if (ids is null)
         {
-            Console.Error.WriteLine("il modello non ha un tokenizer riconosciuto.");
+            Console.Error.WriteLine("the model does not have a recognized tokenizer.");
             return 1;
         }
         var rows = model.Embed(ids);
         if (rows is null)
         {
-            Console.Error.WriteLine("il modello caricato non e' un encoder BERT (desireeia_embed non supportato).");
+            Console.Error.WriteLine("the loaded model is not a BERT encoder (desireeia_embed not supported).");
             return 1;
         }
-        Console.WriteLine($"{ids.Length} token, dimensione embedding = {(rows.Length > 0 ? rows[0].Length : 0)}");
+        Console.WriteLine($"{ids.Length} tokens, embedding dimension = {(rows.Length > 0 ? rows[0].Length : 0)}");
 
         if (rows.Length == 0) return 0;
         var dim = rows[0].Length;
@@ -267,7 +289,7 @@ static int CmdEmbed(string[] rest)
         foreach (var row in rows)
             for (int i = 0; i < dim; i++) pooled[i] += row[i] / rows.Length;
         var norm = MathF.Sqrt(pooled.Sum(v => v * v));
-        Console.WriteLine($"mean-pool (prime 8 componenti, norma L2={norm:F4}): " +
+        Console.WriteLine($"mean-pool (first 8 components, L2 norm={norm:F4}): " +
             string.Join(", ", pooled.Take(8).Select(v => v.ToString("F4"))));
     }
     return 0;
@@ -277,7 +299,7 @@ static async Task<int> CmdGenerate(string[] rest)
 {
     if (rest.Length < 2)
     {
-        Console.Error.WriteLine("uso: desireeia-cli generate <modello.gguf> \"<testo>\" [--max-tokens N] [--chat] " +
+        Console.Error.WriteLine("usage: desireeia-cli generate <model.gguf> \"<text>\" [--max-tokens N] [--chat] " +
                                  "[--stop <s>]... [--json [--schema <json-schema>]]");
         return 1;
     }
@@ -298,7 +320,7 @@ static async Task<int> CmdGenerate(string[] rest)
         var ids = model.Tokenize(promptText);
         if (ids is null || ids.Length == 0)
         {
-            Console.Error.WriteLine("tokenizzazione fallita o prompt vuoto (tokenizer non riconosciuto?).");
+            Console.Error.WriteLine("tokenization failed or empty prompt (unrecognized tokenizer?).");
             return 1;
         }
 
@@ -314,23 +336,23 @@ static async Task<int> CmdGenerate(string[] rest)
         Console.WriteLine();
         if (stopSequences is { Count: > 0 })
         {
-            Console.WriteLine($"[stop sequences attive: {string.Join(", ", stopSequences.Select(s => $"\"{s}\""))} - non incluse nell'output se raggiunte]");
+            Console.WriteLine($"[active stop sequences: {string.Join(", ", stopSequences.Select(s => $"\"{s}\""))} - excluded from output if reached]");
         }
         if (jsonMode)
         {
             var extracted = StructuredOutput.TryExtractJson(sb.ToString());
             Console.WriteLine(extracted is not null
-                ? $"[json mode: blocco JSON estratto correttamente ({extracted.Length} caratteri)]"
-                : "[json mode: NESSUN blocco JSON valido trovato nella risposta - il modello non ha seguito l'istruzione]");
+                ? $"[json mode: JSON block successfully extracted ({extracted.Length} characters)]"
+                : "[json mode: NO valid JSON block found in the response - the model did not follow the instruction]");
         }
         var s = model.GetSampling();
         Console.WriteLine(s.Temperature > 0
-            ? $"[campionamento: temp={s.Temperature} top-k={s.TopK} top-p={s.TopP} " +
-              $"repeat-penalty={s.PenaltyRepeat} (ultimi {s.PenaltyLastN})]"
-            : "[greedy (argmax): deterministico. Su generazioni lunghe entra in cicli " +
-              "ripetitivi: usare --temp 0.8 --repeat-penalty 1.1]");
-        Console.WriteLine("[NB: nessuna validazione di correttezza logit-per-logit contro un " +
-                           "riferimento - vedi docs/engine_gap_analysis.md]");
+            ? $"[sampling: temp={s.Temperature} top-k={s.TopK} top-p={s.TopP} " +
+              $"repeat-penalty={s.PenaltyRepeat} (last {s.PenaltyLastN})]"
+            : "[greedy (argmax): deterministic. On long generations it falls into " +
+              "repetitive loops: use --temp 0.8 --repeat-penalty 1.1]");
+        Console.WriteLine("[NB: no logit-by-logit correctness validation against a " +
+                           "reference - see docs/engine_gap_analysis.md]");
     }
     return 0;
 }
@@ -339,7 +361,7 @@ static int CmdBench(string[] rest)
 {
     if (rest.Length < 1)
     {
-        Console.Error.WriteLine("uso: desireeia-cli bench <modello.gguf> [--tokens N] [--warmup N] [--prompt \"<testo>\"] [--threads N]");
+        Console.Error.WriteLine("usage: desireeia-cli bench <model.gguf> [--tokens N] [--warmup N] [--prompt \"<text>\"] [--threads N] [--backend cpu|cuda]");
         return 1;
     }
 
@@ -381,8 +403,8 @@ static int CmdBench(string[] rest)
         var tokPerSec = nTokens / Math.Max(decodeMs / 1000.0, 1e-6);
         Console.WriteLine($"decode: {nTokens} token in {decodeMs:F1} ms " +
                            $"({tokPerSec:F2} tok/s, {decodeMs / Math.Max(nTokens, 1):F2} ms/token)");
-        Console.WriteLine($"profile (solo decode, {nTokens} token): {DesireeIAEngine.ProfileDump()}");
-        Console.WriteLine($"context_size dopo il bench: {model.ContextSize()} byte");
+        Console.WriteLine($"profile (decode only, {nTokens} tokens): {DesireeIAEngine.ProfileDump()}");
+        Console.WriteLine($"context_size after the bench: {model.ContextSize()} bytes");
     }
     return 0;
 }
@@ -723,8 +745,8 @@ static string? GetStringOption(string[] args, string name, string? def)
 
 static bool HasFlag(string[] args, string name) => Array.IndexOf(args, name) >= 0;
 
-// Raccoglie TUTTE le occorrenze di un'opzione ripetibile (es. piu' --stop),
-// a differenza di GetStringOption che si ferma alla prima. Null se assente.
+// Collects ALL occurrences of a repeatable option (e.g. multiple --stop),
+// unlike GetStringOption which stops at the first one. Null if absent.
 static List<string>? GetStringListOption(string[] args, string name)
 {
     List<string>? result = null;

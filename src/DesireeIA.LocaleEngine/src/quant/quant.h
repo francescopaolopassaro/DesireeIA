@@ -1,4 +1,11 @@
-﻿#ifndef DESIREEIA_QUANT_H
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+#ifndef DESIREEIA_QUANT_H
 #define DESIREEIA_QUANT_H
 
 #include <stdint.h>

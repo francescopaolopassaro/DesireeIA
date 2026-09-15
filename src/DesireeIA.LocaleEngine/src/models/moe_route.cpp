@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "moe_route.h"
 #include <algorithm>
 #include <cmath>
@@ -26,9 +33,9 @@ std::vector<std::pair<uint32_t, float>> moe_route_ex(
         for (size_t i = 0; i < n; ++i) probs[i] = (float) (probs[i] / sum);
     }
 
-    // Bias di selezione (DeepSeek-V3, blk.N.exp_probs_b): sposta solo QUALI
-    // esperti finiscono nel top-k, non il peso di combinazione (vedi la
-    // nota in moe_route.h).
+    // Selection bias (DeepSeek-V3, blk.N.exp_probs_b): shifts only WHICH
+    // experts end up in the top-k, not the combination weight (see the
+    // note in moe_route.h).
     std::vector<float> sel_probs = probs;
     if (sel_bias && sel_bias->size() == n) {
         for (size_t i = 0; i < n; ++i) sel_probs[i] += (*sel_bias)[i];

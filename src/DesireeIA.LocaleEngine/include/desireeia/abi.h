@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_ABI_H
 #define DESIREEIA_ABI_H
 
@@ -142,12 +149,12 @@ DESIREEIA_API desireeia_error desireeia_predict(desireeia_ctx* ctx,
 DESIREEIA_API desireeia_error desireeia_next_token(desireeia_ctx* ctx, int32_t* out_token);
 DESIREEIA_API size_t desireeia_context_size(const desireeia_ctx* ctx);
 
-/* Tokenizer (SentencePiece Unigram o BPE byte-level, auto-rilevato dai
- * metadati del modello). Convenzione query-size: chiamare con out_ids=NULL
- * (o max_ids=0) per ottenere in out_count il numero di token necessari,
- * senza scrivere nulla; una seconda chiamata con un buffer di quella
- * dimensione riempie out_ids. Ritorna DESIREEIA_ERR_NOT_SUPPORTED se il
- * modello non ha un tokenizer riconosciuto. */
+/* Tokenizer (SentencePiece Unigram or byte-level BPE, auto-detected from
+ * the model's metadata). Query-size convention: call with out_ids=NULL
+ * (or max_ids=0) to get the number of tokens needed in out_count,
+ * without writing anything; a second call with a buffer of that size
+ * fills out_ids. Returns DESIREEIA_ERR_NOT_SUPPORTED if the model does
+ * not have a recognized tokenizer. */
 DESIREEIA_API desireeia_error desireeia_tokenize(desireeia_ctx* ctx,
                                         const char* text,
                                         int32_t add_bos,
@@ -155,19 +162,19 @@ DESIREEIA_API desireeia_error desireeia_tokenize(desireeia_ctx* ctx,
                                         size_t max_ids,
                                         size_t* out_count);
 
-/* Scrive in out_buf (capacita' buf_size, sempre NUL-terminato se buf_size>0)
- * il testo del token `id`. Ritorna DESIREEIA_ERR_INVALID_ARG se l'id e' fuori
- * range o il buffer troppo piccolo, DESIREEIA_ERR_NOT_SUPPORTED se il modello
- * non ha un tokenizer riconosciuto. */
+/* Writes into out_buf (capacity buf_size, always NUL-terminated if buf_size>0)
+ * the text of token `id`. Returns DESIREEIA_ERR_INVALID_ARG if the id is out
+ * of range or the buffer is too small, DESIREEIA_ERR_NOT_SUPPORTED if the
+ * model does not have a recognized tokenizer. */
 DESIREEIA_API desireeia_error desireeia_token_piece(desireeia_ctx* ctx,
                                            int32_t id,
                                            char* out_buf,
                                            size_t buf_size);
 
-/* Identificatori dei kind di token speciale per desireeia_special_token_id
- * (Fase 0 "motore di inferenza reale": serve a chi genera per sapere
- * quando fermarsi — EOS — o a chi compone una chat template per sapere
- * come iniziare/finire un turno). */
+/* Kind identifiers for special tokens, for desireeia_special_token_id
+ * (Phase 0 "real inference engine": used by the generation loop to know
+ * when to stop — EOS — or by chat template composition to know how to
+ * open/close a turn). */
 typedef enum desireeia_special_token {
     DESIREEIA_TOKEN_BOS = 0,
     DESIREEIA_TOKEN_EOS = 1,
@@ -175,32 +182,32 @@ typedef enum desireeia_special_token {
     DESIREEIA_TOKEN_PAD = 3
 } desireeia_special_token;
 
-/* Scrive in *out_id l'id del token speciale richiesto, o -1 se il modello
- * non lo definisce (metadato GGUF assente). DESIREEIA_ERR_NOT_SUPPORTED se
- * il modello non ha un vocabolario riconosciuto. */
+/* Writes into *out_id the id of the requested special token, or -1 if the
+ * model does not define it (GGUF metadata absent). DESIREEIA_ERR_NOT_SUPPORTED
+ * if the model does not have a recognized vocabulary. */
 DESIREEIA_API desireeia_error desireeia_special_token_id(const desireeia_ctx* ctx,
                                                 desireeia_special_token which,
                                                 int32_t* out_id);
 
-/* Scrive in *out_is_eog 1 se `id` e' un token di FINE GENERAZIONE, 0
- * altrimenti. Non basta confrontare con l'id EOS: i modelli chat chiudono
- * il turno con token dedicati (gemma: <end_of_turn>), e fermarsi solo su
- * EOS lascia il modello a ripeterli all'infinito. */
+/* Writes into *out_is_eog 1 if `id` is an END-OF-GENERATION token, 0
+ * otherwise. Comparing against the EOS id alone is not enough: chat models
+ * close the turn with dedicated tokens (gemma: <end_of_turn>), and stopping
+ * only on EOS leaves the model repeating them forever. */
 DESIREEIA_API desireeia_error desireeia_is_eog_token(const desireeia_ctx* ctx,
                                             int32_t id,
                                             int32_t* out_is_eog);
 
-/* BERT (encoder-only): embedding per token dell'intera sequenza, in un
- * solo passo (nessuno stato fra chiamate, a differenza di desireeia_predict/
- * desireeia_next_token — un embedding non dipende da chiamate precedenti).
- * Convenzione query-size come desireeia_tokenize: chiamare con out_embd=NULL
- * (o out_capacity=0) per ottenere in *out_len il numero di float necessari
- * (sempre n_tokens * *out_embd_dim) senza scrivere nulla; una seconda
- * chiamata con un buffer di quella dimensione riempie out_embd (token 0 ai
- * float [0, embd_dim), token 1 a [embd_dim, 2*embd_dim), ...). L'embedding
- * NON e' aggregato/normalizzato dal motore (pooling/normalizzazione sono
- * una scelta dell'applicazione). Ritorna DESIREEIA_ERR_NOT_SUPPORTED se il
- * modello caricato non e' un encoder BERT. */
+/* BERT (encoder-only): per-token embedding for the whole sequence, in a
+ * single pass (no state across calls, unlike desireeia_predict/
+ * desireeia_next_token — an embedding does not depend on previous calls).
+ * Query-size convention as in desireeia_tokenize: call with out_embd=NULL
+ * (or out_capacity=0) to get the number of floats needed in *out_len
+ * (always n_tokens * *out_embd_dim) without writing anything; a second
+ * call with a buffer of that size fills out_embd (token 0 in floats
+ * [0, embd_dim), token 1 in [embd_dim, 2*embd_dim), ...). The embedding is
+ * NOT aggregated/normalized by the engine (pooling/normalization are an
+ * application-level choice). Returns DESIREEIA_ERR_NOT_SUPPORTED if the
+ * loaded model is not a BERT encoder. */
 DESIREEIA_API desireeia_error desireeia_embed(desireeia_ctx* ctx,
                                      const int32_t* tokens,
                                      size_t n_tokens,
@@ -209,15 +216,15 @@ DESIREEIA_API desireeia_error desireeia_embed(desireeia_ctx* ctx,
                                      size_t* out_len,
                                      uint32_t* out_embd_dim);
 
-/* Parametri di campionamento. Prima esisteva solo l'argmax greedy: a
- * parita' di prompt il motore rispondeva sempre identico, e su generazioni
- * lunghe entrava in cicli ripetitivi da cui non usciva piu' (misurato:
- * "France is a country with a..." ripetuto fino a degenerare in token
- * casuali). La penalita' di ripetizione serve proprio a quello.
+/* Sampling parameters. Previously only greedy argmax existed: for the same
+ * prompt the engine always answered identically, and on long generations it
+ * would fall into repetitive loops it never escaped (measured: "France is a
+ * country with a..." repeated until it degenerated into random tokens). The
+ * repetition penalty exists specifically to address that.
  *
- * temperature <= 0 = greedy (comportamento precedente, resta il default).
- * top_k <= 0 disattiva il top-k; top_p >= 1 disattiva il top-p;
- * penalty_repeat == 1 disattiva la penalita'. seed == 0 = seme casuale. */
+ * temperature <= 0 = greedy (previous behavior, still the default).
+ * top_k <= 0 disables top-k; top_p >= 1 disables top-p;
+ * penalty_repeat == 1 disables the penalty. seed == 0 = random seed. */
 typedef struct desireeia_sampling {
     float    temperature;
     int32_t  top_k;
@@ -229,70 +236,69 @@ typedef struct desireeia_sampling {
     uint32_t seed;
 } desireeia_sampling;
 
-/* Imposta i parametri di campionamento del contesto. Puo' essere chiamata
- * in qualsiasi momento; ha effetto dal token successivo. */
+/* Sets the context's sampling parameters. Can be called at any time; takes
+ * effect starting from the next token. */
 DESIREEIA_API desireeia_error desireeia_set_sampling(desireeia_ctx* ctx,
                                             const desireeia_sampling* params);
 
-/* Riempie *out con i parametri di campionamento correnti. */
+/* Fills *out with the current sampling parameters. */
 DESIREEIA_API desireeia_error desireeia_get_sampling(const desireeia_ctx* ctx,
                                             desireeia_sampling* out);
 
-/* Recover-LoRA: carica un adapter LoRA in formato GGUF, convenzione
- * desireeialmn (tensori "<nome_base>.lora_a" / "<nome_base>.lora_b",
- * metadato "adapter.lora.alpha"). Applicato a runtime senza toccare i pesi
- * base: out = base_mm(x, W) + scale * B @ (A @ x). Puo' essere chiamata
- * piu' volte per caricare piu' adapter contemporaneamente (i contributi si
- * sommano); scale moltiplica il fattore alpha/rank dell'adapter (1.0 se
- * l'adapter non ha alpha). Copre attenzione, FFN densa/MLA/shared-expert;
- * NON copre gli esperti MoE instradati (percorso diverso, vedi
- * docs/README). Ritorna DESIREEIA_ERR_NOT_SUPPORTED se il modello non ha
- * un motore forward generativo (es. encoder BERT), DESIREEIA_ERR_IO se il
- * file non si apre, DESIREEIA_ERR_PARSE se non e' un adapter LoRA valido. */
+/* Recover-LoRA: loads a LoRA adapter in GGUF format, desireeialmn
+ * convention (tensors "<base_name>.lora_a" / "<base_name>.lora_b",
+ * metadata "adapter.lora.alpha"). Applied at runtime without touching the
+ * base weights: out = base_mm(x, W) + scale * B @ (A @ x). Can be called
+ * multiple times to load several adapters at once (their contributions
+ * add up); scale multiplies the adapter's alpha/rank factor (1.0 if the
+ * adapter has no alpha). Covers attention, dense/MLA/shared-expert FFN;
+ * does NOT cover routed MoE experts (different code path, see
+ * docs/README). Returns DESIREEIA_ERR_NOT_SUPPORTED if the model does not
+ * have a generative forward engine (e.g. a BERT encoder), DESIREEIA_ERR_IO
+ * if the file cannot be opened, DESIREEIA_ERR_PARSE if it is not a valid
+ * LoRA adapter. */
 DESIREEIA_API desireeia_error desireeia_load_lora_adapter(desireeia_ctx* ctx,
                                                   const char* lora_gguf_path,
                                                   float scale);
 
-/* Rimuove tutti gli adapter LoRA caricati sul contesto. */
+/* Removes all LoRA adapters loaded on the context. */
 DESIREEIA_API desireeia_error desireeia_clear_lora_adapters(desireeia_ctx* ctx);
 
-/* Prerouter routing prediction: predice, dai dati del layer L, quali
- * esperti instradera' probabilmente il layer L+1, cosi' i loro pesi
- * possono essere precaricati in background un layer prima del reale
- * calcolo del router (vedi src/models/prerouter.h per la matematica).
- * Non ha mai effetto sulla correttezza: una previsione sbagliata o
- * assente lascia semplicemente girare il percorso di lettura gia'
- * esistente quando il layer L+1 calcola davvero il proprio router.
+/* Prerouter routing prediction: predicts, from layer L's data, which
+ * experts layer L+1 will likely route to, so their weights can be
+ * prefetched in the background one layer before the router's actual
+ * computation (see src/models/prerouter.h for the math).
+ * It never affects correctness: a wrong or missing prediction simply
+ * leaves the existing read path to run when layer L+1 actually computes
+ * its own router.
  *
- * `path`: file GGUF con la convenzione di denominazione propria di questo
- * motore (tensori "prerouter.<N>.fc1.weight" / ".fc2.weight" /
- * ".linear_init.weight" per ogni layer "owner" N) — NON compatibile byte
- * per byte con nessun formato di riferimento esterno. Ritorna
- * DESIREEIA_ERR_NOT_SUPPORTED se il modello non ha esperti MoE o non ha
- * un motore forward generativo, DESIREEIA_ERR_PARSE se il file non
- * contiene nessuna testa valida in quel formato. */
+ * `path`: a GGUF file using this engine's own naming convention (tensors
+ * "prerouter.<N>.fc1.weight" / ".fc2.weight" / ".linear_init.weight" for
+ * each "owner" layer N) — NOT byte-for-byte compatible with any external
+ * reference format. Returns DESIREEIA_ERR_NOT_SUPPORTED if the model has
+ * no MoE experts or no generative forward engine, DESIREEIA_ERR_PARSE if
+ * the file contains no valid head in that format. */
 DESIREEIA_API desireeia_error desireeia_load_prerouter(desireeia_ctx* ctx, const char* path);
 
-/* Rimuove tutte le teste prerouter caricate. */
+/* Removes all loaded prerouter heads. */
 DESIREEIA_API desireeia_error desireeia_clear_prerouter(desireeia_ctx* ctx);
 
-/* Attiva/disattiva l'euristica di fallback ("il layer L+1 instrada agli
- * stessi esperti appena usati dal layer L") per i layer owner senza una
- * testa prerouter addestrata caricata. Spenta di default: nessuna testa
- * addestrata e' oggi disponibile per nessun modello, quindi questa e'
- * l'unico modo di avere QUALCHE previsione finche' non ne esiste una
- * reale — dichiaratamente un placeholder, non una previsione accurata. */
+/* Enables/disables the fallback heuristic ("layer L+1 routes to the same
+ * experts layer L just used") for owner layers with no trained prerouter
+ * head loaded. Off by default: no trained head is currently available for
+ * any model, so this is the only way to get SOME prediction until a real
+ * one exists — explicitly a placeholder, not an accurate prediction. */
 DESIREEIA_API desireeia_error desireeia_set_prerouter_heuristic(desireeia_ctx* ctx, int32_t enabled);
 
-/* Applica il formato di chat rilevato per il modello (dal
- * "tokenizer.chat_template" del GGUF, o da un default per architettura se
- * assente) a una sequenza di messaggi, scrivendo il prompt risultante in
- * out_buf (NUL-terminato se buf_size>0, troncato se il buffer e' piccolo).
- * *out_len riceve la lunghezza necessaria (senza NUL): se maggiore di
- * buf_size, richiamare con un buffer piu' grande. roles/contents sono
- * array paralleli di n_messages stringhe UTF-8 NUL-terminate (ruoli tipici:
- * "system", "user", "assistant"). add_assistant=1 aggiunge il marcatore di
- * apertura del turno assistente, per far generare la risposta subito dopo. */
+/* Applies the chat format detected for the model (from the GGUF's
+ * "tokenizer.chat_template", or a per-architecture default if absent) to a
+ * sequence of messages, writing the resulting prompt into out_buf
+ * (NUL-terminated if buf_size>0, truncated if the buffer is too small).
+ * *out_len receives the required length (without the NUL): if greater than
+ * buf_size, call again with a larger buffer. roles/contents are parallel
+ * arrays of n_messages NUL-terminated UTF-8 strings (typical roles:
+ * "system", "user", "assistant"). add_assistant=1 appends the assistant
+ * turn's opening marker, so generation can start right after. */
 DESIREEIA_API desireeia_error desireeia_apply_chat_template(const desireeia_ctx* ctx,
                                                     const char** roles,
                                                     const char** contents,
@@ -302,13 +308,13 @@ DESIREEIA_API desireeia_error desireeia_apply_chat_template(const desireeia_ctx*
                                                     size_t buf_size,
                                                     size_t* out_len);
 
-/* Profiler minimo sempre attivo (tempo cumulativo per tipo di kernel
- * matmul: quantizzazione attivazione, Q4_0/Q4_K/Q6_K, fallback float).
- * desireeia_profile_dump scrive una riga leggibile in out_buf (NUL-terminata
- * se buf_size>0, troncata se il buffer e' piccolo); desireeia_profile_reset
- * azzera i contatori (utile per isolare la misura a una finestra, es. solo
- * il ciclo di decode di un benchmark). I contatori sono globali di
- * processo, non per-modello. */
+/* Minimal always-on profiler (cumulative time per matmul kernel type:
+ * activation quantization, Q4_0/Q4_K/Q6_K, float fallback).
+ * desireeia_profile_dump writes a human-readable line into out_buf
+ * (NUL-terminated if buf_size>0, truncated if the buffer is too small);
+ * desireeia_profile_reset zeroes the counters (useful to isolate the
+ * measurement to a window, e.g. just a benchmark's decode loop). The
+ * counters are process-global, not per-model. */
 DESIREEIA_API void desireeia_profile_dump(char* out_buf, size_t buf_size);
 DESIREEIA_API void desireeia_profile_reset(void);
 
@@ -396,25 +402,26 @@ DESIREEIA_API desireeia_error desireeia_vision_preprocess(const DesireeAIImage* 
  * file carries clip.vision.* metadata the vision encoder is auto-loaded at
  * desireeia_create() time and these functions work without extra setup. */
 
-/* Scrive 1 in *out_has se il modello caricato ha un encoder visivo
- * (vision), 0 altrimenti. */
+/* Writes 1 into *out_has if the loaded model has a vision encoder,
+ * 0 otherwise. */
 DESIREEIA_API desireeia_error desireeia_has_vision(desireeia_ctx* ctx,
                                                    int32_t* out_has);
 
-/* Numero di vector di embedding che l'encoder visivo produce per immagine
- * (= numero di occorrenze del token placeholder da inserire nel prompt). */
+/* Number of embedding vectors the vision encoder produces per image
+ * (= number of occurrences of the placeholder token to insert in the
+ * prompt). */
 DESIREEIA_API desireeia_error desireeia_vision_token_count(desireeia_ctx* ctx,
                                                            int32_t* out_count);
 
-/* Id del token placeholder immagine risolto sul vocabolario del modello
- * (es. <image>), o -1 se non risolvibile. */
+/* Id of the image placeholder token resolved against the model's
+ * vocabulary (e.g. <image>), or -1 if it cannot be resolved. */
 DESIREEIA_API desireeia_error desireeia_vision_image_token(desireeia_ctx* ctx,
                                                            int32_t* out_id);
 
-/* Codifica un'immagine con l'encoder visivo del modello caricato.
- * Stessa convenzione query-size di desireeia_embed: out_embd=NULL con
- * out_capacity=0 riempie solo *out_len. out_dim riceve la larghezza di
- * ogni vector (dimensione embedding del modello di testo). */
+/* Encodes an image with the loaded model's vision encoder.
+ * Same query-size convention as desireeia_embed: out_embd=NULL with
+ * out_capacity=0 fills only *out_len. out_dim receives the width of
+ * each vector (the text model's embedding dimension). */
 DESIREEIA_API desireeia_error desireeia_vision_encode_ctx(desireeia_ctx* ctx,
                                                           const DesireeAIImage* image,
                                                           float* out_embd,
@@ -422,13 +429,13 @@ DESIREEIA_API desireeia_error desireeia_vision_encode_ctx(desireeia_ctx* ctx,
                                                           size_t* out_len,
                                                           uint32_t* out_dim);
 
-/* Prefill multimodale sul modello caricato: like desireeia_predict, ma il
- * flusso token contiene N occorrenze del token placeholder immagine (N =
- * desireeia_vision_token_count) e `embd` contiene i vector dell'encoder
- * visivo (N * out_dim float, uno per occorrenza, in ordine). image_token
- * puo' essere -1 per usare il placeholder risolto automaticamente.
- * Ritorna DESIREEIA_ERR_NOT_SUPPORTED se il modello non ha vision o non e'
- * un motore forward denso. */
+/* Multimodal prefill on the loaded model: like desireeia_predict, but the
+ * token stream contains N occurrences of the image placeholder token (N =
+ * desireeia_vision_token_count) and `embd` contains the vision encoder's
+ * vectors (N * out_dim floats, one per occurrence, in order). image_token
+ * can be -1 to use the automatically resolved placeholder.
+ * Returns DESIREEIA_ERR_NOT_SUPPORTED if the model has no vision or is not
+ * a dense forward engine. */
 DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
                                                       const int32_t* tokens,
                                                       size_t n_tokens,

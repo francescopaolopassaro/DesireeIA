@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "../core/engine.h"
 #include "../quant/quant.h"
 #include <fstream>
@@ -11,10 +18,10 @@ namespace desireeia {
 
 namespace {
 
-// Parser JSON minimale, sufficiente per l'header safetensors e per
-// safetensors.index.json (oggetti/array/stringhe/numeri, nessuna
-// dipendenza esterna). Non e' un parser JSON generale: non serve, il
-// formato dell'header e' sempre un oggetto piatto di oggetti.
+// Minimal JSON parser, sufficient for the safetensors header and for
+// safetensors.index.json (objects/arrays/strings/numbers, no external
+// dependency). Not a general-purpose JSON parser: not needed, the header
+// format is always a flat object of objects.
 struct JsonValue {
     enum Type { Null, Str, Num, Arr, Obj } type = Null;
     std::string str;
@@ -210,15 +217,34 @@ public:
         return decode_dtype(f, e.dtype, n, out);
     }
 
-    // Convenzione tensori esperti nei file safetensors non e' standardizzata
-    // fra checkpoint HF (varia per famiglia: mixtral, deepseek, qwen2moe
-    // usano schemi di nomi diversi) a differenza di GGUF dove
-    // blk.N.ffn_{gate,up,down}_exps.weight e' fisso. Serve un mapping
-    // per-famiglia esplicito, non ancora implementato: gap noto, vedi
-    // docs/engine_gap_analysis.md.
+    // The expert tensor convention in safetensors files is not standardized
+    // across HF checkpoints (it varies by family: mixtral, deepseek,
+    // qwen2moe each use different naming schemes), unlike GGUF where
+    // blk.N.ffn_{gate,up,down}_exps.weight is fixed. Only the Mixtral
+    // convention is implemented here (the original HF checkpoint, not the
+    // "merged" layout produced by a conversion tool), verified by reading
+    // the reference converter in the external desireeialmn project
+    // (conversion module, MixtralModel.modify_tensors class): each expert
+    // is a separate tensor
+    // "model.layers.{layer}.block_sparse_moe.experts.{idx}.{wid}.weight"
+    // with wid in {w1=gate_proj, w2=down_proj, w3=up_proj} (mapping
+    // confirmed via gguf-py/gguf/tensor_mapping.py: FFN_GATE_EXP -> w1,
+    // FFN_DOWN_EXP -> w2, FFN_UP_EXP -> w3). Other families (deepseek,
+    // qwen2moe) remain an open gap, see docs/engine_gap_analysis.md: there
+    // is no verified reference for their naming as of this session.
     bool read_expert(uint32_t layer, uint32_t idx, ExpertPart part, std::vector<float>& out) override {
-        (void) layer; (void) idx; (void) part; (void) out;
-        return false;
+        const char* wid = nullptr;
+        switch (part) {
+            case ExpertPart::Gate: wid = "w1"; break;
+            case ExpertPart::Down: wid = "w2"; break;
+            case ExpertPart::Up:   wid = "w3"; break;
+        }
+        if (!wid) return false;
+
+        std::string name = "model.layers." + std::to_string(layer) +
+                            ".block_sparse_moe.experts." + std::to_string(idx) +
+                            "." + wid + ".weight";
+        return read_tensor(name, out);
     }
 
 private:
@@ -281,7 +307,7 @@ private:
                 e.off_start = (uint64_t) offsets->arr[0].num;
                 e.off_end = (uint64_t) offsets->arr[1].num;
             } else {
-                continue; // tensore senza data_offsets valido: non utilizzabile
+                continue; // tensor without valid data_offsets: unusable
             }
             tensors_[kv.first] = std::move(e);
         }
@@ -306,7 +332,7 @@ private:
             for (uint64_t i = 0; i < n; ++i) out[(size_t) i] = desireeia_bf16_to_fp32((desireeia_bf16_t) raw[(size_t) i]);
             return true;
         }
-        // I8/U8/I64/F8_E4M3/F8_E5M2 non ancora supportati: gap noto.
+        // I8/U8/I64/F8_E4M3/F8_E5M2 not yet supported: known gap.
         return false;
     }
 

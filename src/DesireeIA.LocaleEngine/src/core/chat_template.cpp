@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "core/chat_template.h"
 
 namespace desireeia {
@@ -26,7 +33,7 @@ bool contains(const std::string& hay, const char* needle) {
 ChatTemplateKind detect_chat_template(const std::string& tmpl) {
     if (contains(tmpl, "<|im_start|>")) {
         if (contains(tmpl, "<|im_sep|>")) return ChatTemplateKind::Phi4;
-        if (contains(tmpl, "<end_of_utterance>")) return ChatTemplateKind::Unknown; // SmolVLM, non coperto
+        if (contains(tmpl, "<end_of_utterance>")) return ChatTemplateKind::Unknown; // SmolVLM, not covered
         return ChatTemplateKind::ChatMl;
     }
     if (tmpl.rfind("mistral", 0) == 0 || contains(tmpl, "[INST]")) {
@@ -47,7 +54,7 @@ ChatTemplateKind detect_chat_template(const std::string& tmpl) {
     if (contains(tmpl, "<|assistant|>") && contains(tmpl, "<|end|>")) return ChatTemplateKind::Phi3;
     if (contains(tmpl, "[gMASK]<sop>")) return ChatTemplateKind::ChatGlm4;
     if (contains(tmpl, "<|assistant|>") && contains(tmpl, "<|user|>")) {
-        return contains(tmpl, "</s>") ? ChatTemplateKind::Falcon3 : ChatTemplateKind::Unknown; // GLMEdge, non coperto
+        return contains(tmpl, "</s>") ? ChatTemplateKind::Falcon3 : ChatTemplateKind::Unknown; // GLMEdge, not covered
     }
     if (contains(tmpl, "<|user|>") && contains(tmpl, "<|endoftext|>")) return ChatTemplateKind::Zephyr;
     if (contains(tmpl, "<start_of_turn>")) return ChatTemplateKind::Gemma;
@@ -56,9 +63,14 @@ ChatTemplateKind detect_chat_template(const std::string& tmpl) {
     if (contains(tmpl, "[gMASK]sop")) return ChatTemplateKind::ChatGlm3;
     if (contains(tmpl, "<\xE7\x94\xA8\xE6\x88\xB7>")) return ChatTemplateKind::MiniCpm; // "<用户>"
     if (contains(tmpl, "'Assistant: ' + message['content'] + eos_token")) return ChatTemplateKind::DeepSeek2;
-    if (contains(tmpl, "<\xEF\xBD\x9CAssistant\xEF\xBD\x9C>") &&
-        contains(tmpl, "<\xEF\xBD\x9CUser\xEF\xBD\x9C>") &&
-        contains(tmpl, "<\xEF\xBD\x9Cend\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>")) {
+    // The hex escape sequences are split into adjacent string literals
+    // wherever the following byte is a valid hex digit (e.g. 'A', 'e'):
+    // without the split, the compiler (MSVC treats it as hard error
+    // C7744, GCC only as a warning) keeps consuming digits past \x9C,
+    // producing an out-of-range value instead of the intended UTF-8 byte.
+    if (contains(tmpl, "<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") &&
+        contains(tmpl, "<\xEF\xBD\x9C" "User\xEF\xBD\x9C>") &&
+        contains(tmpl, "<\xEF\xBD\x9C" "end\xE2\x96\x81" "of\xE2\x96\x81sentence\xEF\xBD\x9C>")) {
         return ChatTemplateKind::DeepSeek3; // "<｜Assistant｜>" / "<｜User｜>" / "<｜end▁of▁sentence｜>"
     }
     if (contains(tmpl, "[|system|]") && contains(tmpl, "[|assistant|]") && contains(tmpl, "[|endofturn|]")) {
@@ -116,11 +128,10 @@ std::string apply_chat_template(ChatTemplateKind kind, const std::vector<ChatMes
         break;
 
     case ChatTemplateKind::Gemma: {
-        // google/gemma-*-it. Gemma non ha un ruolo "system": il contenuto
-        // di un messaggio system viene accodato al prossimo messaggio
-        // utente invece di essere scartato (altrimenti le istruzioni di
-        // sistema andrebbero perse in silenzio). "assistant" diventa
-        // "model" nel marcatore di turno.
+        // google/gemma-*-it. Gemma has no "system" role: a system
+        // message's content is appended to the next user message instead
+        // of being dropped (otherwise the system instructions would be
+        // silently lost). "assistant" becomes "model" in the turn marker.
         std::string system_prompt;
         for (const auto& m : chat) {
             if (m.role == "system") { system_prompt += trim(m.content); continue; }
@@ -157,7 +168,7 @@ std::string apply_chat_template(ChatTemplateKind kind, const std::vector<ChatMes
         const bool support_system = kind != ChatTemplateKind::Llama2;
         const bool bos_in_history = kind == ChatTemplateKind::Llama2SysBos;
         const bool strip_msg = kind == ChatTemplateKind::Llama2SysStrip;
-        bool is_inside_turn = true; // salta il BOS iniziale (aggiunto altrove dal tokenizer)
+        bool is_inside_turn = true; // skips the initial BOS (added elsewhere by the tokenizer)
         app("[INST] ");
         for (const auto& m : chat) {
             const std::string content = strip_msg ? trim(m.content) : m.content;
@@ -241,7 +252,7 @@ std::string apply_chat_template(ChatTemplateKind kind, const std::vector<ChatMes
         for (const auto& m : chat) {
             if (m.role == "system") app(m.content + "\n\n");
             else if (m.role == "user") app("User: " + m.content + "\n\n");
-            else if (m.role == "assistant") app("Assistant: " + m.content + "<\xEF\xBD\x9Cend\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>");
+            else if (m.role == "assistant") app("Assistant: " + m.content + "<\xEF\xBD\x9C" "end\xE2\x96\x81" "of\xE2\x96\x81sentence\xEF\xBD\x9C>");
         }
         if (add_ass) app("Assistant:");
         break;
@@ -249,10 +260,10 @@ std::string apply_chat_template(ChatTemplateKind kind, const std::vector<ChatMes
     case ChatTemplateKind::DeepSeek3:
         for (const auto& m : chat) {
             if (m.role == "system") app(m.content + "\n\n");
-            else if (m.role == "user") app("<\xEF\xBD\x9CUser\xEF\xBD\x9C>" + m.content);
-            else if (m.role == "assistant") app("<\xEF\xBD\x9CAssistant\xEF\xBD\x9C>" + m.content + "<\xEF\xBD\x9Cend\xE2\x96\x81of\xE2\x96\x81sentence\xEF\xBD\x9C>");
+            else if (m.role == "user") app("<\xEF\xBD\x9C" "User\xEF\xBD\x9C>" + m.content);
+            else if (m.role == "assistant") app("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>" + m.content + "<\xEF\xBD\x9C" "end\xE2\x96\x81" "of\xE2\x96\x81sentence\xEF\xBD\x9C>");
         }
-        if (add_ass) app("<\xEF\xBD\x9CAssistant\xEF\xBD\x9C>");
+        if (add_ass) app("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>");
         break;
 
     case ChatTemplateKind::Exaone3:
@@ -265,10 +276,10 @@ std::string apply_chat_template(ChatTemplateKind kind, const std::vector<ChatMes
 
     case ChatTemplateKind::Unknown:
     default:
-        // Nessun formato riconosciuto: si ricade su ChatML. E' il fallback
-        // piu' diffuso (moltissimi fine-tune lo adottano anche senza
-        // dichiararlo esplicitamente) ed e' comunque meglio del prompt
-        // grezzo senza marcatori di turno che c'era prima di questa fase.
+        // No recognized format: falls back to ChatML. It's the most
+        // common fallback (a great many fine-tunes adopt it even without
+        // declaring it explicitly), and it's still better than the raw
+        // prompt with no turn markers that existed before this phase.
         for (const auto& m : chat) app("<|im_start|>" + m.role + "\n" + m.content + "<|im_end|>\n");
         if (add_ass) app("<|im_start|>assistant\n");
         break;

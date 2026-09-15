@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_ARCH_TAGS_H
 #define DESIREEIA_ARCH_TAGS_H
 
@@ -75,6 +82,15 @@ enum class ArchKind {
                // separately from the norm that feeds the FFN) is read
                // defensively — present only there, absent everywhere
                // else — so no dedicated quirk is needed for it.
+    Spark25,   // hybrid sliding-window attention: which layers are local is
+               // declared as an explicit per-layer flag ARRAY rather than a
+               // period, and local and global layers differ in BOTH the RoPE
+               // base frequency AND the number of rotated dimensions (global
+               // layers rotate only a prefix of each head). QKV is fused into
+               // one tensor, the FFN is gated with GELU, and the attention
+               // output is scaled per head by a sigmoid gate computed from
+               // the same normalized input that feeds Q/K/V
+               // (DenseQuirks::attn_gate). No QK-norm, no sandwich norm.
     Gpt2,      // absolute position embeddings (a position table added to
                // the token embeddings once, not per layer), QKV fused
                // WITH bias, LayerNorm with bias, non-gated GELU FFN with
@@ -202,6 +218,22 @@ struct DenseQuirks {
     // A norm applied ONCE to the embeddings, before the first layer (not
     // per layer): bloom (tok_norm/tok_norm_b).
     bool embd_norm = false;
+
+    // Per-head output gate on attention (blk.N.attn_gate.weight, shape
+    // {n_embd, n_head}: ONE scalar per head, not per channel). The gate is
+    // computed from the SAME normalized input that feeds Q/K/V — not from
+    // the attention output and not from the raw residual — then passed
+    // through a sigmoid, and each head's slice of the attention output is
+    // multiplied by its own scalar before the output projection:
+    //
+    //   g    = sigmoid(W_gate * x_norm)          // one value per head
+    //   a[h] = a[h] * g[h]                       // a[h] is head_dim wide
+    //   out  = W_o * a
+    //
+    // Reading the gate from the wrong input, or broadcasting it per channel
+    // instead of per head, both produce plausible-looking values and
+    // degenerate text, so the source and the broadcast shape both matter.
+    bool attn_gate = false;
 };
 
 DESIREEIA_INTERNAL DenseQuirks quirks_for(ArchKind kind);

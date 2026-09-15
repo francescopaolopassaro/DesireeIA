@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_DENSE_FORWARD_H
 #define DESIREEIA_DENSE_FORWARD_H
 
@@ -49,8 +56,30 @@ struct DenseConfig {
     float rope_freq_scale = 1.0f;      // global layers
     float rope_freq_scale_swa = 1.0f;  // local layers
 
+    // Explicit per-layer sliding-window flags, one entry per layer. Some
+    // architectures don't repeat a fixed period at all and declare the
+    // layout outright; when this is non-empty it REPLACES the period
+    // formula below, which would otherwise get an arbitrary layout wrong
+    // on most layers.
+    std::vector<uint8_t> swa_mask;
+
+    // Number of rotated dimensions on sliding-window layers, when it
+    // differs from n_rot (which keeps its usual meaning: the count declared
+    // by `rope.dimension_count`, used by every non-sliding-window layer).
+    // 0 means the two are the same, which is the case for every
+    // architecture that doesn't split them — so the default changes
+    // nothing. Note this is independent of head_dim: a layer can rotate
+    // only a PREFIX of each head and leave the rest untouched.
+    uint32_t n_rot_swa = 0;
+
     bool layer_is_swa(uint32_t il) const {
+        if (!swa_mask.empty()) {
+            return il < swa_mask.size() && swa_mask[il] != 0;
+        }
         return swa_pattern != 0 && (il % swa_pattern) < (swa_pattern - 1);
+    }
+    uint32_t layer_n_rot(uint32_t il) const {
+        return (n_rot_swa != 0 && layer_is_swa(il)) ? n_rot_swa : n_rot;
     }
     float layer_rope_theta(uint32_t il) const {
         return layer_is_swa(il) ? rope_theta_swa : rope_theta;
@@ -86,6 +115,14 @@ struct DenseConfig {
         lo = std::max(0.0f, start);
         hi = std::min((float) n_rot - 1.0f, end);
     }
+
+    // desireeia_backend* from the plan (DESIREEIA_BACKEND_CPU=1/CUDA=2/...),
+    // set by DenseForward::open(). Used only to route quantized kernels to
+    // the CUDA backend when available (see matvec/matvec_batch in
+    // dense_forward.cpp and docs/CUDAPiano.md); 0/CPU by default, path
+    // unchanged when it's not CUDA or the DESIREEIA_CUDA_ENABLED build
+    // flag is absent.
+    int32_t backend = 0;
 
     // MoE (n_expert==0 -> classic dense layer, wff_*; n_expert>0 -> router
     // + ExpertStore, wff_* unused). See models/moe_route.h.
@@ -171,6 +208,21 @@ struct MatVec {
     // Empty (the common case: no adapter loaded, or this adapter doesn't
     // touch this tensor) costs one vector-empty check on the hot path.
     std::vector<LoraWeight> lora;
+#ifdef DESIREEIA_CUDA_ENABLED
+    // Q8_0 weights already loaded on device (see backend_cuda.cu,
+    // matmul_q8_0_cuda_upload_weights), populated by
+    // DenseForward::load_matrix ONLY when this MatVec is part of the
+    // persistent weight cache (cache_enabled_): nothing to gain from
+    // loading to VRAM a buffer that will be reloaded from disk on the next
+    // step anyway (scratch_/streaming path). shared_ptr with the
+    // cuda_free_device deleter instead of a raw pointer: MatVec is
+    // copied/reassigned by value elsewhere in the code (e.g. `lw =
+    // LayerWeights{}` in load_lora) and a shared_ptr frees the device
+    // buffer automatically on the last destruction, with no need for a
+    // hand-written destructor/copy operator for this struct.
+    std::shared_ptr<void> cuda_qs;
+    std::shared_ptr<void> cuda_scale;
+#endif
     bool empty() const { return f.empty() && raw.empty(); }
 };
 
@@ -210,6 +262,8 @@ struct LayerWeights {
     std::vector<float> k_norm;        // DenseQuirks::qk_norm, dim head_dim
     std::vector<float> post_attn_norm; // DenseQuirks::sandwich_norm, dim n_embd
     std::vector<float> post_ffn_norm;  // DenseQuirks::sandwich_norm, dim n_embd
+    MatVec attn_gate; // DenseQuirks::attn_gate, shape [n_head, n_embd]:
+                      // one output row per HEAD, not per channel
     MatVec router; // DenseConfig::n_expert>0, shape [n_expert, n_embd] (ffn_gate_inp)
     std::vector<float> router_bias; // DenseQuirks::moe_has_sel_bias, dim n_expert, optional
 
@@ -267,7 +321,7 @@ class DenseForward : public IForwardEngine {
 public:
     ~DenseForward() override;
     bool open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, uint64_t ram_budget_mb,
-              ExpertStore* experts, bool kv_quantized = false);
+              ExpertStore* experts, bool kv_quantized = false, int32_t backend = 0);
     void reset_cache() override;
     // If all_logits != nullptr, it's filled with n_tokens*n_vocab logits
     // (one per batch position, not just the last): used by speculative
@@ -482,6 +536,29 @@ private:
     // scratch_ on every step, slower but with constant memory usage
     // independent of layer count).
     bool cache_enabled_ = false;
+    // True while load_matrix is populating a MatVec that lives for the
+    // whole session: the embedding and the output head (always
+    // persistent, loaded once in open()) or a layer that enters the
+    // weight cache (cache_enabled_). Used to decide whether it makes
+    // sense to load the weights to VRAM (see MatVec::cuda_qs): on a
+    // scratch buffer, reloaded from disk on every step, there would be
+    // nothing to reuse.
+    // cache_enabled_ CANNOT be used directly: it is computed AFTER
+    // load_embd() in open(), so the embedding and the output head would
+    // still see it as false — a measured bug, it cost 155 ms per token
+    // (the output head reloaded to VRAM on every token).
+    bool loading_persistent_ = false;
+#ifdef DESIREEIA_CUDA_ENABLED
+    // True when the device KV cache is allocated and aligned with the
+    // host one (see write_kv_cache / grow_cache). If the allocation fails
+    // it stays false and everything falls back to the CPU path, no
+    // half-measures: a partial device copy would silently give wrong
+    // results.
+    bool cuda_kv_ready_ = false;
+    // Filled by the DESIREEIA_CUDA_VERIFY debugging path only.
+    std::vector<float> verify_proj_gpu_;
+    uint32_t verify_layer_ = 0;
+#endif
     // Whether MoE layers keep their experts stacked and quantized inside the
     // layer (fast, but only sound while layers stay resident) or go one
     // expert at a time through ExpertStore. Decided at load, from whether the

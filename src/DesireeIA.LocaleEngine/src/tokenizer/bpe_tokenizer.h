@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_BPE_TOKENIZER_H
 #define DESIREEIA_BPE_TOKENIZER_H
 
@@ -9,14 +16,15 @@
 
 namespace desireeia {
 
-// Tokenizer BPE byte-level in stile GPT2 (usato da qwen2 e da molte
-// famiglie non-SentencePiece nei file GGUF, tag "tokenizer.ggml.model" =
-// "gpt2"). Nessuna dipendenza esterna.
+// Byte-level GPT2-style BPE tokenizer (used by qwen2 and many
+// non-SentencePiece families in GGUF files, tag "tokenizer.ggml.model" =
+// "gpt2"). No external dependency.
 //
-// Pipeline: pre-tokenizzazione in chunk (lettere/cifre/punteggiatura/spazi,
-// approssimazione del pattern regex GPT2 — non gestisce categorie Unicode
-// complete, gap noto) -> mappatura byte->unicode "visibile" (tabella GPT2
-// standard) -> merge BPE greedy per rank su ogni chunk -> lookup vocabolario.
+// Pipeline: pre-tokenization into chunks (letters/digits/punctuation/spaces,
+// an approximation of the GPT2 regex pattern — does not handle full
+// Unicode categories, known gap) -> byte->"visible" unicode mapping
+// (standard GPT2 table) -> greedy BPE merge by rank on each chunk ->
+// vocabulary lookup.
 class DESIREEIA_INTERNAL BpeTokenizer {
 public:
     bool load(const VocabData& vocab);
@@ -42,12 +50,12 @@ private:
 
     // Special-token cache (CONTROL/USER_DEFINED/UNKNOWN), sorted by
     // decreasing text length so the longest match wins.
-    // Serve perche' senza, marcatori come "<|im_start|>" (usati dai
-    // template di chat ChatML/Llama3/Phi/...) NON tokenizzavano affatto
-    // come voce atomica del vocabolario: finivano spezzettati dalla
-    // pre-tokenizzazione/merge BPE ordinaria in "<", "|", "im", "_",
-    // "start", "|", ">" — il modello non vedeva mai il vero token di
-    // controllo, e la generazione non si fermava piu' sul turno.
+    // Needed because, without it, markers like "<|im_start|>" (used by the
+    // ChatML/Llama3/Phi/... chat templates) did NOT tokenize at all as an
+    // atomic vocabulary entry: they ended up split apart by ordinary
+    // pre-tokenization/BPE merging into "<", "|", "im", "_", "start", "|",
+    // ">" — the model never saw the real control token, and generation no
+    // longer stopped at the turn boundary.
     std::vector<std::pair<std::string, int32_t>> special_tokens_;
 };
 

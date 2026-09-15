@@ -1,4 +1,11 @@
-﻿#include "engine.h"
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+#include "engine.h"
 #include "profile.h"
 #include "../quant/quant.h"
 #include <algorithm>
@@ -27,17 +34,17 @@ namespace desireeia {
 static inline __m256i mul_add_i8_pairs_avx2(const __m256i x, const __m256i y) {
     const __m256i ax = _mm256_sign_epi8(x, x);
     const __m256i sy = _mm256_sign_epi8(y, x);
-    return _mm256_maddubs_epi16(ax, sy); // 16x int16, somma a coppie adiacenti
+    return _mm256_maddubs_epi16(ax, sy); // 16x int16, summed in adjacent pairs
 }
 static inline __m256i sum_i16_pairs_i32_avx2(const __m256i x) {
     const __m256i ones = _mm256_set1_epi16(1);
     return _mm256_madd_epi16(ones, x); // 8x int32
 }
 
-// Riduzione orizzontale di un accumulatore float a 8 corsie. Fatta con
-// shuffle invece che con store su array + 8 somme scalari: quest'ultima
-// forma costringe a un round-trip in memoria (store-to-load forwarding)
-// proprio sul valore appena calcolato.
+// Horizontal reduction of an 8-lane float accumulator. Done with shuffles
+// instead of storing to an array and doing 8 scalar sums: the latter form
+// forces a round-trip through memory (store-to-load forwarding) on the
+// value that was just computed.
 static inline float hsmax_ps_avx2(__m256 v) {
     __m128 s = _mm_max_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
     s = _mm_max_ps(s, _mm_movehl_ps(s, s));
@@ -76,30 +83,30 @@ static float dot8_avx2(const int8_t* a, const int8_t* b, size_t n) {
     return static_cast<float>(acc);
 }
 
-// Come dot8_avx2 ma per n=32 fisso e SENZA la riduzione orizzontale finale
-// (ritorna il vettore di 8 somme parziali int32, non ancora sommate in uno
-// scalare). Usato quando il chiamante deve accumulare molti dot dello
-// stesso ordine di grandezza in fila (es. gli 8 sotto-blocchi da 32 di un
-// super-blocco Q4_K): fare la riduzione orizzontale (store in memoria + 8
-// somme scalari) una volta sola per riga invece che una volta per
-// sotto-blocco evita ~64 riduzioni ridondanti per riga su un modello
-// tipico (n_super=8, 8 sotto-dot/super-blocco). La combinazione con la
-// scala per-blocco avviene comunque in virgola mobile dopo la conversione
-// (cvtepi32_ps), quindi il risultato resta numericamente equivalente
-// (a meno di riordino in virgola mobile, come per il tiling a 2 righe).
+// Like dot8_avx2 but for a fixed n=32 and WITHOUT the final horizontal
+// reduction (returns the vector of 8 partial int32 sums, not yet summed
+// into a scalar). Used when the caller needs to accumulate many dots of
+// the same order of magnitude in a row (e.g. the eight 32-wide sub-blocks
+// of a Q4_K super-block): doing the horizontal reduction (store to memory
+// + 8 scalar sums) once per row instead of once per sub-block avoids
+// ~64 redundant reductions per row on a typical model (n_super=8, 8
+// sub-dots per super-block). The combination with the per-block scale
+// still happens in floating point after the conversion (cvtepi32_ps), so
+// the result remains numerically equivalent (up to floating-point
+// reordering, same as for the 2-row tiling).
 static __m256i dot8_avx2_i32(const int8_t* a, const int8_t* b) {
     const __m256i va = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a));
     const __m256i vb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(b));
     return sum_i16_pairs_i32_avx2(mul_add_i8_pairs_avx2(va, vb));
 }
 
-// Dot int8x16 dedicato (SSE4.1/SSSE3, sempre disponibile quando __AVX2__ e'
-// definito). dot8_avx2 richiede n>=32 per entrare nel suo loop AVX2 (sotto
-// soglia ricade tutta sullo scalare del tail loop): matmul_q6_k lavora
-// pero' su sotto-blocchi da esattamente 16 elementi (scala per sotto-
-// blocco Q6_K), quindi con dot8_avx2 quei dot NON erano mai vettorizzati.
-// Scoperto misurando col profiler (core/profile.h), non ipotizzato. Stessa
-// tecnica maddubs di dot8_avx2 sopra, a 128 bit.
+// Dedicated int8x16 dot (SSE4.1/SSSE3, always available when __AVX2__ is
+// defined). dot8_avx2 requires n>=32 to enter its AVX2 loop (below that
+// threshold everything falls back to the scalar tail loop): matmul_q6_k,
+// however, works on sub-blocks of exactly 16 elements (per-sub-block scale
+// for Q6_K), so with dot8_avx2 those dots were NEVER vectorized. Discovered
+// by measuring with the profiler (core/profile.h), not guessed. Same
+// maddubs technique as dot8_avx2 above, at 128 bits.
 static inline __m128i mul_add_i8_pairs_sse(const __m128i x, const __m128i y) {
     const __m128i ax = _mm_sign_epi8(x, x);
     const __m128i sy = _mm_sign_epi8(y, x);
@@ -119,24 +126,24 @@ static float dot8_16(const int8_t* a, const int8_t* b) {
     return static_cast<float>(r[0] + r[1] + r[2] + r[3]);
 }
 
-// Come dot8_16 ma senza la riduzione orizzontale finale (vedi
-// dot8_avx2_i32: stesso principio, applicato alla dimensione a 16 usata
-// da Q6_K). matmul_q6_k fa 16 di questi dot per super-blocco (4 quadranti
-// x 2 meta'): differire la riduzione a una volta per riga invece che una
-// volta per dot evita altrettante riduzioni ridondanti.
+// Like dot8_16 but without the final horizontal reduction (see
+// dot8_avx2_i32: same principle, applied to the 16-wide dimension used by
+// Q6_K). matmul_q6_k does 16 of these dots per super-block (4 quadrants x
+// 2 halves): deferring the reduction to once per row instead of once per
+// dot avoids that many redundant reductions.
 static __m128i dot8_16_i32(const int8_t* a, const int8_t* b) {
     const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a));
     const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b));
     return sum_i16_pairs_i32_sse(mul_add_i8_pairs_sse(va, vb));
 }
 
-// Nota per sviluppi futuri: e' stata provata una versione AVX2 esplicita
-// dell'estrazione nibble sopra (shift a 16 bit + AND 0x0F, stesso trick di
-// dot8_avx2) sia per Q4_0 che Q4_K. Misurata: nessun guadagno reale (~6%
-// piu' lenta su 5 run ripetuti), verosimilmente perche' il loop scalare
-// e' gia' ben auto-vettorizzato da -O3 e gli intrinsics manuali aggiungono
-// solo latenza di store/reload. Rimossa, non tenuta: vedi
-// docs/engine_gap_analysis.md per i dettagli della misura.
+// Note for future work: an explicit AVX2 version of the nibble extraction
+// above (16-bit shift + AND 0x0F, same trick as dot8_avx2) was tried for
+// both Q4_0 and Q4_K. Measured: no real gain (~6% slower over 5 repeated
+// runs), most likely because the scalar loop is already well
+// auto-vectorized by -O3 and the manual intrinsics only add store/reload
+// latency. Removed, not kept: see docs/engine_gap_analysis.md for the
+// measurement details.
 #endif
 
 #if defined(__ARM_NEON)
@@ -160,15 +167,16 @@ static inline int32x4_t dot_i8x16_neon(int32x4_t acc, int8x16_t a, int8x16_t b) 
 #endif
 }
 
-// Equivalenti NEON di dot8_avx2/dot8_16/dot8_16_i32 (definiti sopra per
-// AVX2): stessa firma, stessa semantica, cosi' i ~15 call site sparsi nel
-// file possono aggiungere un ramo `#elif defined(__ARM_NEON)` che chiama
-// questi invece di duplicare la logica di estrazione nibble ogni volta.
+// NEON equivalents of dot8_avx2/dot8_16/dot8_16_i32 (defined above for
+// AVX2): same signature, same semantics, so the ~15 call sites scattered
+// through the file can add an `#elif defined(__ARM_NEON)` branch that
+// calls these instead of duplicating the nibble-extraction logic every
+// time.
 //
-// dot8_neon lavora a passi di 16 (un registro NEON), non 32 come dot8_avx2
-// (che ne processa 2 in un colpo, essendo AVX2 a 256 bit): la coda
-// scalare finale copre sia il caso n non multiplo di 16 sia, quando serve,
-// gli ultimi 16 elementi di un blocco da 32.
+// dot8_neon works in steps of 16 (one NEON register), not 32 like
+// dot8_avx2 (which processes 2 at once, since AVX2 is 256 bits wide): the
+// final scalar tail covers both the case where n is not a multiple of 16
+// and, when needed, the last 16 elements of a 32-wide block.
 static float dot8_neon(const int8_t* a, const int8_t* b, size_t n) {
     int32x4_t sum = vdupq_n_s32(0);
     size_t i = 0;
@@ -180,17 +188,17 @@ static float dot8_neon(const int8_t* a, const int8_t* b, size_t n) {
     return (float) acc;
 }
 
-// Equivalente NEON di dot8_16: n=16 fisso, CON riduzione a scalare.
+// NEON equivalent of dot8_16: fixed n=16, WITH reduction to scalar.
 static inline float dot8_16_neon(const int8_t* a, const int8_t* b) {
     const int32x4_t sum = dot_i8x16_neon(vdupq_n_s32(0), vld1q_s8(a), vld1q_s8(b));
     return (float) vaddvq_s32(sum);
 }
 
-// n=16 fisso, senza riduzione orizzontale (equivalente di dot8_16_i32):
-// usato dove il chiamante accumula molti dot da 16 elementi in fila prima
-// di convertire una sola volta in float (stessa idea di dot8_avx2_i32/
-// dot8_16_i32, qui a 128 bit — che e' gia' la larghezza nativa NEON, quindi
-// non serve una variante "larga" separata come su AVX2).
+// Fixed n=16, without horizontal reduction (equivalent of dot8_16_i32):
+// used where the caller accumulates many 16-element dots in a row before
+// converting to float just once (same idea as dot8_avx2_i32/dot8_16_i32,
+// here at 128 bits — which is already NEON's native width, so no separate
+// "wide" variant is needed like on AVX2).
 static inline int32x4_t dot16_neon_i32(const int8_t* a, const int8_t* b) {
     return dot_i8x16_neon(vdupq_n_s32(0), vld1q_s8(a), vld1q_s8(b));
 }
@@ -270,8 +278,8 @@ int quantized_matmul(const std::vector<float>& a, const std::vector<float>& b,
 }
 
 namespace {
-// Stessa funzione di quant.cpp (non esposta in quant.h): estrae scala e
-// minimo a 6 bit dal blocco scales[12] di un super-blocco Q4_K/Q5_K.
+// Same function as in quant.cpp (not exposed in quant.h): extracts the
+// 6-bit scale and min from the scales[12] block of a Q4_K/Q5_K super-block.
 inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
     if (j < 4) {
         *d = q[j] & 63; *m = q[j + 4] & 63;
@@ -347,9 +355,9 @@ int matmul_q8_0(const uint8_t* q8_data, size_t rows, size_t cols, const float* x
     {
     ScopedTimer t(profile_counters().ns_q80_compute);
     parallel_rows(rows, [&](size_t r0, size_t r1) {
-        // Tiling a 2 righe (stessa tecnica di matmul_q4_k/matmul_q6_k):
-        // nessun nibble da spacchettare qui (Q8_0 e' gia' int8), quindi il
-        // guadagno e' solo dare 2 catene di dot indipendenti per iterazione.
+        // 2-row tiling (same technique as matmul_q4_k/matmul_q6_k): no
+        // nibble to unpack here (Q8_0 is already int8), so the gain is
+        // just from giving 2 independent dot chains per iteration.
         size_t r = r0;
         for (; r + 1 < r1; r += 2) {
             const uint8_t* row0 = q8_data + (r + 0) * row_bytes;
@@ -437,14 +445,14 @@ int matmul_q8_0_batch(const uint8_t* q8_data, size_t rows, size_t cols,
         // local variables (not an indexed array), so the compiler can
         // keep them in registers for the whole reduction over b, the way
         // a real GEMM microkernel does.
-        // Costo: i byte del peso vengono riletti una volta per blocco di
-        // 4 token invece che una sola volta per l'intera riga (traffico
-        // di lettura pesi diviso per RN=4 invece che per n_tok) â€” ma
-        // restano quasi certamente in L1/L2 fra un blocco di token e il
-        // successivo (righe piccole, poche decine di byte), quindi il
-        // costo reale e' basso rispetto al guadagno di avere accumulatori
-        // davvero in registro. Misurato prima di tenerlo (regola di
-        // sviluppo): vedi docs/engine_gap_analysis.md.
+        // Cost: the weight bytes get re-read once per block of 4 tokens
+        // instead of just once for the whole row (weight-read traffic
+        // divided by RN=4 instead of by n_tok) — but they almost certainly
+        // stay in L1/L2 between one token block and the next (small rows,
+        // a few dozen bytes), so the real cost is low compared to the gain
+        // from having accumulators that truly live in registers. Measured
+        // before keeping it (development rule): see
+        // docs/engine_gap_analysis.md.
         size_t r = r0;
         for (; r + 1 < r1; r += 2) {
             const uint8_t* row_ptr0 = q8_data + (r + 0) * row_bytes;
@@ -1014,13 +1022,13 @@ int matmul_q2_k(const uint8_t* data, size_t rows, size_t cols, const float* x, f
         ScopedTimer t(profile_counters().ns_quantize_act);
         quantize_q8_0(x, cols, xq, xscale, unused_signs);
     }
-    // Sotto-blocchi Q2_K sono da 16 (non 32 come l'attivazione): xscale/xq
-    // restano block-32, ma il termine "min" va sommato su range da 16, per
-    // cui serve la somma delle attivazioni quantizzate su 16 elementi (non
-    // sui 32 usati da Q4_K/Q5_K). Nota: essendo un sotto-range di un blocco
-    // da 32 con la STESSA scala xscale (il blocco Q8_0 dell'attivazione e'
-    // piu' largo del sotto-blocco Q2_K), non serve una scala diversa,
-    // solo una somma piu' fine.
+    // Q2_K sub-blocks are 16 wide (not 32 like the activation): xscale/xq
+    // stay block-32, but the "min" term has to be summed over ranges of 16,
+    // which requires the sum of the quantized activations over 16 elements
+    // (not the 32 used by Q4_K/Q5_K). Note: since this is a sub-range of a
+    // 32-wide block with the SAME xscale (the activation's Q8_0 block is
+    // wider than the Q2_K sub-block), no separate scale is needed, just a
+    // finer-grained sum.
     std::vector<int32_t> xsum16(n_sub16);
     for (size_t sb = 0; sb < n_sub16; ++sb) {
         int32_t s = 0;
@@ -1349,16 +1357,17 @@ void quantize_q8_k_super(const float* x, size_t cols, std::vector<int8_t>& q, st
 // exposes the same per-32 arrays the kernels used with Q8_0: the scale is
 // REPLICATED across the 8 slots of the super-block.
 //
-// Il punto non e' risparmiare sulla quantizzazione â€” e' che, con la scala
-// costante dentro il super-blocco, il kernel puo' accumulare TUTTI e 8 i
-// sotto-blocchi nel dominio intero e fare una sola conversione/
-// moltiplicazione float ogni 256 pesi invece di otto. Con la scala per-32
-// questo e' impossibile, perche' ogni sotto-blocco va riportato in float
-// prima di poter essere sommato agli altri.
+// The point isn't saving on the quantization itself — it's that, with a
+// constant scale inside the super-block, the kernel can accumulate ALL 8
+// sub-blocks in the integer domain and do a single float conversion/
+// multiply every 256 weights instead of eight. With the per-32 scale this
+// is impossible, because every sub-block has to be brought back to float
+// before it can be summed with the others.
 //
-// La replica mantiene compatibili i kernel non ancora convertiti (Q5_K,
-// Q6_K), che continuano a leggere xscale[sub] senza sapere che ora e'
-// costante a tratti: nessuna doppia quantizzazione, nessuna firma cambiata.
+// The replication keeps the kernels that haven't been converted yet
+// (Q5_K, Q6_K) compatible, since they keep reading xscale[sub] without
+// knowing it is now piecewise-constant: no double quantization, no
+// signature change.
 void quantize_act_q8k_rep(const float* x, size_t cols, std::vector<int8_t>& q,
                           std::vector<float>& xscale32, std::vector<int32_t>& xsum32) {
     const size_t n_super = cols / QK_K;
@@ -1370,10 +1379,10 @@ void quantize_act_q8k_rep(const float* x, size_t cols, std::vector<int8_t>& q,
         const float* xs = x + s * QK_K;
         int8_t* qs = q.data() + s * QK_K;
 #if defined(__AVX2__)
-        // Versione vettoriale. La scalare costava ~19 cicli per valore
-        // (misurati 3,5 ms per token su ~550000 valori, la voce seriale piu'
-        // pesante dopo l'attivazione): lrintf scalare e' lento e il
-        // compilatore non puo' vettorizzare da solo per via dei clamp.
+        // Vectorized version. The scalar version cost ~19 cycles per value
+        // (measured at 3.5 ms per token over ~550000 values, the heaviest
+        // serial item after the activation itself): scalar lrintf is slow
+        // and the compiler can't auto-vectorize it because of the clamps.
         const __m256i absmask = _mm256_set1_epi32(0x7FFFFFFF);
         __m256 vmax = _mm256_setzero_ps();
         for (int j = 0; j < QK_K; j += 8) {
@@ -1386,25 +1395,25 @@ void quantize_act_q8k_rep(const float* x, size_t cols, std::vector<int8_t>& q,
 
         const __m256 vid = _mm256_set1_ps(id);
         for (int sb = 0; sb < QK_K / 32; ++sb) {
-            // I 32 valori del sotto-blocco in quattro vettori, convertiti a
-            // int32 con arrotondamento al pari (come lrintf in modalita'
-            // predefinita), poi impacchettati a int8 con saturazione.
+            // The 32 sub-block values in four vectors, converted to int32
+            // with round-to-even (like lrintf in its default mode), then
+            // packed into int8 with saturation.
             __m256i i0 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xs + sb * 32 +  0), vid));
             __m256i i1 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xs + sb * 32 +  8), vid));
             __m256i i2 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xs + sb * 32 + 16), vid));
             __m256i i3 = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(xs + sb * 32 + 24), vid));
 
-            // La somma del sotto-blocco si ricava qui in int32, senza un
-            // secondo passaggio di lettura sui byte gia' scritti.
+            // The sub-block sum is derived here in int32, without a second
+            // read pass over the already-written bytes.
             const __m256i vsum = _mm256_add_epi32(_mm256_add_epi32(i0, i1),
                                                   _mm256_add_epi32(i2, i3));
 
-            // packs satura a [-128,127]; il -128 non si presenta perche'
-            // |x*id| <= 127 per costruzione di id.
-            __m256i p01 = _mm256_packs_epi32(i0, i1);   // corsie: [i0.lo i1.lo | i0.hi i1.hi]
+            // packs saturates to [-128,127]; -128 never occurs because
+            // |x*id| <= 127 by construction of id.
+            __m256i p01 = _mm256_packs_epi32(i0, i1);   // lanes: [i0.lo i1.lo | i0.hi i1.hi]
             __m256i p23 = _mm256_packs_epi32(i2, i3);
             __m256i p   = _mm256_packs_epi16(p01, p23);
-            // packs lavora per corsie da 128 bit: rimette in ordine i gruppi.
+            // packs operates per 128-bit lane: this puts the groups back in order.
             p = _mm256_permutevar8x32_epi32(p, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7));
             _mm256_storeu_si256(reinterpret_cast<__m256i*>(qs + sb * 32), p);
 
@@ -1413,17 +1422,17 @@ void quantize_act_q8k_rep(const float* x, size_t cols, std::vector<int8_t>& q,
             xsum32[idx] = hsum_epi32_avx2(vsum);
         }
 #elif defined(__ARM_NEON)
-        // Stessa logica della versione AVX2 sopra, con le stesse garanzie:
-        // `id` e' calcolato in modo che |x*id| <= 127 per costruzione,
-        // quindi la somma dei valori PRIMA della saturazione a int8
-        // coincide esattamente con la somma dei valori FINALI — si somma
-        // quindi il vettore int32 pre-narrow, non serve un secondo giro
-        // sui byte scritti.
+        // Same logic as the AVX2 version above, with the same guarantees:
+        // `id` is computed so that |x*id| <= 127 by construction, so the
+        // sum of the values BEFORE saturation to int8 coincides exactly
+        // with the sum of the FINAL values — so the pre-narrow int32
+        // vector is summed, no need for a second pass over the written
+        // bytes.
         //
-        // vcvtnq_s32_f32/vmaxvq_f32 sono intrinseche AArch64 (non ARMv7):
-        // coerente col resto del file, che gia' assume aarch64 (vaddvq_s32
-        // in dot_i8x16_neon) — il vincolo del progetto e' macOS Apple
-        // Silicon e Linux ARM, entrambi aarch64.
+        // vcvtnq_s32_f32/vmaxvq_f32 are AArch64 intrinsics (not ARMv7):
+        // consistent with the rest of the file, which already assumes
+        // aarch64 (vaddvq_s32 in dot_i8x16_neon) — the project's target is
+        // macOS Apple Silicon and Linux ARM, both aarch64.
         float32x4_t vmax4 = vdupq_n_f32(0.0f);
         for (int j = 0; j < QK_K; j += 4) {
             vmax4 = vmaxq_f32(vmax4, vabsq_f32(vld1q_f32(xs + j)));
@@ -1435,11 +1444,11 @@ void quantize_act_q8k_rep(const float* x, size_t cols, std::vector<int8_t>& q,
         for (int sb = 0; sb < QK_K / 32; ++sb) {
             const float* xb = xs + sb * 32;
             int32x4_t sum32 = vdupq_n_s32(0);
-            // Le 32 attivazioni del sotto-blocco si convertono in due meta'
-            // da 16 (4 vettori float32x4 ciascuna), poi si restringono in
-            // cascata: int32 -> int16 (vqmovn, satura) -> int8 (vqmovn,
-            // satura di nuovo — la doppia saturazione e' innocua perche'
-            // per costruzione i valori non escono mai da [-127,127]).
+            // The 32 sub-block activations are converted in two halves of
+            // 16 (4 float32x4 vectors each), then narrowed in cascade:
+            // int32 -> int16 (vqmovn, saturates) -> int8 (vqmovn,
+            // saturates again — the double saturation is harmless because
+            // by construction the values never leave [-127,127]).
             int8x16_t out[2];
             for (int half = 0; half < 2; ++half) {
                 const int32x4_t i0 = vcvtnq_s32_f32(vmulq_n_f32(vld1q_f32(xb + half * 16 +  0), id));
@@ -1480,14 +1489,15 @@ void quantize_act_q8k_rep(const float* x, size_t cols, std::vector<int8_t>& q,
 }
 
 namespace {
-// Nucleo di matmul_q4_k, estratto per essere richiamabile sia col path
-// normale (quantizza l'attivazione al suo interno) sia col path
-// "pre-quantizzato" matmul_q4_k_pq (Fase "elimina ri-quantizzazione
-// ridondante", 2026-09-07): wq/wk/wo/ffn_gate/ffn_up di un modello Q4_K_M
-// leggono TUTTI dalla stessa attivazione (rispettivamente l'uscita di
-// attn_norm/ffn_norm), ma essendo formati diversi (Q4_K/Q6_K) chiamavano
-// ciascuno la propria matmul_qX_k che riquantizzava l'attivazione da
-// capo â€” fino a 5 volte la stessa quantizzazione per layer. Dato che
+// Core of matmul_q4_k, extracted so it can be called both from the normal
+// path (quantizes the activation internally) and from the
+// "pre-quantized" path matmul_q4_k_pq ("eliminate redundant
+// re-quantization" phase, 2026-09-07): wq/wk/wo/ffn_gate/ffn_up of a
+// Q4_K_M model ALL read from the same activation (the output of
+// attn_norm/ffn_norm respectively), but being different formats
+// (Q4_K/Q6_K) each one used to call its own matmul_qX_k, which
+// requantized the activation from scratch — up to 5 times the same
+// quantization per layer. Given that
 // Q4_K/Q5_K/Q6_K now share the same activation quantization scheme
 // (quantize_q8_k_super), so it can be computed once in dense_forward.cpp
 // and reused across every matmul_qX_k_pq call in the layer.
@@ -1536,19 +1546,20 @@ int matmul_q4_k_core(const uint8_t* q4k_data, size_t rows, size_t cols,
         const float dmin = desireeia_fp16_to_fp32(blk.dmin);
         const uint8_t* q = blk.qs;
 
-        // FASE SCALARE, tutta in testa e fuori dal loop vettoriale.
-        // Prima le 8 scale/minimi venivano spacchettati DENTRO il loop, due
-        // per gruppo: get_scale_min_k4 e' pieno di rami e manipolazione di
-        // bit, e intercalarlo alle istruzioni SIMD teneva le unita'
-        // vettoriali ferme ad aspettare. Contate ~20 operazioni scalari
-        // ogni 32 byte di pesi, contro ~16 vettoriali: il loop era in
-        // realta' limitato dalla parte scalare, non dal calcolo utile.
-        // Separandole, il motore out-of-order puo' sovrapporre le due fasi.
-        // Qui si precalcola direttamente il prodotto finale d*scala*xscale,
-        // cosi' nel loop resta solo un broadcast da memoria.
-        // L'attivazione e' quantizzata Q8_K: una sola scala per super-blocco,
-        // replicata nelle 8 caselle per-32 (vedi quantize_act_q8k_rep). E'
-        // questo che permette l'accumulazione intera piu' sotto.
+        // SCALAR PHASE, all done up front and outside the vector loop.
+        // Previously the 8 scales/mins were unpacked INSIDE the loop, two
+        // per group: get_scale_min_k4 is full of branches and bit
+        // manipulation, and interleaving it with the SIMD instructions
+        // kept the vector units idle waiting. Counted ~20 scalar operations
+        // per 32 bytes of weights, against ~16 vector ones: the loop was
+        // actually limited by the scalar part, not by the useful compute.
+        // By separating them, the out-of-order engine can overlap the two
+        // phases. Here the final product d*scale*xscale is precomputed
+        // directly, so inside the loop only a broadcast from memory
+        // remains. The activation is Q8_K-quantized: a single scale per
+        // super-block, replicated across the 8 per-32 slots (see
+        // quantize_act_q8k_rep). This is what enables the integer
+        // accumulation further below.
         const float dx = xscale[sub0];
         float min_acc = 0.0f;
         uint8_t sc8[QK_K / 32];
@@ -1561,23 +1572,24 @@ int matmul_q4_k_core(const uint8_t* q4k_data, size_t rows, size_t cols,
 
         int is = 0;
 #if defined(__AVX2__)
-        // DUE accumulatori indipendenti, non uno. Con un accumulatore solo
-        // i due add_ps di ogni gruppo formano una catena di dipendenze
-        // seriale: ogni add deve attendere il precedente (~4 cicli di
-        // latenza), e il loop diventa latency-bound invece che
-        // throughput-bound. Misurato: giravamo al 24% della banda di
-        // memoria disponibile a QUALSIASI numero di thread â€” sintomo di
-        // stallo per dipendenza, non di saturazione della memoria.
-        // I due sotto-blocchi A e B sono indipendenti, quindi possono
-        // accumulare in parallelo e sommarsi solo alla fine.
+        // TWO independent accumulators, not one. With a single accumulator
+        // the two add_ps per group form a serial dependency chain: each
+        // add has to wait for the previous one (~4 cycles of latency), and
+        // the loop becomes latency-bound instead of throughput-bound.
+        // Measured: we were running at 24% of the available memory
+        // bandwidth at ANY thread count — a symptom of a dependency stall,
+        // not of memory saturation. The two sub-blocks A and B are
+        // independent, so they can accumulate in parallel and only be
+        // summed at the end.
         //
-        // Gli accumulatori sono INTERI, non float: la scala a 6 bit del peso
-        // viene applicata nel dominio intero con madd_epi16 (stessa tecnica
-        // gia' usata in q6k_group128_avx2), quindi tutti e 8 i sotto-blocchi
-        // si sommano fra loro senza mai passare in virgola mobile. Resta una
-        // sola cvtepi32_ps + moltiplicazione ogni 256 pesi invece di otto.
-        // Nessun overflow: maddubs sta in +-3810, per la scala (<=63) fa
-        // 240030, sommato su 8 sotto-blocchi resta ben dentro int32.
+        // The accumulators are INTEGER, not float: the weight's 6-bit
+        // scale is applied in the integer domain with madd_epi16 (same
+        // technique already used in q6k_group128_avx2), so all 8
+        // sub-blocks get summed together without ever passing through
+        // floating point. Only a single cvtepi32_ps + multiply remains
+        // every 256 weights instead of eight. No overflow: maddubs stays
+        // within +-3810, times the scale (<=63) gives 240030, summed over
+        // 8 sub-blocks stays well inside int32.
         __m256i sumiA = _mm256_setzero_si256();
         __m256i sumiB = _mm256_setzero_si256();
 #elif defined(__ARM_NEON)
@@ -1606,38 +1618,38 @@ int matmul_q4_k_core(const uint8_t* q4k_data, size_t rows, size_t cols,
             const int8_t* xA = xq + subA * 32;
             const int8_t* xB = xq + subB * 32;
 #if defined(__AVX2__)
-            // I 32 byte impacchettati contengono 64 pesi: i nibble bassi
-            // sono il sotto-blocco A, quelli alti il sotto-blocco B. Si
-            // spacchettano IN REGISTRO e si danno subito in pasto a
-            // maddubs, senza mai passare da un array di stack: e' questa
-            // la differenza col tentativo descritto a inizio file (che
-            // spacchettava in registro ma poi ristoccava in wA[]/wB[] e
-            // ricaricava, annullando il guadagno con lo store-to-load).
+            // The 32 packed bytes contain 64 weights: the low nibbles are
+            // sub-block A, the high ones sub-block B. They are unpacked
+            // IN-REGISTER and fed straight into maddubs, without ever
+            // passing through a stack array: this is the difference from
+            // the attempt described at the top of the file (which unpacked
+            // in-register but then re-stored into wA[]/wB[] and reloaded,
+            // cancelling the gain with a store-to-load).
             //
-            // In piu' qui si sfrutta un fatto specifico di Q4_K che il
-            // percorso generico dot8_avx2_i32 non puo' sfruttare: i pesi
-            // sono UNSIGNED 0..15 (il minimo e' gestito a parte da dmin),
-            // e maddubs vuole esattamente un operando unsigned e uno
-            // signed. Quindi entrano diretti, senza la coppia sign_epi8
-            // del trucco per operandi entrambi signed. Nessun overflow:
-            // il massimo per coppia e' 2*15*127 = 3810, dentro int16.
+            // On top of that, this exploits a fact specific to Q4_K that
+            // the generic dot8_avx2_i32 path can't: the weights are
+            // UNSIGNED 0..15 (the min is handled separately via dmin), and
+            // maddubs wants exactly one unsigned and one signed operand.
+            // So they go in directly, without the sign_epi8 pair needed
+            // for the both-signed trick. No overflow: the max per pair is
+            // 2*15*127 = 3810, well within int16.
             const __m256i packed = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(q));
             const __m256i wA = _mm256_and_si256(packed, _mm256_set1_epi8(0x0F));
             const __m256i wB = _mm256_and_si256(_mm256_srli_epi16(packed, 4), _mm256_set1_epi8(0x0F));
             const __m256i vxA = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xA));
             const __m256i vxB = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xB));
-            // La scala del peso entra qui, in int16, invece che dopo in float.
+            // The weight's scale enters here, in int16, instead of later in float.
             sumiA = _mm256_add_epi32(sumiA, _mm256_madd_epi16(
                 _mm256_set1_epi16((short) sc8[is + 0]), _mm256_maddubs_epi16(wA, vxA)));
             sumiB = _mm256_add_epi32(sumiB, _mm256_madd_epi16(
                 _mm256_set1_epi16((short) sc8[is + 1]), _mm256_maddubs_epi16(wB, vxB)));
 #elif defined(__ARM_NEON)
-            // 32 byte impacchettati = 64 pesi (32 per A nei nibble bassi, 32
-            // per B negli alti), letti in due meta' da 16 byte perche' i
-            // registri NEON sono a 128 bit contro i 256 di AVX2. I pesi
-            // 0..15 restano validi come int8 con segno senza bisogno del
-            // trucco unsigned/signed di maddubs (il bit di segno non e' mai
-            // impostato per un nibble).
+            // 32 packed bytes = 64 weights (32 for A in the low nibbles, 32
+            // for B in the high ones), read in two 16-byte halves because
+            // NEON registers are 128 bits wide against AVX2's 256. The
+            // 0..15 weights remain valid as signed int8 without needing
+            // maddubs's unsigned/signed trick (the sign bit is never set
+            // for a nibble).
             const uint8x16_t p0 = vld1q_u8(q);
             const uint8x16_t p1 = vld1q_u8(q + 16);
             const uint8x16_t m4 = vdupq_n_u8(0x0F);
@@ -1671,7 +1683,7 @@ int matmul_q4_k_core(const uint8_t* q4k_data, size_t rows, size_t cols,
             is += 2;
         }
 #if defined(__AVX2__)
-        // UNA sola conversione + moltiplicazione per super-blocco.
+        // A single conversion + multiplication per super-block.
         const float acc = d * dx * hsum_ps_avx2(
             _mm256_cvtepi32_ps(_mm256_add_epi32(sumiA, sumiB)));
 #elif defined(__ARM_NEON)
@@ -1784,12 +1796,12 @@ int matmul_q4_0_batch(const uint8_t* q4_data, size_t rows, size_t cols,
 
 int matmul_q4_k_batch(const uint8_t* q4k_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
-    // REVERT DI CORRETTEZZA (2026-09-07): il tile 2x4 con quantizzazione
-    // Q8_K (vedi la nota in matmul_q4_k_core) produceva output corrotto
-    // su un modello reale. Finche' non si riscrive il tile con la
-    // quantizzazione fine (Q8_0 per sotto-blocco da 32), si ricade sulla
-    // versione a singola colonna gia' corretta, riga per riga. Piu' lento
-    // (nessun riuso del peso decodificato fra colonne), ma corretto.
+    // CORRECTNESS REVERT (2026-09-07): the 2x4 tile with Q8_K quantization
+    // (see the note in matmul_q4_k_core) produced corrupted output on a
+    // real model. Until the tile is rewritten with fine-grained
+    // quantization (Q8_0 per 32-wide sub-block), this falls back to the
+    // already-correct single-column version, row by row. Slower (no reuse
+    // of the decoded weight across columns), but correct.
     if (n_tok == 0) return DESIREEIA_OK;
     if (cols == 0 || cols % QK_K != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
     for (size_t tk = 0; tk < n_tok; ++tk) {
@@ -1801,7 +1813,7 @@ int matmul_q4_k_batch(const uint8_t* q4k_data, size_t rows, size_t cols,
 
 int matmul_q6_k_batch(const uint8_t* q6k_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
-    // Stesso revert di matmul_q4_k_batch sopra, stessa motivazione.
+    // Same revert as matmul_q4_k_batch above, same reasoning.
     if (n_tok == 0) return DESIREEIA_OK;
     if (cols == 0 || cols % QK_K != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
     for (size_t tk = 0; tk < n_tok; ++tk) {
@@ -1811,8 +1823,8 @@ int matmul_q6_k_batch(const uint8_t* q6k_data, size_t rows, size_t cols,
     return DESIREEIA_OK;
 }
 
-// REVERT DI CORRETTEZZA (2026-09-07): stessa motivazione di matmul_q4_k
-// sopra, quantizzazione tornata a Q8_0 per sotto-blocco da 32.
+// CORRECTNESS REVERT (2026-09-07): same reasoning as matmul_q4_k above,
+// quantization reverted to Q8_0 per 32-wide sub-block.
 int matmul_q5_k(const uint8_t* q5k_data, size_t rows, size_t cols, const float* x, float* y) {
     if (cols == 0 || cols % QK_K != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
     const size_t n_super = cols / QK_K;
@@ -1871,13 +1883,13 @@ int matmul_q5_k(const uint8_t* q5k_data, size_t rows, size_t cols, const float* 
             acc_vec = _mm256_add_ps(acc_vec, _mm256_mul_ps(dotA_f, _mm256_set1_ps(d1 * xscale[subA])));
             acc_vec = _mm256_add_ps(acc_vec, _mm256_mul_ps(dotB_f, _mm256_set1_ps(d2 * xscale[subB])));
 #elif defined(__ARM_NEON)
-            // Pesi Q5_K: 5 bit (0..31), sicuri come int8 con segno (mai
-            // impostato il bit 7). Stesso schema scalare-accumulate di
-            // Q4_K/Q6_K NEON: riduzione a vaddvq_s32, moltiplicazione per
-            // la scala, accumulo in float (qui non nel dominio intero
-            // perche' l'attivazione Q5_K resta a scala per-32, non Q8_K
-            // per-256 come Q4_K/Q6_K — vedi il commento REVERT DI
-            // CORRETTEZZA in testa a questa funzione).
+            // Q5_K weights: 5 bits (0..31), safe as signed int8 (bit 7 is
+            // never set). Same scalar-accumulate scheme as the Q4_K/Q6_K
+            // NEON paths: reduce with vaddvq_s32, multiply by the scale,
+            // accumulate in float (not in the integer domain here, because
+            // the Q5_K activation stays at per-32 scale, not per-256 Q8_K
+            // like Q4_K/Q6_K — see the CORRECTNESS REVERT comment at the
+            // top of this function).
             const int32x4_t dA = dot_i8x16_neon(
                 dot_i8x16_neon(vdupq_n_s32(0), vld1q_s8(wA), vld1q_s8(xA)),
                 vld1q_s8(wA + 16), vld1q_s8(xA + 16));
@@ -1926,8 +1938,8 @@ int matmul_q5_k(const uint8_t* q5k_data, size_t rows, size_t cols, const float* 
 
 int matmul_q5_k_batch(const uint8_t* q5k_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
-    // Stesso revert di matmul_q4_k_batch, stessa motivazione: ricade sulla
-    // versione a singola colonna, gia' corretta.
+    // Same revert as matmul_q4_k_batch, same reasoning: falls back to the
+    // already-correct single-column version.
     if (n_tok == 0) return DESIREEIA_OK;
     if (cols == 0 || cols % QK_K != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
     for (size_t tk = 0; tk < n_tok; ++tk) {
@@ -1938,33 +1950,35 @@ int matmul_q5_k_batch(const uint8_t* q5k_data, size_t rows, size_t cols,
 }
 
 namespace {
-// REVERT DI CORRETTEZZA (2026-09-07): vedi la nota completa in
-// matmul_q4_k_core sopra. Tornati alla quantizzazione per sotto-blocco da
-// 16 (quantize_q8_0 dell'attivazione, poi usata a granularita' 32 con
-// indicizzazione /16 per Q6_K) invece del singolo scale Q8_K per 256.
+// CORRECTNESS REVERT (2026-09-07): see the full note in matmul_q4_k_core
+// above. Reverted to per-16 sub-block quantization (quantize_q8_0 of the
+// activation, then used at granularity 32 with /16 indexing for Q6_K)
+// instead of the single per-256 Q8_K scale.
 #if defined(__AVX2__)
-// Accumula il contributo di un gruppo di 128 pesi Q6_K (il gruppo naturale
-// del formato: 64 byte di nibble bassi + 32 byte di bit alti + 8 scale).
+// Accumulates the contribution of one group of 128 Q6_K weights (the
+// format's natural group: 64 bytes of low nibbles + 32 bytes of high bits
+// + 8 scales).
 //
-// Tre differenze rispetto alla versione precedente, tutte misurate:
-//  1. Larghezza piena. Prima si lavorava a 16 elementi (SSE, 128 bit)
-//     perche' la scala Q6_K e' per-16: meta' della larghezza vettoriale
-//     disponibile buttata su ogni singolo prodotto.
-//  2. Le scale per-16 sono applicate NEL DOMINIO INTERO con madd_epi16.
-//     I 32 byte di un vettore AVX2 si dividono in due corsie da 128 bit,
-//     e i primi 16 pesi finiscono esattamente nelle prime 8 lane int16:
-//     basta quindi un vettore di scale con sc[2q] nella corsia bassa e
-//     sc[2q+1] in quella alta. Cosi' resta UNA moltiplicazione float ogni
-//     32 pesi invece di due ogni 16.
-//  3. L'offset -32 dei pesi non viene applicato byte per byte (cosa che
-//     renderebbe i pesi signed e costringerebbe al trucco sign_epi8):
-//     si tiene w unsigned 0..63 e si sottrae 32*x nel dominio int16.
-//     Nessuna saturazione: maddubs(w,x) sta in [-16128, 16002],
-//     maddubs(32,x) in [-8128, 8128], la differenza in [-24256, 24130].
-// L'accumulatore e' INTERO: l'attivazione e' Q8_K (una scala per super-blocco,
-// vedi quantize_act_q8k_rep), quindi tutti i gruppi si sommano fra loro
-// nel dominio intero e la conversione in float avviene una sola volta per
-// super-blocco invece di una ogni 32 pesi.
+// Three differences from the previous version, all measured:
+//  1. Full width. Previously this worked on 16 elements (SSE, 128 bit)
+//     because the Q6_K scale is per-16: half the available vector width
+//     was wasted on every single product.
+//  2. The per-16 scales are applied IN THE INTEGER DOMAIN with
+//     madd_epi16. The 32 bytes of an AVX2 vector split into two 128-bit
+//     lanes, and the first 16 weights land exactly in the first 8 int16
+//     lanes: so a single scale vector with sc[2q] in the low lane and
+//     sc[2q+1] in the high one suffices. This leaves a SINGLE float
+//     multiply every 32 weights instead of two every 16.
+//  3. The weights' -32 offset is not applied byte by byte (which would
+//     make the weights signed and force the sign_epi8 trick): w is kept
+//     unsigned 0..63 and 32*x is subtracted in the int16 domain. No
+//     saturation: maddubs(w,x) stays within [-16128, 16002],
+//     maddubs(32,x) within [-8128, 8128], the difference within
+//     [-24256, 24130].
+// The accumulator is INTEGER: the activation is Q8_K (one scale per
+// super-block, see quantize_act_q8k_rep), so all the groups get summed
+// together in the integer domain and the conversion to float happens only
+// once per super-block instead of once every 32 weights.
 static inline __m256i q6k_group128_avx2(const uint8_t* ql, const uint8_t* qh,
                                         const int8_t* sc,
                                         const int8_t* x, __m256i acc) {
@@ -1975,9 +1989,9 @@ static inline __m256i q6k_group128_avx2(const uint8_t* ql, const uint8_t* qh,
     const __m256i qlH = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql + 32));
     const __m256i qhv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
 
-    // Gli shift sono a 16 bit (non esiste lo shift per byte in AVX2): i bit
-    // possono migrare fra i due byte della parola, ma l'AND successivo con
-    // m3/m4 ripulisce, quindi il risultato per byte resta esatto.
+    // The shifts are 16-bit (there's no per-byte shift in AVX2): bits can
+    // migrate between the word's two bytes, but the following AND with
+    // m3/m4 cleans it up, so the per-byte result stays exact.
     __m256i w[4];
     w[0] = _mm256_or_si256(_mm256_and_si256(qlL, m4),
                            _mm256_slli_epi16(_mm256_and_si256(qhv, m3), 4));
@@ -2000,18 +2014,19 @@ static inline __m256i q6k_group128_avx2(const uint8_t* ql, const uint8_t* qh,
 }
 
 #elif defined(__ARM_NEON)
-// Equivalente NEON di q6k_group128_avx2 sopra, ma strutturato come il
-// kernel Q4_K NEON: accumulo scalare int32 (scala moltiplicata subito dopo
-// la riduzione orizzontale), non accumulo vettoriale con scala nel dominio
-// SIMD. Motivazione identica: su NEON (128 bit, 4 corsie int32)
-// vaddvq_s32 e' una singola istruzione, quindi non c'e' nulla da
-// guadagnare a rimandare la riduzione.
+// NEON equivalent of q6k_group128_avx2 above, but structured like the
+// Q4_K NEON kernel: scalar int32 accumulation (scale multiplied right
+// after the horizontal reduction), not vector accumulation with the scale
+// in the SIMD domain. Same reasoning: on NEON (128 bit, 4 int32 lanes)
+// vaddvq_s32 is a single instruction, so there's nothing to gain by
+// deferring the reduction.
 //
-// Differenza dal ramo AVX2: la' l'offset -32 veniva sottratto con un
-// secondo maddubs (perche' maddubs vuole un operando unsigned, e i pesi
-// dopo -32 diventerebbero signed). NEON non ha questo vincolo — vmull_s8
-// accetta due operandi signed direttamente — quindi qui si sottrae 32 UNA
-// volta con vsubq_s8, prima del dot-product, non due maddubs per gruppo.
+// Difference from the AVX2 branch: there the -32 offset was subtracted
+// with a second maddubs (because maddubs wants one unsigned operand, and
+// the weights would become signed after -32). NEON has no such
+// constraint — vmull_s8 accepts two signed operands directly — so here 32
+// is subtracted ONCE with vsubq_s8, before the dot-product, not with two
+// maddubs per group.
 //
 // The 8 values returned by qh/ql cover 128 weights in four groups of 32
 // (w[0..3]), each split into two 16-wide halves with its own scale
@@ -2030,8 +2045,8 @@ static inline int32_t q6k_group128_neon(const uint8_t* ql, const uint8_t* qh,
     const uint8x16_t qh_a  = vld1q_u8(qh);
     const uint8x16_t qh_b  = vld1q_u8(qh + 16);
 
-    // Bit alti dei quattro gruppi, gia' posizionati nel nibble alto (<<4)
-    // cosi' l'OR con il nibble basso di ql ricompone il valore a 6 bit.
+    // High bits of the four groups, already positioned in the high nibble
+    // (<<4) so the OR with ql's low nibble reassembles the 6-bit value.
     const uint8x16_t h0_a = vshlq_n_u8(vandq_u8(qh_a, m3), 4);
     const uint8x16_t h0_b = vshlq_n_u8(vandq_u8(qh_b, m3), 4);
     const uint8x16_t h1_a = vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_a, 2), m3), 4);
@@ -2115,7 +2130,7 @@ int matmul_q6_k_core(const uint8_t* q6k_data, size_t rows, size_t cols,
 #endif
         }
 #if defined(__AVX2__)
-        // Una sola conversione in float per super-blocco.
+        // A single conversion to float per super-block.
         const float acc = d * xscale[out_base / 32]
                         * hsum_ps_avx2(_mm256_cvtepi32_ps(acc_vec));
 #elif defined(__ARM_NEON)
@@ -2151,11 +2166,11 @@ int matmul_q6_k_core(const uint8_t* q6k_data, size_t rows, size_t cols,
                     const uint8_t* ql_0 = ql0_0 + (n / 128) * 64; const uint8_t* qh_0 = qh0_0 + (n / 128) * 32; const int8_t* sc_0 = sc0_0 + (n / 128) * 8;
                     const uint8_t* ql_1 = ql0_1 + (n / 128) * 64; const uint8_t* qh_1 = qh0_1 + (n / 128) * 32; const int8_t* sc_1 = sc0_1 + (n / 128) * 8;
 #if defined(__AVX2__)
-                    // Le due righe condividono le stesse attivazioni: il
-                    // costo di quantizzazione e i load di x sono ammortizzati
-                    // su entrambe (e' il motivo per cui il tiling a 2 righe
-                    // resta, mentre a 4 era peggiorativo â€” vedi le note sul
-                    // tiling in docs/engine_gap_analysis.md).
+                    // The two rows share the same activations: the
+                    // quantization cost and the x loads are amortized
+                    // across both (this is why the 2-row tiling stays,
+                    // while 4-row made things worse — see the tiling notes
+                    // in docs/engine_gap_analysis.md).
                     const int8_t* x_grp = xq + out_base + n;
                     acc0_vec = q6k_group128_avx2(ql_0, qh_0, sc_0, x_grp, acc0_vec);
                     acc1_vec = q6k_group128_avx2(ql_1, qh_1, sc_1, x_grp, acc1_vec);
@@ -2195,9 +2210,10 @@ int matmul_q6_k_core(const uint8_t* q6k_data, size_t rows, size_t cols,
 #endif
                 }
 #if defined(__AVX2__)
-                // d cambia a ogni super-blocco, quindi l'accumulatore intero
-                // va riversato in float qui e azzerato: e' comunque UNA
-                // conversione ogni 256 pesi invece di una ogni 32.
+                // d changes at every super-block, so the integer
+                // accumulator has to be flushed to float here and reset:
+                // it's still ONE conversion every 256 weights instead of
+                // one every 32.
                 const float dx = xscale[out_base / 32];
                 acc0f += d0  * dx * hsum_ps_avx2(_mm256_cvtepi32_ps(acc0_vec));
                 acc1f += d1v * dx * hsum_ps_avx2(_mm256_cvtepi32_ps(acc1_vec));
@@ -2249,8 +2265,8 @@ int matmul_q6_k(const uint8_t* q6k_data, size_t rows, size_t cols, const float* 
     std::vector<int32_t> unused_xsum;
     {
         ScopedTimer t(profile_counters().ns_quantize_act);
-        // Q8_K: il kernel Q6_K accumula ora in interi e assume la scala
-        // costante dentro il super-blocco (vedi q6k_group128_avx2).
+        // Q8_K: the Q6_K kernel now accumulates in integers and assumes a
+        // constant scale inside the super-block (see q6k_group128_avx2).
         quantize_act_q8k_rep(x, cols, xq, xscale, unused_xsum);
     }
     return matmul_q6_k_core(q6k_data, rows, cols, xq.data(), xscale.data(), y);

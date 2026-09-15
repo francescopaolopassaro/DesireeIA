@@ -1,16 +1,23 @@
-// Microbenchmark dei kernel quantizzati.
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+// Microbenchmark of the quantized kernels.
 //
-// Perche' esiste: le misure end-to-end con la CLI su questo portatile
-// derivano del 30% fra un batch e l'altro per throttling termico (a parita'
-// di binario), pur essendo stabili al 5% dentro lo stesso batch. Confrontare
-// due varianti di kernel misurandole a minuti di distanza e' quindi privo di
-// significato — un "miglioramento" del 10% e' dentro la deriva. Qui si
-// misura il solo kernel, in pochi secondi, e si riporta il MIGLIORE di N
-// ripetizioni: il best-of e' robusto rispetto a throttling e interferenze
-// (entrambi possono solo rallentare, mai accelerare).
+// Why this exists: end-to-end measurements with the CLI on this laptop
+// drift by 30% between one batch and the next due to thermal throttling
+// (with the same binary), while being stable within 5% inside the same
+// batch. Comparing two kernel variants measured minutes apart is therefore
+// meaningless — a "10% improvement" is within the drift. Here only the
+// kernel is measured, in a few seconds, and the BEST of N repetitions is
+// reported: best-of is robust against throttling and interference (both can
+// only slow things down, never speed them up).
 //
-// Le dimensioni imitano i due matmul che dominano il decode di gemma3-4b
-// (misurato col profiler: q4k ~62%, q6k ~31% del tempo).
+// The dimensions mimic the two matmuls that dominate gemma3-4b's decode
+// (measured with the profiler: q4k ~62%, q6k ~31% of the time).
 #include "../src/DesireeIA.LocaleEngine/src/core/engine.h"
 #include "../src/DesireeIA.LocaleEngine/src/quant/quant.h"
 #include "../src/DesireeIA.LocaleEngine/src/core/thread_pool.h"
@@ -48,10 +55,10 @@ double bench(const char* name, size_t rows, size_t cols, size_t bytes_per_row,
 
 int main(int argc, char** argv) {
     int reps = argc > 1 ? atoi(argv[1]) : 7;
-    // argv[2] = parallelismo totale. Va fissato PRIMA della prima matmul,
-    // perche' il pool globale si costruisce pigramente una volta sola.
-    // Serve perche' il default (tutti i thread logici) sovraccarica i core
-    // fisici, e con l'attesa attiva l'oversubscription e' devastante.
+    // argv[2] = total parallelism. Must be set BEFORE the first matmul,
+    // because the global pool is lazily constructed only once. Needed
+    // because the default (all logical threads) oversubscribes the physical
+    // cores, and with busy-waiting the oversubscription is devastating.
     const int threads = argc > 2 ? atoi(argv[2]) : 0;
     if (threads > 0) ThreadPool::set_thread_override((size_t) threads);
     printf("threads=%s\n", threads > 0 ? argv[2] : "default");
@@ -60,26 +67,26 @@ int main(int argc, char** argv) {
     std::uniform_int_distribution<int> byte_dist(0, 255);
     std::uniform_real_distribution<float> fdist(-1.0f, 1.0f);
 
-    // DUE REGIMI, e la differenza fra i due e' il punto di questo strumento.
+    // TWO REGIMES, and the difference between them is the whole point of
+    // this tool.
     //
-    // Errore commesso il 2026-09-07 e corretto qui: la prima versione usava
-    // solo la matrice piccola (2560x10240 = 14,7 MB) riusata a ogni
-    // ripetizione. Su questa CPU la L3 e' 24 MB, quindi i pesi restavano
-    // CALDI IN CACHE e il benchmark misurava un regime che nel motore vero
-    // non esiste mai: durante il decode ogni tensore si legge una volta
-    // sola, in streaming dalla DRAM. Risultato: una modifica misurata +67%
-    // "in cache" si e' rivelata neutra end-to-end. Un benchmark che mente e'
-    // peggio di nessun benchmark.
+    // Mistake made on 2026-09-07 and fixed here: the first version used only
+    // the small matrix (2560x10240 = 14.7 MB) reused on every repetition. On
+    // this CPU the L3 is 24 MB, so the weights stayed HOT IN CACHE and the
+    // benchmark measured a regime that never exists in the real engine:
+    // during decode each tensor is read exactly once, streamed from DRAM.
+    // Result: a change measured at +67% "in cache" turned out to be neutral
+    // end-to-end. A benchmark that lies is worse than no benchmark.
     //
-    // - "L3"   : working set che sta in cache. Utile per isolare il costo di
-    //            CALCOLO puro del kernel (istruzioni, dipendenze).
-    // - "DRAM" : working set molto piu' grande della L3. E' il regime del
-    //            decode reale, ed e' l'unico che predice l'end-to-end.
-    // Guardare SEMPRE il numero DRAM per decidere se una modifica va tenuta.
+    // - "L3"   : working set that fits in cache. Useful for isolating the
+    //            pure COMPUTE cost of the kernel (instructions, dependencies).
+    // - "DRAM" : working set much larger than L3. This is the real decode
+    //            regime, and the only one that predicts end-to-end behavior.
+    // ALWAYS look at the DRAM number to decide whether a change should be kept.
     struct Regime { const char* tag; size_t rows; size_t cols; };
     const Regime regimes[] = {
-        { "L3",   2560,   10240 },   // ~15 MB  (ffn_down di gemma3-4b)
-        { "DRAM", 200000, 2560  },   // ~288 MB (oltre 10x la L3)
+        { "L3",   2560,   10240 },   // ~15 MB  (ffn_down of gemma3-4b)
+        { "DRAM", 200000, 2560  },   // ~288 MB (over 10x the L3)
     };
 
     for (const Regime& rg : regimes) {
@@ -103,21 +110,21 @@ int main(int argc, char** argv) {
                   [&] { matmul_q6_k(w.data(), rg.rows, rg.cols, x.data(), y.data()); });
         }
     }
-    // REGIME "MANY": stessi byte totali del regime DRAM, ma spezzati in molte
-    // chiamate piccole invece di una grande — cioe' il pattern reale del
-    // decode, dove ogni token fa ~240 matmul su tensori distinti di pochi MB.
-    // Confrontare questo con q4_K/DRAM isola ESATTAMENTE il costo per
-    // chiamata (dispatch del thread pool, risveglio dei worker, barriera)
-    // separandolo dal costo del calcolo e della memoria.
-    // Forme reali dei tensori q4_K di un layer gemma3-4b, con un numero di
-    // chiamate scelto per tenere il volume totale ben oltre la L3 (~290 MB).
-    // Serve perche' il costo puo' dipendere dalla FORMA (righe corte = piu'
-    // dispatch per byte), non solo dal volume.
+    // "MANY" REGIME: same total bytes as the DRAM regime, but split into
+    // many small calls instead of one big one — i.e. the real decode
+    // pattern, where each token does ~240 matmuls on distinct tensors of a
+    // few MB each. Comparing this with q4_K/DRAM isolates EXACTLY the
+    // per-call cost (thread pool dispatch, worker wake-up, barrier),
+    // separating it from the cost of compute and memory.
+    // Real q4_K tensor shapes from a gemma3-4b layer, with a number of calls
+    // chosen to keep the total volume well beyond the L3 (~290 MB). Needed
+    // because the cost can depend on the SHAPE (short rows = more dispatch
+    // per byte), not just the volume.
     struct ManyCase { const char* tag; size_t rows; size_t cols; size_t calls; };
     const ManyCase many_cases[] = {
         { "kv1024",   1024, 2560, 200 },  // wk / wv
         { "q2048",    2048, 2560, 100 },  // wq / wo
-        { "ffn10240", 10240, 2560, 20 },  // ffn_gate / ffn_up (56% del lavoro)
+        { "ffn10240", 10240, 2560, 20 },  // ffn_gate / ffn_up (56% of the work)
     };
     for (const ManyCase& mc : many_cases) {
         const size_t n_calls = mc.calls;
@@ -133,10 +140,10 @@ int main(int argc, char** argv) {
             w.resize(rows * row_bytes);
             for (auto& b : w) b = (uint8_t) byte_dist(rng);
         }
-        // Stesse chiamate, ma con l'attivazione quantizzata UNA volta
-        // fuori dal ciclo (matmul_q4_k_pq). La differenza fra MANY e MANY_PQ
-        // e' esattamente il costo per chiamata di quantize_act_q8k_rep e
-        // delle tre allocazioni di vettori che matmul_q4_k fa al suo interno.
+        // Same calls, but with the activation quantized ONCE outside the
+        // loop (matmul_q4_k_pq). The difference between MANY and MANY_PQ is
+        // exactly the per-call cost of quantize_act_q8k_rep and the three
+        // vector allocations that matmul_q4_k does internally.
         {
             std::vector<int8_t> xq;
             std::vector<float> xs;
@@ -150,5 +157,79 @@ int main(int argc, char** argv) {
             });
         }
     }
+
+#ifdef DESIREEIA_CUDA_ENABLED
+    // CUDA backend: where does the per-call time go?
+    //
+    // The engine's profiler does NOT instrument the CUDA path (its counters
+    // wrap CPU kernel dispatch), so the end-to-end numbers only said "the
+    // time is somewhere else". Here the single call is measured at
+    // INCREASING sizes: if the per-call time stays roughly constant, the
+    // bottleneck is fixed latency (submission + sync per call, which no
+    // faster kernel can remove); if it scales with volume, it's the
+    // kernel/bandwidth. Distinguishing the two cases decides whether it's
+    // worth optimizing the kernel or whether the architecture needs to
+    // change instead (device-resident activations, no round-trip per
+    // matvec).
+    printf("\n--- CUDA Q8_0: latency vs bandwidth (weights already on device) ---\n");
+    {
+        struct CudaCase { const char* tag; size_t rows; size_t cols; };
+        const CudaCase cuda_cases[] = {
+            { "tiny",   256,  2048 },
+            { "small",  2048, 2048 },
+            { "medium", 4096, 2048 },
+            { "large",  11008, 2048 },
+        };
+        for (const CudaCase& cc : cuda_cases) {
+            const size_t nb = cc.cols / 32;
+            const size_t row_bytes = nb * sizeof(block_q8_0);
+            std::vector<uint8_t> w(cc.rows * row_bytes);
+            for (auto& b : w) b = (uint8_t) byte_dist(rng);
+            std::vector<float> x(cc.cols);
+            for (auto& v : x) v = fdist(rng);
+            std::vector<float> y(cc.rows);
+
+            void* d_qs = nullptr;
+            void* d_scale = nullptr;
+            if (!matmul_q8_0_cuda_upload_weights(w.data(), cc.rows, cc.cols, &d_qs, &d_scale)) {
+                printf("  %-8s weight upload FAILED\n", cc.tag);
+                continue;
+            }
+            // 50 calls per measurement: a single call is dominated by
+            // driver warm-up and says nothing about the steady-state regime.
+            const size_t n_calls = 50;
+            const double best = bench((std::string("cuda/") + cc.tag).c_str(),
+                                       cc.rows * n_calls, cc.cols, row_bytes, reps, [&] {
+                for (size_t i = 0; i < n_calls; ++i) {
+                    matmul_q8_0_cuda_resident(d_qs, d_scale, cc.rows, cc.cols, x.data(), y.data());
+                }
+            });
+            printf("             -> %.1f us per call\n", best * 1e6 / (double) n_calls);
+            cuda_free_device(d_qs);
+            cuda_free_device(d_scale);
+        }
+
+        // CPU reference on the same shape, to have the comparison within
+        // the same measurement batch (no thermal drift between the two
+        // numbers).
+        {
+            const size_t rows = 2048, cols = 2048;
+            const size_t nb = cols / 32;
+            const size_t row_bytes = nb * sizeof(block_q8_0);
+            std::vector<uint8_t> w(rows * row_bytes);
+            for (auto& b : w) b = (uint8_t) byte_dist(rng);
+            std::vector<float> x(cols);
+            for (auto& v : x) v = fdist(rng);
+            std::vector<float> y(rows);
+            const size_t n_calls = 50;
+            const double best = bench("cpu/small", rows * n_calls, cols, row_bytes, reps, [&] {
+                for (size_t i = 0; i < n_calls; ++i) {
+                    matmul_q8_0(w.data(), rows, cols, x.data(), y.data());
+                }
+            });
+            printf("             -> %.1f us per call\n", best * 1e6 / (double) n_calls);
+        }
+    }
+#endif
     return 0;
 }

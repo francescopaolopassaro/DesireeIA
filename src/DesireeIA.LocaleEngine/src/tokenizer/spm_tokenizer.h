@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_SPM_TOKENIZER_H
 #define DESIREEIA_SPM_TOKENIZER_H
 
@@ -9,13 +16,13 @@
 
 namespace desireeia {
 
-// Tokenizer SentencePiece Unigram con byte-fallback, guidato interamente dai
-// metadati del formato (tokens/scores/token_type), senza dipendenze esterne.
-// Segmentazione via Viterbi (programmazione dinamica) sui confini di
-// codepoint UTF-8, con fallback byte-per-byte quando nessun pezzo del
-// vocabolario copre un codepoint (richiede i token <0xXX> nel vocabolario).
-// Normalizzazione limitata a: spazio -> U+2581, prefisso U+2581 iniziale.
-// NFKC non e' applicata (gap noto, vedi docs/engine_gap_analysis.md).
+// SentencePiece Unigram tokenizer with byte-fallback, driven entirely by
+// the format's metadata (tokens/scores/token_type), with no external
+// dependencies. Segmentation via Viterbi (dynamic programming) over UTF-8
+// codepoint boundaries, with a byte-by-byte fallback when no vocabulary
+// piece covers a codepoint (requires the <0xXX> tokens in the vocabulary).
+// Normalization is limited to: space -> U+2581, leading U+2581 prefix.
+// NFKC is not applied (known gap, see docs/engine_gap_analysis.md).
 class DESIREEIA_INTERNAL SpmTokenizer {
 public:
     bool load(const VocabData& vocab);
@@ -32,7 +39,7 @@ private:
 
     std::unordered_map<std::string, Entry> piece_to_id_;
     std::vector<std::string> id_to_piece_;
-    std::unordered_map<int32_t, int32_t> byte_token_id_; // valore byte (0-255) -> id vocabolario
+    std::unordered_map<int32_t, int32_t> byte_token_id_; // byte value (0-255) -> vocabulary id
     size_t max_piece_cp_ = 1;
     int32_t bos_id_ = -1;
     int32_t eos_id_ = -1;

@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "spm_tokenizer.h"
 #include <limits>
 
@@ -10,7 +17,7 @@ size_t utf8_len(unsigned char c0) {
     if ((c0 & 0xE0) == 0xC0) return 2;
     if ((c0 & 0xF0) == 0xE0) return 3;
     if ((c0 & 0xF8) == 0xF0) return 4;
-    return 1; // byte non valido: trattato come codepoint di 1 byte
+    return 1; // invalid byte: treated as a 1-byte codepoint
 }
 
 int hex_val(char c) {
@@ -70,12 +77,12 @@ bool SpmTokenizer::piece(int32_t id, std::string& out) const {
     if (id < 0 || (size_t) id >= id_to_piece_.size()) return false;
     const std::string& raw = id_to_piece_[(size_t) id];
 
-    // Detokenizzazione: inversa della normalizzazione fatta in encode().
-    // 1) U+2581 (\xe2\x96\x81, il marcatore di spazio SentencePiece) torna
-    //    a essere uno spazio normale — prima veniva restituito grezzo e
-    //    finiva letteralmente nell'output ("The▁capital▁of...").
-    // 2) I token di byte-fallback "<0xNN>" tornano al byte che
-    //    rappresentano (altrimenti resterebbero visibili come testo).
+    // Detokenization: inverse of the normalization done in encode().
+    // 1) U+2581 (\xe2\x96\x81, the SentencePiece space marker) is turned
+    //    back into a normal space — previously it was returned raw and
+    //    ended up literally in the output ("The▁capital▁of...").
+    // 2) Byte-fallback tokens "<0xNN>" are turned back into the byte they
+    //    represent (otherwise they would stay visible as text).
     if (raw.size() == 6 && raw[0] == '<' && raw[1] == '0' && raw[2] == 'x' && raw[5] == '>') {
         const int hi = hex_val(raw[3]);
         const int lo = hex_val(raw[4]);
@@ -106,8 +113,8 @@ std::vector<int32_t> SpmTokenizer::encode(const std::string& text, bool add_bos)
     std::vector<int32_t> result;
     if (!ready()) return result;
 
-    // Normalizzazione minima SentencePiece: spazio -> U+2581, prefisso
-    // U+2581 iniziale (add_dummy_prefix). NFKC non applicata (gap noto).
+    // Minimal SentencePiece normalization: space -> U+2581, leading U+2581
+    // prefix (add_dummy_prefix). NFKC is not applied (known gap).
     std::string norm;
     norm.reserve(text.size() + 4);
     norm += "\xe2\x96\x81";

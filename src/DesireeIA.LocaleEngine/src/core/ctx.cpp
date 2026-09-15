@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "engine.h"
 #include "desireeia/abi.h"
 #include "core/arch_tags.h"
@@ -23,15 +30,15 @@ namespace desireeia {
 
 struct EngineContext {
     EngineState st;
-    // Motore forward: DenseForward per le architetture ad attenzione,
-    // SsmForward per Mamba2 (vedi ArchKind::Mamba2 e la nota estesa su
-    // core/forward_iface.h). Le due classi non condividono stato: solo il
-    // puntatore e' unificato dietro l'interfaccia minima.
+    // Forward engine: DenseForward for attention-based architectures,
+    // SsmForward for Mamba2 (see ArchKind::Mamba2 and the extended note on
+    // core/forward_iface.h). The two classes share no state: only the
+    // pointer is unified behind the minimal interface.
     IForwardEngine* gf = nullptr;
-    // BERT (encoder-only, ArchKind::Bert): NON implementa IForwardEngine —
-    // non genera un "prossimo token", non ha logit su un vocabolario, non
-    // ha una KV-cache da resettare. Campo separato, mutuamente esclusivo
-    // con gf (un modello e' o generativo o un encoder, mai entrambi qui).
+    // BERT (encoder-only, ArchKind::Bert): does NOT implement IForwardEngine —
+    // it doesn't generate a "next token", has no logits over a vocabulary, and
+    // has no KV cache to reset. Separate field, mutually exclusive with gf
+    // (a model is either generative or an encoder, never both here).
     BertForward* bert = nullptr;
     Tokenizer tok;
     bool has_tok = false;
@@ -39,10 +46,10 @@ struct EngineContext {
     bool has_session = false;
     std::mutex mtx;
 
-    // Fase 0 (motore di inferenza reale): id dei token speciali letti dal
-    // vocabolario del modello, persistiti qui (VocabData e' locale a
-    // engine_create) cosi' desireeia_special_token_id puo' esporli a chi
-    // genera (per fermarsi a EOS) o compone una chat template.
+    // Phase 0 (real inference engine): special token ids read from the
+    // model's vocabulary, persisted here (VocabData is local to
+    // engine_create) so desireeia_special_token_id can expose them to
+    // whoever generates (to stop at EOS) or builds a chat template.
     int32_t bos_id = -1;
     int32_t eos_id = -1;
     int32_t unk_id = -1;
@@ -55,14 +62,14 @@ struct EngineContext {
     // answered correctly.
     std::set<int32_t> eog_ids;
 
-    // Campionamento. Di default greedy (temperature 0), cioe' il
-    // comportamento che c'era prima e che i test end-to-end si aspettano;
-    // diventa campionamento vero appena il chiamante alza la temperatura.
+    // Sampling. Greedy by default (temperature 0), i.e. the behavior that
+    // existed before and that the end-to-end tests expect; becomes real
+    // sampling as soon as the caller raises the temperature.
     Sampler sampler;
 
-    // Formato di prompt per la chat, rilevato al caricamento (vedi
-    // engine_create): dal chat_template del GGUF se presente, altrimenti
-    // dal default per architettura.
+    // Chat prompt format, detected at load time (see engine_create): from
+    // the GGUF's chat_template when present, otherwise from the
+    // per-architecture default.
     ChatTemplateKind chat_template = ChatTemplateKind::Unknown;
 
     // Prompt Lookup Decoding: full history of tokens already in the KV
@@ -75,15 +82,15 @@ struct EngineContext {
 };
 
 namespace {
-// Cerca l'ultima occorrenza (piu' recente = piu' probabile per pattern
-// locali ripetuti, es. codice) della sequenza [ultimi kNgramLen-1 token di
-// history, last_token] altrove in history, e restituisce quello che la
-// seguiva come continuazione candidata (fino a max_draft token). Nessun
-// modello draft: e' la tecnica "Prompt Lookup Decoding" (n-gram), utile
-// soprattutto quando l'output ripete materiale gia' visto nel contesto
-// (tipico di codice/documenti strutturati). Se non trova nulla, ritorna
-// false e il chiamante ricade sul decode singolo token normale (nessuna
-// regressione: costo aggiuntivo di una scansione lineare su history).
+// Looks for the LATEST occurrence (most recent = most likely for repeated
+// local patterns, e.g. code) of the sequence [last kNgramLen-1 tokens of
+// history, last_token] elsewhere in history, and returns what followed it
+// as a candidate continuation (up to max_draft tokens). No draft model
+// involved: this is the "Prompt Lookup Decoding" technique (n-gram),
+// useful especially when the output repeats material already seen in the
+// context (typical of code/structured documents). If nothing is found,
+// returns false and the caller falls back to normal single-token decode
+// (no regression: the extra cost is one linear scan over history).
 bool find_ngram_continuation(const std::vector<int32_t>& history, int32_t last_token,
                               size_t ngram_len, size_t max_draft,
                               std::vector<int32_t>& out_continuation) {
@@ -536,7 +543,7 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
     } else if (meta.format == DESIREEIA_FORMAT_GGUF && arch_kind != ArchKind::Unknown) {
         DenseForward* df = new DenseForward;
         if (df->open(*reader, meta, arch_kind, ctx->st.plan.ram_budget_mb, ctx->st.experts,
-                     ctx->st.plan.kv_compression_enabled != 0)) {
+                     ctx->st.plan.kv_compression_enabled != 0, ctx->st.plan.backend)) {
             ctx->gf = df;
             if (log) {
                 log(5, df->weight_cache_enabled()
@@ -611,8 +618,8 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
         if (c->st.log) c->st.log(3, c->st.last_error.c_str());
         return false;
     }
-    // La storia per le penalita' di ripetizione e' il prompt stesso: il
-    // primo token generato non deve ripetere quello che c'e' gia' scritto.
+    // The history for the repetition penalties is the prompt itself: the
+    // first generated token must not repeat what's already written.
     c->history.assign(tokens, tokens + n_tokens);
     out_token = c->sampler.sample(logits, c->history);
     c->last_token = out_token;
@@ -621,26 +628,26 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     return true;
 }
 
-// Fase 9 - Prompt Lookup Decoding: verifica fino a kMaxDraft token candidati
-// (trovati per ripetizione n-gram nella storia gia' generata) in UN SOLO
-// passo batched (Fase 8), invece di un token alla volta. Implementata e
-// misurata (2026-09-07) su gemma3-4b Q4_K_M con un prompt generico non
-// ripetitivo: RISULTATO NEGATIVO, non abilitata di default.
-// Trace reale (kNgramLen=3, kMaxDraft=4): la maggior parte dei round trova
-// solo K=1-2 con tasso di accettazione molto basso (accepted=0 o 1 quasi
-// sempre, mai piu' di 1 osservato). Dato che il costo di verifica scala
-// con K (il lm_head, ~525MB per gemma3-4b, viene comunque letto/decodificato
-// una volta ma il dot-product va calcolato per ogni colonna K), un round
-// K=2 con accepted<=1 non guadagna nulla e costa di piu' di un decode
-// singolo normale: decode misurato 4.42 tok/s vs 7.3 tok/s baseline (peggio,
-// non meglio). La tecnica resta valida in teoria per workload molto
-// ripetitivi (code-edit, RAG che ripete il contesto), ma richiede un gate
-// adattivo (es. tracciare il tasso di accettazione recente e disabilitare
-// la speculazione quando scende sotto una soglia) prima di poter essere
-// tenuta accesa di default: non implementato in questa sessione, vedi
-// Fase 9 in engine_gap_analysis.md. L'infrastruttura sotto (step() con
-// all_logits, DenseForward::truncate_cache, find_ngram_continuation sopra)
-// resta comunque disponibile e testata per quando verra' aggiunto il gate.
+// Phase 9 - Prompt Lookup Decoding: verifies up to kMaxDraft candidate
+// tokens (found via n-gram repetition in the history generated so far) in
+// A SINGLE batched pass (Phase 8), instead of one token at a time.
+// Implemented and measured (2026-09-07) on gemma3-4b Q4_K_M with a generic,
+// non-repetitive prompt: NEGATIVE RESULT, not enabled by default.
+// Real trace (kNgramLen=3, kMaxDraft=4): most rounds find only K=1-2 with a
+// very low acceptance rate (accepted=0 or 1 almost always, never more than
+// 1 observed). Since the verification cost scales with K (the lm_head,
+// ~525MB for gemma3-4b, is still read/decoded once but the dot-product has
+// to be computed for every K column), a K=2 round with accepted<=1 gains
+// nothing and costs more than a normal single-token decode: measured decode
+// throughput 4.42 tok/s vs 7.3 tok/s baseline (worse, not better). The
+// technique remains valid in theory for highly repetitive workloads
+// (code-edit, RAG that repeats the context), but needs an adaptive gate
+// (e.g. tracking the recent acceptance rate and disabling speculation
+// when it drops below a threshold) before it can be left on by default:
+// not implemented in this session, see Phase 9 in engine_gap_analysis.md.
+// The infrastructure below (step() with all_logits, DenseForward::
+// truncate_cache, find_ngram_continuation above) remains available and
+// tested regardless, for when the gate gets added.
 bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
@@ -655,9 +662,9 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
         if (c->st.log) c->st.log(3, c->st.last_error.c_str());
         return false;
     }
-    // `tk` (il token appena consumato) entra nella storia PRIMA di
-    // campionare: e' proprio la ripetizione immediata che le penalita'
-    // devono poter vedere.
+    // `tk` (the token just consumed) enters the history BEFORE sampling:
+    // it's exactly the immediate repetition that the penalties need to
+    // be able to see.
     c->history.push_back(tk);
     out_token = c->sampler.sample(logits, c->history);
     c->last_token = out_token;
@@ -770,8 +777,8 @@ size_t engine_context_size(const desireeia_ctx* ctx) {
     if (!c) return 0;
     std::lock_guard<std::mutex> lk(c->mtx);
     size_t n = 0;
-    // c->st.kv e' la KvCache legacy (mai popolata dal forward path attuale);
-    // la cache K/V reale vive dentro DenseForward.
+    // c->st.kv is the legacy KvCache (never populated by the current
+    // forward path); the real K/V cache lives inside DenseForward.
     if (c->gf) n += (size_t) c->gf->kv_bytes();
     else if (c->st.kv) n += c->st.kv->bytes();
     return n;

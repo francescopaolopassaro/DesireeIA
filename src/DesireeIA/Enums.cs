@@ -1,4 +1,11 @@
-﻿namespace DesireeIA;
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+namespace DesireeIA;
 
 public enum ModelFormat
 {
@@ -9,6 +16,13 @@ public enum ModelFormat
 
 public enum InferenceBackend
 {
+    // 0 = unspecified: the native plan auto-detects it from the hardware
+    // (desireeia_make_plan only fills plan.backend when it is 0, see
+    // core/plan.cpp/ctx.cpp). ExecutionPlan.Backend uses this as its default
+    // on purpose: a partial override like `new ExecutionPlan { ThreadCount =
+    // t }` must not silently force Cpu on a machine with a real GPU just
+    // because the backend wasn't being set.
+    Unconfigured = 0,
     Cpu = 1,
     Cuda = 2,
     Metal = 3,

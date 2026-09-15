@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "ssm_forward.h"
 #include "core/thread_pool.h"
 #include <cmath>
@@ -8,10 +15,10 @@ namespace desireeia {
 
 namespace {
 
-// y[j] = sum_i w[j*c+i]*x[i], accumulatore double (stessa scelta di
-// dense_forward.cpp: precisione, non velocita', qui non e' il collo di
-// bottiglia dominante rispetto alla scansione SSM stessa). Parallelizzato
-// sulle righe per ssm_in/ssm_out (le uniche matrici davvero grandi qui).
+// y[j] = sum_i w[j*c+i]*x[i], double accumulator (same choice as
+// dense_forward.cpp: precision, not speed — here it is not the dominant
+// bottleneck compared to the SSM scan itself). Parallelized over rows for
+// ssm_in/ssm_out (the only truly large matrices here).
 void matvec_f32(const float* w, size_t r, size_t c, const float* x, float* y) {
     ThreadPool::global().parallel_for(r, [&](size_t j0, size_t j1) {
         for (size_t j = j0; j < j1; ++j) {
@@ -36,13 +43,12 @@ void rms_norm_vec(const float* x, const float* w, float* y, size_t n, float eps)
 }
 
 bool SsmForward::load_embd(ModelReader& rd) {
-    // Semplificazione voluta (prima passata di correttezza, nessun GGUF
-    // Mamba2 reale disponibile per testare): embedding e lm_head tenuti
-    // interamente in float, senza il dequant-per-riga a domanda che
-    // DenseForward usa per i modelli grandi. I modelli Mamba2 pubblicati
-    // sono tipicamente piccoli-medi (130M-7B): gap noto, documentato,
-    // ottimizzabile in seguito se servisse su un modello con vocabolario
-    // enorme.
+    // Deliberate simplification (first correctness pass, no real Mamba2
+    // GGUF available to test against): embedding and lm_head kept entirely
+    // in float, without the on-demand per-row dequantization DenseForward
+    // uses for large models. Published Mamba2 models are typically
+    // small-to-medium (130M-7B): a known, documented gap, optimizable
+    // later if it becomes relevant for a model with a huge vocabulary.
     if (!rd.read_tensor("token_embd.weight", tok_embd_) ||
         tok_embd_.size() != (size_t) cfg_.n_vocab * cfg_.n_embd) return false;
     if (!rd.read_tensor("output.weight", output_) ||
@@ -77,7 +83,7 @@ bool SsmForward::load_layer_data(ModelReader& rd, uint32_t il, SsmLayerWeights& 
 
     w.ssm_norm.clear();
     rd.read_tensor(p + "ssm_norm.weight", w.ssm_norm);
-    if (w.ssm_norm.size() != cfg_.d_inner) w.ssm_norm.clear(); // gruppo singolo/assente: gap noto, nessuna norm applicata
+    if (w.ssm_norm.size() != cfg_.d_inner) w.ssm_norm.clear(); // single/absent group: known gap, no norm applied
 
     if (!rd.read_tensor(p + "ssm_out.weight", w.ssm_out) || w.ssm_out.size() != (size_t) cfg_.n_embd * cfg_.d_inner) return false;
 
@@ -125,11 +131,11 @@ bool SsmForward::open(ModelReader& rd, const ModelMeta& meta, uint64_t ram_budge
     if (!load_embd(rd)) return false;
     if (!load_norms(rd)) return false;
 
-    // Stima RAM: pesi SSM per layer + i due grandi (ssm_in/ssm_out) contro
-    // il budget pianificato, stessa soglia conservativa (60%) usata da
-    // DenseForward per lasciare margine a embeddings/overhead — qui lo
-    // stato ricorrente e' trascurabile (dimensione fissa, non cresce col
-    // contesto) quindi non serve considerarlo nel budget.
+    // RAM estimate: per-layer SSM weights + the two large ones (ssm_in/
+    // ssm_out) against the planned budget, the same conservative threshold
+    // (60%) DenseForward uses to leave margin for embeddings/overhead —
+    // here the recurrent state is negligible (fixed size, does not grow
+    // with context) so it does not need to be counted in the budget.
     const size_t bytes_per_layer =
         (size_t) cfg_.d_in_proj() * cfg_.n_embd * sizeof(float) +
         (size_t) cfg_.n_embd * cfg_.d_inner * sizeof(float) +
@@ -155,8 +161,8 @@ void SsmForward::reset_cache() {
 }
 
 uint64_t SsmForward::kv_bytes() const {
-    // Stato a dimensione FISSA (il punto degli SSM): non cresce col
-    // contesto, a differenza della KV-cache del motore denso.
+    // FIXED-size state (the whole point of SSMs): does not grow with
+    // context, unlike the dense engine's KV-cache.
     return (uint64_t) (conv_state_.size() + ssm_state_.size()) * sizeof(float);
 }
 
@@ -248,9 +254,9 @@ void SsmForward::step_token(ModelReader& rd, int32_t token, bool want_logits, st
 
         const float* y_final = y.data();
         if (!lw->ssm_norm.empty()) {
-            // RMSNorm a gruppi: n_group blocchi contigui di d_inner/n_group
-            // canali, ciascuno normalizzato per conto proprio col proprio
-            // segmento di peso (vedi la nota sul layout in ssm_forward.h).
+            // Grouped RMSNorm: n_group contiguous blocks of d_inner/n_group
+            // channels, each normalized independently with its own weight
+            // segment (see the layout note in ssm_forward.h).
             const uint32_t grp_w = d_inner / n_group;
             for (uint32_t g = 0; g < n_group; ++g) {
                 rms_norm_vec(y.data() + (size_t) g * grp_w, lw->ssm_norm.data() + (size_t) g * grp_w,

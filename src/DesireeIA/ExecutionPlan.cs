@@ -1,8 +1,23 @@
-﻿namespace DesireeIA;
+﻿// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
+namespace DesireeIA;
 
 public sealed class ExecutionPlan
 {
-    public InferenceBackend Backend { get; init; } = InferenceBackend.Cpu;
+    // Unconfigured (0), not Cpu: an ExecutionPlan built as a partial override
+    // (e.g. `new ExecutionPlan { ThreadCount = t }`, the pattern used by the
+    // CLI) serializes EVERY field to the native plan, not just the one that
+    // was explicitly set. The native side (core/ctx.cpp) only auto-detects
+    // the backend from the hardware when it receives 0 — a Cpu default here
+    // would silently force the backend to CPU even on a machine with a real
+    // GPU, any time a partial override was passed for any other field (a
+    // real bug, found while measuring the CUDA backend).
+    public InferenceBackend Backend { get; init; } = InferenceBackend.Unconfigured;
     public ModelFormat Format { get; init; } = ModelFormat.Unknown;
     public Quantization DenseQuantization { get; init; } = Quantization.Q8_0;
     public Quantization ExpertQuantization { get; init; } = Quantization.Q4K;

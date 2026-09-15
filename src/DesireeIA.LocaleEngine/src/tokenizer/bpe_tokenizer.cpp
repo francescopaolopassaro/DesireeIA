@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "bpe_tokenizer.h"
 #include <algorithm>
 #include <array>
@@ -28,9 +35,9 @@ std::string utf8_encode_cp(uint32_t cp) {
     return out;
 }
 
-// Tabella standard GPT2 byte<->unicode "visibile": ogni byte 0..255 e'
-// mappato su un codepoint che, quando ricodificato UTF-8, e' il carattere
-// usato nei pezzi del vocabolario BPE nei file GGUF.
+// Standard GPT2 byte<->"visible" unicode table: every byte 0..255 is
+// mapped to a codepoint that, once re-encoded as UTF-8, is the character
+// used in the BPE vocabulary pieces in GGUF files.
 const std::array<std::string, 256>& byte_to_unicode() {
     static const std::array<std::string, 256> table = [] {
         std::array<std::string, 256> t;
@@ -68,10 +75,10 @@ size_t utf8_len(unsigned char c0) {
     return 1;
 }
 
-// Inversa di map_bytes: dai caratteri "visibili" del vocabolario BPE ai
-// byte reali. Serve in detokenizzazione — senza, i pezzi tornavano grezzi
-// e nell'output comparivano letteralmente i marcatori GPT2 (Ġ per lo
-// spazio, Ċ per il newline) invece del testo vero.
+// Inverse of map_bytes: from the "visible" characters of the BPE
+// vocabulary back to the real bytes. Needed for detokenization — without
+// it, pieces came back raw and the output literally showed the GPT2
+// markers (Ġ for space, Ċ for newline) instead of the actual text.
 const std::unordered_map<std::string, unsigned char>& unicode_to_byte() {
     static const std::unordered_map<std::string, unsigned char> table = [] {
         std::unordered_map<std::string, unsigned char> m;
@@ -94,8 +101,8 @@ std::string unmap_bytes(const std::string& mapped) {
         if (it != tbl.end()) {
             out += (char) it->second;
         } else {
-            // Non e' un carattere della mappa GPT2 (es. un token speciale
-            // come <|im_end|>): lo si lascia com'e'.
+            // Not a character from the GPT2 map (e.g. a special token like
+            // <|im_end|>): leave it as is.
             out += ch;
         }
         i += len;
@@ -107,12 +114,13 @@ bool is_ascii_alpha(unsigned char c) { return (c >= 'a' && c <= 'z') || (c >= 'A
 bool is_ascii_digit(unsigned char c) { return c >= '0' && c <= '9'; }
 bool is_space(unsigned char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 
-// Pre-tokenizzazione approssimata del pattern GPT2: gestisce contrazioni
-// inglesi comuni, poi raggruppa lettere / cifre / altro / spazi in chunk
-// separati, con lo spazio iniziale opzionale attaccato al chunk successivo
-// (come nel pattern originale). Categorie Unicode complete (\p{L}, \p{N})
-// non sono implementate: ogni byte >=0x80 (parte di sequenza UTF-8
-// multi-byte) e' trattato come "lettera" per approssimazione (gap noto).
+// Approximate pre-tokenization of the GPT2 pattern: handles common English
+// contractions, then groups letters / digits / other / spaces into
+// separate chunks, with the optional leading space attached to the
+// following chunk (as in the original pattern). Full Unicode categories
+// (\p{L}, \p{N}) are not implemented: every byte >=0x80 (part of a
+// multi-byte UTF-8 sequence) is treated as a "letter" as an approximation
+// (known gap).
 std::vector<std::string> pre_tokenize(const std::string& text) {
     std::vector<std::string> chunks;
     static const char* contractions[] = { "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" };
@@ -166,7 +174,7 @@ std::vector<std::string> pre_tokenize(const std::string& text) {
                 if (!is_ascii_alpha(cc) && !is_ascii_digit(cc) && !is_space(cc) && cc < 0x80) j++;
                 else break;
             }
-            if (j == i) j++; // garantisce progresso su byte imprevisti
+            if (j == i) j++; // ensures progress on unexpected bytes
             chunks.push_back(text.substr(start, j - start));
             i = j;
         }
@@ -223,9 +231,9 @@ int32_t BpeTokenizer::token_to_id(const std::string& piece) const {
 
 bool BpeTokenizer::piece(int32_t id, std::string& out) const {
     if (id < 0 || (size_t) id >= id_to_piece_.size()) return false;
-    // Detokenizzazione: inversa della mappa byte->unicode "visibile" di
-    // GPT2 applicata in encode(). Senza, l'output conteneva letteralmente
-    // i marcatori (Ġ al posto dello spazio, Ċ al posto del newline).
+    // Detokenization: inverse of the byte->"visible" unicode GPT2 map
+    // applied in encode(). Without it, the output would literally contain
+    // the markers (Ġ instead of space, Ċ instead of newline).
     out = unmap_bytes(id_to_piece_[(size_t) id]);
     return true;
 }
@@ -259,8 +267,8 @@ std::vector<std::string> BpeTokenizer::bpe_merge(const std::string& chunk_mapped
 }
 
 namespace {
-// Applica la pipeline BPE ordinaria (pre-tokenizzazione -> mappa byte ->
-// merge -> lookup) a un tratto di testo che NON contiene token speciali.
+// Applies the ordinary BPE pipeline (pre-tokenization -> byte map -> merge
+// -> lookup) to a stretch of text that does NOT contain special tokens.
 void encode_plain(const std::string& text,
                   const std::unordered_map<std::string, int32_t>& piece_to_id,
                   int32_t unk_id,
@@ -293,12 +301,12 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
         return out;
     }
 
-    // Scansione lineare: a ogni posizione si prova il token speciale piu'
-    // lungo che combacia (special_tokens_ e' ordinata per lunghezza
-    // decrescente). Il testo semplice fra due token speciali (o prima del
-    // primo/dopo l'ultimo) si accumula e passa dalla pipeline BPE
-    // ordinaria solo quando si chiude il tratto — non carattere per
-    // carattere, altrimenti si perderebbero i merge fra byte adiacenti.
+    // Linear scan: at every position, try the longest special token that
+    // matches (special_tokens_ is sorted by decreasing length). Plain text
+    // between two special tokens (or before the first / after the last) is
+    // accumulated and only run through the ordinary BPE pipeline once the
+    // stretch closes — not character by character, otherwise merges
+    // between adjacent bytes would be lost.
     size_t pos = 0;
     size_t plain_start = 0;
     while (pos < text.size()) {
@@ -309,7 +317,7 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
             if (!s.empty() && text.compare(pos, s.size(), s) == 0) {
                 matched_id = st.second;
                 matched_len = s.size();
-                break; // ordinata per lunghezza decrescente: il primo e' il piu' lungo
+                break; // sorted by decreasing length: the first one is the longest
             }
         }
         if (matched_id < 0) {

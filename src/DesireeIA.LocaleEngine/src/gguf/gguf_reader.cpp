@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "../core/engine.h"
 #include "../quant/quant.h"
 #include <fstream>
@@ -79,6 +86,11 @@ bool read_tensor_info(std::istream& f, TensorInfo& t) {
     if (!read_at(f, t.offset)) return false;
     return true;
 }
+
+// Upper bound on the length of a metadata array kept in memory. Per-layer
+// flag arrays are at most a few hundred entries; anything longer is a data
+// array that has no business being cached here.
+constexpr uint64_t kMetaArrayMax = 4096;
 
 uint64_t tensor_count(const std::vector<uint64_t>& dims) {
     uint64_t n = 1;
@@ -164,6 +176,30 @@ public:
                     continue;
                 }
                 if (key == "tokenizer.ggml.tokens") n_tokens = n;
+                // Short numeric arrays are kept: some architectures declare
+                // per-layer behaviour as an array of flags (one entry per
+                // layer) rather than as a period, and that array is the only
+                // place the information exists. The length cap keeps this
+                // from ever latching onto a vocabulary-sized array, and the
+                // element types accepted are the ones such keys use.
+                if (n > 0 && n <= kMetaArrayMax && key.rfind("tokenizer.", 0) != 0 &&
+                    (elem == 7 || elem == 0 || elem == 1 || elem == 2 ||
+                     elem == 3 || elem == 4 || elem == 5)) {
+                    std::vector<uint32_t> vals((size_t) n, 0);
+                    bool ok = true;
+                    for (uint64_t a = 0; a < n && ok; ++a) {
+                        switch (elem) {
+                            case 7: case 0: { uint8_t  v = 0; ok = read_at(f, v); vals[(size_t) a] = v; break; }
+                            case 1:         { int8_t   v = 0; ok = read_at(f, v); vals[(size_t) a] = (uint32_t) (int32_t) v; break; }
+                            case 2:         { uint16_t v = 0; ok = read_at(f, v); vals[(size_t) a] = v; break; }
+                            case 3:         { int16_t  v = 0; ok = read_at(f, v); vals[(size_t) a] = (uint32_t) (int32_t) v; break; }
+                            default:        { uint32_t v = 0; ok = read_at(f, v); vals[(size_t) a] = v; break; }
+                        }
+                    }
+                    if (!ok) return false;
+                    kv_arr_[key] = std::move(vals);
+                    continue;
+                }
                 for (uint64_t a = 0; a < n; ++a) {
                     if (!skip_gguf_value(f, elem)) return false;
                 }
@@ -199,13 +235,13 @@ public:
                 kv_int_[key] = v;
                 continue;
             }
-            // type 8 = GGUF_TYPE_STRING. Prima veniva sempre scartata
-            // (skip_gguf_value): il motore non leggeva NESSUNA stringa a
-            // livello di chiave/valore. Serve per "tokenizer.chat_template"
-            // (Fase template di chat, 2026-09-08): senza, la CLI non ha modo
-            // di sapere quale formato di chat usa il modello e deve
-            // indovinare dall'architettura, che per famiglie con piu'
-            // varianti (llama3 vs llama2, mistral v1/v3/v7...) non basta.
+            // type 8 = GGUF_TYPE_STRING. This used to always be discarded
+            // (skip_gguf_value): the engine read NO string at all at the
+            // key/value level. It is needed for "tokenizer.chat_template"
+            // (chat template phase, 2026-09-08): without it, the CLI has no
+            // way of knowing which chat format the model uses and has to
+            // guess from the architecture, which for families with several
+            // variants (llama3 vs llama2, mistral v1/v3/v7...) is not enough.
             if (type == 8) {
                 std::string v;
                 if (!read_string(f, v)) return false;
@@ -320,11 +356,10 @@ public:
     }
 
     // MoE tensor convention: blk.N.ffn_{gate,up,down}_exps.weight, shape
-    // [n_embd, n_ff, n_expert] per gate/up e [n_ff, n_embd, n_expert] per
-    // down (dims[0] = larghezza riga, dims[1] = righe per esperto,
-    // dims[2] = n_expert, esperti contigui in righe [idx*dims[1],
-    // (idx+1)*dims[1])). Si legge solo il sotto-blocco dell'esperto
-    // richiesto, non l'intero tensore.
+    // [n_embd, n_ff, n_expert] for gate/up and [n_ff, n_embd, n_expert] for
+    // down (dims[0] = row width, dims[1] = rows per expert, dims[2] =
+    // n_expert, experts contiguous in rows [idx*dims[1], (idx+1)*dims[1])).
+    // Only the requested expert's sub-block is read, not the whole tensor.
     bool read_expert(uint32_t layer, uint32_t idx, ExpertPart part, std::vector<float>& out) override {
         char buf[64];
         std::snprintf(buf, sizeof(buf), "blk.%u.", layer);
@@ -391,6 +426,13 @@ public:
         return true;
     }
 
+    bool meta_u32_array(const std::string& key, std::vector<uint32_t>& out) override {
+        auto it = kv_arr_.find(key);
+        if (it == kv_arr_.end()) return false;
+        out = it->second;
+        return true;
+    }
+
     bool read_vocab(VocabData& out) override {
         if (vocab_.tokens.empty()) return false;
         out = vocab_;
@@ -406,6 +448,7 @@ private:
     std::unordered_map<std::string, uint64_t> kv_int_;
     std::unordered_map<std::string, float> kv_float_;
     std::unordered_map<std::string, std::string> kv_string_;
+    std::unordered_map<std::string, std::vector<uint32_t>> kv_arr_;
     VocabData vocab_;
 };
 

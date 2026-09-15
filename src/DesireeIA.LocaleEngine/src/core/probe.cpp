@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #include "engine.h"
 #include <cstring>
 #include <vector>
@@ -142,12 +149,12 @@ bool lib_present(const char* name) {
 #endif
 }
 
-// La sola presenza di nvcuda.dll/nvml.dll NON implica una GPU NVIDIA
-// funzionante: puo' restare installata da un driver rimosso solo in parte,
-// o da altro software che la porta con se'. Bug reale scoperto dall'utente
-// (macchina senza GPU che risultava "cuda=1" nel probe): serve interrogare
-// davvero il driver (cuInit + cuDeviceGetCount) e contare i device
-// riportati, non fidarsi del solo LoadLibrary/dlopen.
+// The mere presence of nvcuda.dll/nvml.dll does NOT imply a working
+// NVIDIA GPU: it can remain installed by a partially removed driver, or
+// by other software that bundles it. Real bug found by the user (a
+// machine with no GPU that reported "cuda=1" from the probe): the driver
+// must actually be queried (cuInit + cuDeviceGetCount) and the reported
+// devices counted, rather than trusting a bare LoadLibrary/dlopen.
 int cuda_real_device_count() {
 #if defined(_WIN32)
     HMODULE h = LoadLibraryA("nvcuda.dll");

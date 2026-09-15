@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_CHAT_TEMPLATE_H
 #define DESIREEIA_CHAT_TEMPLATE_H
 
@@ -65,16 +72,17 @@ enum class ChatTemplateKind {
 // de-facto formats.
 DESIREEIA_INTERNAL ChatTemplateKind detect_chat_template(const std::string& tmpl);
 
-// Quando il modello non porta un chat_template nei metadati (GGUF piu'
-// vecchi, o conversioni che non lo hanno copiato), si ricade su un default
-// per architettura: non e' affidabile quanto il template esplicito (una
-// stessa architettura puo' avere piu' varianti storiche, es. llama2 vs
-// llama3), ma e' sempre meglio del prompt grezzo senza marcatori di turno.
+// When the model carries no chat_template in its metadata (older GGUF
+// files, or conversions that didn't copy it over), falls back to a
+// per-architecture default: not as reliable as an explicit template (the
+// same architecture can have several historical variants, e.g. llama2 vs
+// llama3), but always better than the raw prompt with no turn markers.
 DESIREEIA_INTERNAL ChatTemplateKind chat_template_for_arch(ArchKind arch);
 
-// Applica il formato ai messaggi, producendo il prompt da tokenizzare.
-// add_assistant aggiunge il marcatore di apertura del turno assistente
-// (per far generare la risposta), com'era gia' fatto a mano per gemma.
+// Applies the format to the messages, producing the prompt to tokenize.
+// add_assistant appends the assistant turn's opening marker (to make it
+// generate the response), the same way it was already done by hand for
+// gemma.
 DESIREEIA_INTERNAL std::string apply_chat_template(ChatTemplateKind kind,
                                                  const std::vector<ChatMessage>& chat,
                                                  bool add_assistant);

@@ -1,3 +1,10 @@
+// DesireeIA
+// Copyright (c) Passaro Francesco Paolo. All rights reserved.
+// Licensed under the DesireeIA License - see LICENSE and the "License"
+// section of README.md for full terms: no modification, no unauthorized
+// integration, no AI training/ingestion without explicit written consent
+// from the author.
+
 #ifndef DESIREEIA_THREAD_POOL_H
 #define DESIREEIA_THREAD_POOL_H
 
@@ -68,10 +75,10 @@ public:
     static void set_thread_override(int n);
     static size_t& desired_threads();
 
-    // La task viene passata come puntatore a funzione + contesto, NON come
-    // std::function: costruirne una a ogni dispatch significava
-    // un'allocazione sull'heap per ogni matmul (~240 a token) proprio sul
-    // percorso critico, per giunta dentro la sezione col mutex.
+    // The task is passed as a function pointer + context, NOT as
+    // std::function: constructing one on every dispatch meant a heap
+    // allocation for every matmul (~240 per token) right on the critical
+    // path, and inside the mutex-protected section to boot.
     using TaskFn = void (*)(void*, size_t, size_t);
 
     template <typename Fn>
@@ -83,8 +90,8 @@ public:
         }, &local);
     }
 
-    // Variante per poche unita' grosse e indipendenti (vedi parallel_units in
-    // engine.h): una unita' per fetta, nessuna soglia minima.
+    // Variant for a few large, independent units (see parallel_units in
+    // engine.h): one unit per slice, no minimum threshold.
     template <typename Fn>
     void parallel_for_units(size_t total, Fn&& fn) {
         using F = typename std::decay<Fn>::type;
@@ -101,8 +108,8 @@ private:
     ThreadPool(const ThreadPool&) = delete;
     ThreadPool& operator=(const ThreadPool&) = delete;
 
-    // grain_override = 0 -> fette calcolate automaticamente e allineate alla
-    // cache line; > 0 -> fette di quella dimensione esatta.
+    // grain_override = 0 -> slices computed automatically and aligned to
+    // the cache line; > 0 -> slices of that exact size.
     void run_raw(size_t total, TaskFn fn, void* ctx,
                  size_t grain_override = 0, size_t min_parallel = 64);
     void worker_loop(size_t worker_id);
@@ -112,43 +119,44 @@ private:
 
     void run_chunks();
 
-    // NON copiate dai worker: prima ogni worker faceva `fn = task_` sotto
-    // mutex a ogni dispatch, cioe' una copia di std::function (con
-    // allocazione) per worker per dispatch — con ~239 matmul per token e 16
-    // worker sono ~3800 allocazioni a token, tutte serializzate sul mutex.
-    // Scritte da run_raw() prima di incrementare generation_ e valide finche'
-    // run_raw() non ritorna (cosa che avviene solo a pending_==0), quindi i
-    // worker le leggono senza copiare e senza prendere il mutex.
+    // NOT copied by the workers: previously every worker did `fn = task_`
+    // under the mutex on every dispatch, i.e. one std::function copy
+    // (with allocation) per worker per dispatch — with ~239 matmuls per
+    // token and 16 workers that's ~3800 allocations per token, all
+    // serialized on the mutex. Written by run_raw() before incrementing
+    // generation_ and valid until run_raw() returns (which only happens
+    // at pending_==0), so the workers read them without copying and
+    // without taking the mutex.
     TaskFn task_fn_ = nullptr;
     void* task_ctx_ = nullptr;
     size_t total_ = 0;
     size_t n_workers_ = 0;
 
-    // Chunking DINAMICO: i worker prendono fette da un contatore atomico
-    // invece di ricevere una fetta statica calcolata da worker_id. Con la
-    // divisione statica ogni dispatch finiva col piu' lento (straggler), e
-    // bastava un core rallentato — da hyperthreading, da un altro processo o
-    // da throttling — per allungare l'intera matmul. Misurato: lo scaling
-    // era 1,37x da 4 a 8 thread e solo 1,18x da 8 a 16.
+    // DYNAMIC chunking: workers take slices from an atomic counter instead
+    // of receiving a static slice computed from worker_id. With static
+    // division every dispatch ended up waiting on the slowest (straggler),
+    // and it only took one core running slower — from hyperthreading,
+    // another process, or throttling — to drag out the entire matmul.
+    // Measured: scaling was 1.37x from 4 to 8 threads and only 1.18x from
+    // 8 to 16.
     std::atomic<size_t> next_{0};
     size_t grain_ = 1;
 
-    // Solo per il profiler: istante di fine dell'ultimo dispatch, per misurare
-    // il tratto seriale che lo separa dal successivo. Scritti e letti solo dal
-    // thread chiamante (le regioni parallele non si sovrappongono mai), quindi
-    // non serve sincronizzazione.
+    // For the profiler only: the timestamp of the end of the last
+    // dispatch, to measure the serial stretch that separates it from the
+    // next one. Written and read only by the calling thread (parallel
+    // regions never overlap), so no synchronization is needed.
     std::chrono::steady_clock::time_point last_end_{};
     bool have_last_end_ = false;
-    // Atomico per permettere ai worker di controllarlo in un breve spin-wait
-    // PRIMA di entrare in cv_start_.wait() (riduce la latenza di risveglio
-    // nel caso comune: la dispatch successiva arriva quasi sempre entro
-    // pochi microsecondi). La lettura definitiva di task_/total_ resta
-    // comunque sotto mutex in worker_loop, lo spin e' solo un'euristica per
-    // evitare il costo di un wait/wake col sistema operativo quando non
-    // serve.
+    // Atomic so the workers can check it in a brief spin-wait BEFORE
+    // entering cv_start_.wait() (reduces wake-up latency in the common
+    // case: the next dispatch almost always arrives within a few
+    // microseconds). The definitive read of task_/total_ still happens
+    // under the mutex in worker_loop; the spin is just a heuristic to
+    // avoid the cost of an OS wait/wake when it isn't needed.
     std::atomic<uint64_t> generation_{0};
     std::atomic<size_t> pending_{0};
-    bool stop_ = false; // mai impostato (il pool non viene mai fermato): vedi global().
+    bool stop_ = false; // never set (the pool is never stopped): see global().
 };
 
 }
