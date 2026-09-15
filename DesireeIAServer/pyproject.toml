@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "desireeia-server"
+version = "0.0.1"
+description = "OpenAI-compatible API server and web UI for the DesireeIA local LLM engine"
+readme = "README.md"
+license = {text = "Proprietary"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Passaro Francesco Paolo"},
+]
+keywords = ["llm", "inference", "local", "desireeia", "openai", "server"]
+dependencies = [
+    "desireeia>=0.1.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+desireeia-server = "desireeiaserver.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["desireeiaserver*"]
+
+[tool.setuptools.package-data]
+"desireeiaserver" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

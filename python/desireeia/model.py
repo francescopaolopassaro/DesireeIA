@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import ctypes
 import threading
-from ctypes import c_char, c_float, c_int32, c_uint32, c_uint64, c_void_p, POINTER, byref, cast
+from ctypes import (
+    c_char, c_char_p, c_float, c_int32, c_uint32, c_uint64, c_void_p,
+    POINTER, byref, cast,
+)
 from typing import Callable, Generator, Iterator, List, Optional, Tuple
 
 from . import _native as _nat
@@ -71,7 +74,13 @@ class LocalModel:
     ) -> LocalModel:
         """Load a model from disk. Raises RuntimeError on failure."""
         lib = _nat.get_lib()
-        cb_ref = None
+        # desireeia_create's argtypes declare this parameter as LOG_CB (a
+        # CFUNCTYPE), not a plain c_void_p — ctypes only auto-converts None
+        # to NULL for POINTER argtypes, not for CFUNCTYPE ones, so passing
+        # bare None here raises "expected CFunctionType instance instead of
+        # NoneType" before the call is even made. cast(None, LOG_CB)
+        # produces the null function pointer ctypes actually accepts.
+        cb_ref = cast(None, _nat.LOG_CB)
         if logger is not None:
             def _cb(level: int, msg: c_char_p, user: c_void_p) -> None:
                 if msg:
