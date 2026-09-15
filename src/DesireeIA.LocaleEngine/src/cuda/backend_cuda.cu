@@ -318,6 +318,122 @@ __global__ void attention_kernel(const float* __restrict__ q,
 // fixed-size accumulator array below.
 #define DESIREEIA_ATTN_MAX_ACC 4
 
+// Prefill attention: one block per (token, head) pair, the whole batch in
+// a single launch.
+//
+// Same arithmetic as attention_kernel_q8 below (online softmax over the
+// Q8_0 KV cache), with two differences that come from processing a batch
+// rather than one position:
+//   - `pos` is derived from the block's token index instead of being read
+//     from device memory, since every token of the batch has a different
+//     one;
+//   - the sliding window is applied by passing n_swa = 0 on layers that
+//     don't use it, so the caller doesn't need a second kernel.
+//
+// Why it exists: profiled on a 601-token prompt, prefill spent 3.9 s in
+// GPU kernels and ~13 s on the CPU, nearly all of it this attention. It
+// is also the only O(n^2) part of prefill, so it is what makes a long
+// prompt feel like a freeze.
+__global__ void attention_batch_kernel_q8(const float* __restrict__ q_all,
+                                           const uint8_t* __restrict__ kcache,
+                                           const uint8_t* __restrict__ vcache,
+                                           float* __restrict__ out_all,
+                                           uint32_t head_dim, uint32_t heads_per_kv,
+                                           uint32_t q_dim,
+                                           size_t row_bytes, size_t pos_bytes,
+                                           size_t layer_off,
+                                           uint32_t col0, uint32_t n_swa,
+                                           float inv_d) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t p = blockIdx.y;
+    const uint32_t pos = col0 + p;
+    const uint32_t cc_start = (n_swa > 0 && pos + 1 > n_swa) ? (pos + 1 - n_swa) : 0;
+
+    extern __shared__ float bsmem[];
+    float* sh_score = bsmem;
+    float* sh_red   = bsmem + blockDim.x;
+
+    const uint32_t hkv = h / heads_per_kv;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nthreads = blockDim.x;
+    const uint32_t nblk = head_dim / 32;
+
+    const float* qh = q_all + (size_t) p * q_dim + (size_t) h * head_dim;
+    const uint8_t* kb = kcache + layer_off + (size_t) hkv * row_bytes;
+    const uint8_t* vb = vcache + layer_off + (size_t) hkv * row_bytes;
+
+    float acc[DESIREEIA_ATTN_MAX_ACC];
+    #pragma unroll
+    for (int a = 0; a < DESIREEIA_ATTN_MAX_ACC; ++a) acc[a] = 0.0f;
+
+    float run_max = -INFINITY;
+    float run_sum = 0.0f;
+
+    for (uint32_t base = cc_start; base <= pos; base += nthreads) {
+        const uint32_t cc = base + tid;
+        const bool active = cc <= pos;
+
+        float sc = -INFINITY;
+        if (active) {
+            const uint8_t* row = kb + (size_t) cc * pos_bytes;
+            float dot = 0.0f;
+            for (uint32_t b = 0; b < nblk; ++b) {
+                const uint8_t* blk = row + (size_t) b * 34;
+                const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+                const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 2);
+                float bd = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < 32; ++j) bd += qh[b * 32 + j] * (float) qs[j];
+                dot += d * bd;
+            }
+            sc = dot * inv_d;
+        }
+        sh_red[tid] = sc;
+        __syncthreads();
+        for (unsigned stride = nthreads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) sh_red[tid] = fmaxf(sh_red[tid], sh_red[tid + stride]);
+            __syncthreads();
+        }
+        const float chunk_max = sh_red[0];
+        __syncthreads();
+
+        const float new_max = fmaxf(run_max, chunk_max);
+        const float rescale = (run_max == -INFINITY) ? 0.0f : __expf(run_max - new_max);
+        const float e = active ? __expf(sc - new_max) : 0.0f;
+        sh_score[tid] = e;
+        sh_red[tid] = e;
+        __syncthreads();
+        for (unsigned stride = nthreads / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) sh_red[tid] += sh_red[tid + stride];
+            __syncthreads();
+        }
+        const float chunk_sum = sh_red[0];
+        run_sum = run_sum * rescale + chunk_sum;
+        run_max = new_max;
+
+        const uint32_t n_in_chunk = min(nthreads, pos + 1 - base);
+        for (uint32_t d = tid, a = 0; d < head_dim; d += nthreads, ++a) {
+            const uint32_t b = d / 32;
+            const uint32_t j = d % 32;
+            float sum = 0.0f;
+            for (uint32_t i = 0; i < n_in_chunk; ++i) {
+                const uint8_t* blk = vb + (size_t) (base + i) * pos_bytes + (size_t) b * 34;
+                const float dq = __half2float(*reinterpret_cast<const __half*>(blk));
+                const int8_t qv = reinterpret_cast<const int8_t*>(blk + 2)[j];
+                sum += sh_score[i] * dq * (float) qv;
+            }
+            acc[a] = acc[a] * rescale + sum;
+        }
+        __syncthreads();
+    }
+
+    const float inv_sum = 1.0f / run_sum;
+    float* out = out_all + (size_t) p * q_dim + (size_t) h * head_dim;
+    for (uint32_t d = tid, a = 0; d < head_dim; d += nthreads, ++a) {
+        out[d] = acc[a] * inv_sum;
+    }
+}
+
 __global__ void attention_kernel_q8(const float* __restrict__ q,
                                      const uint8_t* __restrict__ kcache,
                                      const uint8_t* __restrict__ vcache,
@@ -1626,6 +1742,8 @@ struct CudaScratch {
     uint8_t* d_bat_q = nullptr;   size_t bat_q_cap = 0;    // [int8 qs][float scales]
     int32_t* d_bat_sum = nullptr; size_t bat_sum_cap = 0;  // n_tok*nb sums
     float*   d_bat_y = nullptr;   size_t bat_y_cap = 0;    // n_tok*rows floats
+    float*   d_bat_qa = nullptr;  size_t bat_qa_cap = 0;   // n_tok*q_dim floats (prefill attention Q)
+    float*   d_bat_o = nullptr;   size_t bat_o_cap = 0;    // n_tok*q_dim floats (prefill attention out)
     // Whole-layer episode buffers.
     float* d_xn = nullptr;
     float* d_xn2 = nullptr;
@@ -1948,6 +2066,8 @@ void cuda_backend_shutdown() {
     if (g_scratch.d_bat_q) { cudaFree(g_scratch.d_bat_q); g_scratch.d_bat_q = nullptr; }
     if (g_scratch.d_bat_sum) { cudaFree(g_scratch.d_bat_sum); g_scratch.d_bat_sum = nullptr; }
     if (g_scratch.d_bat_y) { cudaFree(g_scratch.d_bat_y); g_scratch.d_bat_y = nullptr; }
+    if (g_scratch.d_bat_qa) { cudaFree(g_scratch.d_bat_qa); g_scratch.d_bat_qa = nullptr; }
+    if (g_scratch.d_bat_o) { cudaFree(g_scratch.d_bat_o); g_scratch.d_bat_o = nullptr; }
     g_scratch.xsum_cap = 0;
     g_scratch.xin_cap = 0; g_scratch.qbuf_cap = 0; g_scratch.kvbuf_cap = 0;
     g_scratch.rope_cap = 0; g_scratch.bq_cap = 0; g_scratch.bkv_cap = 0;
@@ -2226,6 +2346,63 @@ int matmul_kquant_cuda_resident(int format, const void* d_w, size_t rows, size_t
     if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
 
     cudaMemcpyAsync(y, g_scratch.d_y, rows * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return DESIREEIA_ERR_IO;
+    return DESIREEIA_OK;
+}
+
+// Prefill attention for a whole batch of tokens in one episode.
+//
+// The KV cache on device is already current: write_kv_cache mirrors every
+// position as it is produced, and the caller runs this only after the
+// per-token preparation loop (bias, QK-norm, RoPE, KV write) has finished
+// for the entire batch.
+//
+// Returns NOT_SUPPORTED when the shape doesn't fit the kernel's register
+// budget or the KV cache isn't on device, in which case the caller keeps
+// its CPU path — which stays the definition of record.
+int cuda_attention_batch(const float* q_all, float* out_all,
+                          uint32_t n_tokens, uint32_t n_head, uint32_t heads_per_kv,
+                          uint32_t head_dim, uint32_t q_dim,
+                          size_t row_bytes, size_t pos_bytes, size_t layer_off,
+                          uint32_t col0, uint32_t n_swa) {
+    static const bool attn_batch_enabled = std::getenv("DESIREEIA_CUDA_NO_ATTN_BATCH") == nullptr;
+    if (!attn_batch_enabled) return DESIREEIA_ERR_NOT_SUPPORTED;
+    if (!g_scratch.d_kcache || n_tokens == 0 || n_head == 0) return DESIREEIA_ERR_NOT_SUPPORTED;
+    constexpr int athr = 128;
+    // Same register-budget limit as the decode kernel: the V accumulator
+    // holds one entry per head dimension a thread owns.
+    if (head_dim > athr * DESIREEIA_ATTN_MAX_ACC || head_dim % 32 != 0) {
+        return DESIREEIA_ERR_NOT_SUPPORTED;
+    }
+
+    ScopedTimer prof_t(profile_counters().ns_cuda_attn);
+    profile_counters().calls_cuda_attn.fetch_add(n_tokens, std::memory_order_relaxed);
+
+    const size_t n_elem = (size_t) n_tokens * q_dim;
+    auto grow = [](void** p, size_t& cap, size_t need_bytes) {
+        if (need_bytes <= cap && *p) return true;
+        if (*p) cudaFree(*p);
+        *p = nullptr; cap = 0;
+        if (cudaMalloc(p, need_bytes) != cudaSuccess) return false;
+        cap = need_bytes;
+        return true;
+    };
+    if (!grow((void**) &g_scratch.d_bat_qa, g_scratch.bat_qa_cap, n_elem * sizeof(float))) return DESIREEIA_ERR_IO;
+    if (!grow((void**) &g_scratch.d_bat_o, g_scratch.bat_o_cap, n_elem * sizeof(float))) return DESIREEIA_ERR_IO;
+
+    cudaStream_t stream = scratch_stream();
+    cudaMemcpyAsync(g_scratch.d_bat_qa, q_all, n_elem * sizeof(float),
+                    cudaMemcpyHostToDevice, stream);
+
+    const dim3 grid(n_head, n_tokens);
+    attention_batch_kernel_q8<<<grid, athr, 2 * athr * sizeof(float), stream>>>(
+        g_scratch.d_bat_qa, g_scratch.d_kcache, g_scratch.d_vcache, g_scratch.d_bat_o,
+        head_dim, heads_per_kv, q_dim, row_bytes, pos_bytes, layer_off,
+        col0, n_swa, 1.0f / sqrtf((float) head_dim));
+    if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
+
+    cudaMemcpyAsync(out_all, g_scratch.d_bat_o, n_elem * sizeof(float),
+                    cudaMemcpyDeviceToHost, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) return DESIREEIA_ERR_IO;
     return DESIREEIA_OK;
 }

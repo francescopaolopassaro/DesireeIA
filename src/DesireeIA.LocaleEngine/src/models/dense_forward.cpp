@@ -2112,7 +2112,7 @@ void DenseForward::write_kv_cache(uint32_t l, uint32_t pos, const float* k, cons
         // this is the ONLY place the float KV cache is ever written: every
         // path (batch prefill, decode, CPU fallback) goes through here, so
         // the two copies can never diverge.
-        if (cuda_kv_ready_) {
+        if (cuda_kv_ready_ && !kv_mirror_deferred_) {
             cuda_kv_cache_write(elem_off * sizeof(float), k, v, kv_dim * sizeof(float));
         }
 #endif
@@ -2135,7 +2135,7 @@ void DenseForward::write_kv_cache(uint32_t l, uint32_t pos, const float* k, cons
     // Mirror the freshly written quantized position onto the device copy,
     // for the same reason as the float branch above: this is the only
     // place the KV cache is ever written.
-    if (cuda_kv_ready_) {
+    if (cuda_kv_ready_ && !kv_mirror_deferred_) {
         const size_t byte_off = (size_t) l * cache_capacity_ * pos_bytes + (size_t) pos * pos_bytes;
         cuda_kv_cache_write(byte_off, kc, vc, pos_bytes);
     }
@@ -2534,6 +2534,19 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
 
             const float inv_d = 1.0f / sqrtf((float) cfg_.head_dim);
             const uint32_t heads_per_kv = n_head / cfg_.n_head_kv;
+#ifdef DESIREEIA_CUDA_ENABLED
+            // The batch writes a contiguous run of positions in this
+            // layer, so the device mirror is done once for the whole run
+            // below instead of once per position (see the note on
+            // kv_mirror_deferred_).
+            const bool defer_mirror = cuda_kv_ready_ && kv_quantized_ &&
+                                      g_active_backend == DESIREEIA_BACKEND_CUDA;
+            kv_mirror_deferred_ = defer_mirror;
+            struct MirrorGuard {
+                bool& flag;
+                ~MirrorGuard() { flag = false; }
+            } mirror_guard{kv_mirror_deferred_};
+#endif
             for (size_t p = 0; p < n_tokens; ++p) {
                 const uint32_t pos = col0 + (uint32_t) p;
                 float* qp = q_all.data() + p * q_dim;
@@ -2597,6 +2610,67 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             // has now fully completed, so one dispatch over the product is
             // the same arithmetic with the work actually spread out.
             {
+#ifdef DESIREEIA_CUDA_ENABLED
+            // The deferred device mirror is flushed HERE, unconditionally
+            // whenever it was deferred — not inside the attention branch
+            // below. If it only ran when the device attention ran, a shape
+            // the kernel rejects would leave the device KV cache missing
+            // this whole batch, and decode (which reads that cache) would
+            // silently attend to stale positions.
+            if (defer_mirror) {
+                const size_t pos_bytes_m = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
+                const size_t base_off = (size_t) l * cache_capacity_ * pos_bytes_m
+                                      + (size_t) col0 * pos_bytes_m;
+                cuda_kv_cache_write(base_off,
+                                    k_cache_q_.data() + base_off,
+                                    v_cache_q_.data() + base_off,
+                                    n_tokens * pos_bytes_m);
+            }
+            // Whole-batch attention on device. The KV cache mirror is
+            // already current (write_kv_cache above mirrors each position
+            // as it is produced), so this only has to send Q and read the
+            // result back. Any quirk the kernel doesn't implement, or a
+            // shape it can't take, falls through to the CPU loop below.
+            // Only for BIG batches. The device kernel is far faster at the
+            // attention itself, but it pays two transfers of the whole
+            // batch's Q and output plus a synchronisation, per layer, and
+            // that fixed cost is linear while the CPU side it replaces is
+            // O(n^2) — so it only pays off once the batch is large.
+            //
+            // Measured interleaved (alternating the two paths pair by
+            // pair, so thermal drift cancels instead of picking a winner),
+            // prefill tok/s, CPU attention vs device attention:
+            //
+            //    601 tokens   49.8 / 49.2   vs   48.4 / 48.7   -> a tie
+            //   1351 tokens   48.6 / 48.3   vs   70.1 / 71.7   -> +46% device
+            //
+            // A first, non-interleaved pass suggested the device path was
+            // much WORSE at 601 tokens; repeating it properly showed that
+            // was measurement noise on both sides. Worth remembering: on
+            // this machine a single run of this benchmark is worth roughly
+            // nothing.
+            //
+            // The threshold stays because a genuinely small batch (a short
+            // prompt, or a single-token top-up) would still pay the
+            // transfers for no gain. Below it the CPU path runs, which is
+            // also the only path a non-CUDA build has.
+            constexpr size_t kPrefillAttnGpuMin = 1024;
+            bool cuda_attn_batch_done = false;
+            if (n_tokens >= kPrefillAttnGpuMin &&
+                g_active_backend == DESIREEIA_BACKEND_CUDA && cuda_kv_ready_ &&
+                kv_quantized_ && !quirks_.alibi && !quirks_.mla) {
+                const size_t row_bytes = kv_q_row_bytes_;
+                const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
+                const bool is_swa_layer = cfg_.n_swa > 0 && cfg_.layer_is_swa(l);
+                cuda_attn_batch_done = cuda_attention_batch(
+                    q_all.data(), attn_out_all.data(),
+                    (uint32_t) n_tokens, n_head, heads_per_kv, cfg_.head_dim, q_dim,
+                    row_bytes, pos_bytes,
+                    (size_t) l * cache_capacity_ * pos_bytes,
+                    col0, is_swa_layer ? cfg_.n_swa : 0u) == DESIREEIA_OK;
+            }
+            if (!cuda_attn_batch_done) {
+#endif
             const size_t attn_units = n_tokens * (size_t) n_head;
             parallel_units(attn_units, [&](size_t u_begin, size_t u_end) {
                 // One scratch buffer per worker range, not per unit.
@@ -2660,6 +2734,9 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     }
                 }
             });
+#ifdef DESIREEIA_CUDA_ENABLED
+            }
+#endif
             }
 
             // Per-head output gate (see DenseQuirks::attn_gate): computed

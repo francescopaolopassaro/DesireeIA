@@ -447,6 +447,17 @@ DESIREEIA_INTERNAL int matmul_kquant_cuda_resident(int format, const void* d_w, 
 // kernel, so the caller falls back to its per-column path.
 DESIREEIA_INTERNAL int matmul_kquant_cuda_batch(int format, const void* d_w, size_t rows, size_t cols,
                                                const float* x, size_t n_tok, float* y);
+// Prefill attention for a whole batch: one block per (token, head) pair,
+// reading the device KV cache the per-token preparation loop has already
+// filled. q_all and out_all are [token][q_dim] on the host. Pass n_swa = 0
+// on layers without a sliding window. Returns NOT_SUPPORTED when the shape
+// doesn't fit, leaving the caller on its CPU path.
+DESIREEIA_INTERNAL int cuda_attention_batch(const float* q_all, float* out_all,
+                                           uint32_t n_tokens, uint32_t n_head,
+                                           uint32_t heads_per_kv, uint32_t head_dim,
+                                           uint32_t q_dim, size_t row_bytes,
+                                           size_t pos_bytes, size_t layer_off,
+                                           uint32_t col0, uint32_t n_swa);
 DESIREEIA_INTERNAL void cuda_free_device(void* p);
 DESIREEIA_INTERNAL void cuda_backend_shutdown();
 DESIREEIA_INTERNAL int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows, size_t cols,

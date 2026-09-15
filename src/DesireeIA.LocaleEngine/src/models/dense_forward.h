@@ -555,6 +555,14 @@ private:
     // half-measures: a partial device copy would silently give wrong
     // results.
     bool cuda_kv_ready_ = false;
+    // Set while the batch (prefill) path is filling a layer: write_kv_cache
+    // then updates the host cache only and skips the per-position device
+    // mirror, because the batch path uploads the whole range in ONE copy
+    // afterwards. Mirroring position by position there meant two async
+    // copies per token per layer — ~43k tiny transfers for a 600-token
+    // prompt, whose per-call cost lands on the critical path as soon as
+    // anything synchronises.
+    bool kv_mirror_deferred_ = false;
     // Filled by the DESIREEIA_CUDA_VERIFY debugging path only.
     std::vector<float> verify_proj_gpu_;
     uint32_t verify_layer_ = 0;

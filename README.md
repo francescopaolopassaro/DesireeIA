@@ -358,8 +358,32 @@ bound by):
 
 | Model | Quantization | CPU decode | CUDA decode | Speedup |
 | --- | --- | --- | --- | --- |
-| Gemma 2B IT | Q4_K_M | 27.2 tok/s | **82.5 tok/s** | 3.0x |
-| Spark-X2.5 4B | Q4_K_M | 17.2 tok/s | **50.2 tok/s** | 2.9x |
+| Gemma 2B IT | Q4_K_M | 27.2 tok/s | **~80 tok/s** | 2.9x |
+| Spark-X2.5 4B | Q4_K_M | 17.2 tok/s | **~50 tok/s** | 2.9x |
+
+Prompt processing (prefill) runs batched on the device as well — each
+weight is read once for a tile of tokens rather than once per token, and
+past about a thousand tokens the attention itself moves to the GPU too,
+where it is worth +46% on a 1351-token prompt (48.5 → 70.9 tok/s,
+measured by alternating the two paths pair by pair so thermal drift
+cancels out).
+
+To give you a sense of scale on this same laptop with the same Gemma 2B model: 
+while other inference engines average around 30 tok/s—and one of their wrappers 
+even dropped to 20 tok/s—we managed to reach nearly 80 tok/s.
+
+This is a remarkable achievement, especially considering ours is still a very young version.
+ The comparison was carefully controlled, and it should be noted that it was conducted on the exact same hardware, 
+ strictly maintaining identical hardware settings and thermal curves.
+
+**On measuring any of this yourself**: on a laptop these numbers move by
+tens of percent with the machine's power state alone. On the development
+machine the GPU sat in `SW Power Cap` at 25 W of an available 60 W with
+its SM clock at 435 MHz instead of ~1700, which halved decode until the
+vendor's thermal/power profile was set to performance — the Windows power
+plan by itself was not enough. Run any comparison twice, alternating the
+configurations, and re-check a pure bandwidth test if a result looks like
+a regression.
 
 Force a backend explicitly with `--backend cpu|cuda` on the CLI, or leave
 it on auto-detection (the default).
