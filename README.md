@@ -20,6 +20,39 @@ This project started in 2023, out of a simple need: a local inference engine we 
 
 The project was set aside for a while as other priorities took over, but it came back into focus with the development of a personal AI assistant — Kodinn IA, originally called Offgrid — which needed to run primarily on local models. Development resumed, running alongside the rest of that assistant's libraries rather than as the main focus, until it reached the point of being split out and developed as its own project in the shape it's in today.
 
+## 📌 Project Overview
+
+DesireeIA is designed to provide high-performance AI integration tailored for practical enterprise environments. Our primary focus during this early beta phase is delivering maximum efficiency on standard corporate hardware while building a robust, flexible external integration layer.
+
+---
+
+## 🚀 Key Focus Areas & Current Status
+
+### 1. Hardware Optimization for Corporate Laptops
+- We are actively benchmarking and testing DesireeIA on standard enterprise notebooks and laptops.
+- **Goal:** Extract peak performance, low execution latency, and maximum resource efficiency on standard business hardware without requiring specialized high-end GPUs.
+
+### 2. External Integration Infrastructure
+- **Current Support (C#):** We are building our external integration infrastructure primarily in **C#** for seamless compatibility with corporate and enterprise software stacks.
+- **Future Language Support:** We plan to expand support to other languages, particularly **Python**, in upcoming releases to offer multi-language flexibility.
+
+### 3. Model Integration & Quality Tuning
+- **New Models (Spark):** We are integrating cutting-edge model architectures, including **Spark**.
+- **Addressing Hallucinations:** As with new AI model architectures, occasional hallucinations may occur during early testing iterations.
+- **Optimization Strategy:** We are aggressively optimizing for inference speed and responsiveness while strictly maintaining high output quality and accuracy.
+
+---
+
+## 🛣 Roadmap
+
+- [x] Core C# integration infrastructure (Beta 0.1)
+- [x] Performance and memory benchmarking on enterprise laptop profiles
+- [x] Advanced hallucination mitigation and model tuning for Spark
+- [ ] Multi-language bindings (Python SDK expansion)
+- [ ] Comprehensive API documentation and deployment guides
+
+---
+
 ## Supported model formats
 
 - **GGUF**
