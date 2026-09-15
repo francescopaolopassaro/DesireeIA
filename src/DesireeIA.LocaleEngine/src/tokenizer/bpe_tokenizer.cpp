@@ -292,7 +292,14 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
     std::vector<int32_t> out;
     if (!ready()) return out;
 
-    if (add_bos && bos_id_ >= 0) out.push_back(bos_id_);
+    // A model that declares tokenizer.ggml.add_bos_token = false gets NO
+    // automatic BOS, whatever the caller asked for: its prompt format
+    // already places the opening marker itself, and prepending a second
+    // one puts a token the model never saw in that position at the very
+    // start of every prompt. add_bos_default_ carries that declaration
+    // (read in load(); it defaults to true, so models that say nothing,
+    // or say true, behave exactly as before).
+    if (add_bos && add_bos_default_ && bos_id_ >= 0) out.push_back(bos_id_);
 
     auto merge_fn = [this](const std::string& s) { return bpe_merge(s); };
 

@@ -54,6 +54,11 @@ enum class ChatTemplateKind {
     Phi4,
     DeepSeek2,
     DeepSeek3,
+    // Spark2_5: same full-width sentence delimiters as the DeepSeek
+    // family, but the role markers use ORDINARY pipes and different words
+    // (<|System|>/<|User|>/<|Bot|>), so it is a distinct format and not a
+    // variant of the two above.
+    Spark25,
     CommandR,
     ChatGlm3,
     ChatGlm4,

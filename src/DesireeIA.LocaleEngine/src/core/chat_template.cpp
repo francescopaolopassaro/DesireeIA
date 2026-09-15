@@ -68,6 +68,14 @@ ChatTemplateKind detect_chat_template(const std::string& tmpl) {
     // without the split, the compiler (MSVC treats it as hard error
     // C7744, GCC only as a warning) keeps consuming digits past \x9C,
     // producing an out-of-range value instead of the intended UTF-8 byte.
+    // Checked BEFORE the DeepSeek3 rule below: this format shares the same
+    // full-width sentence delimiters but names its roles differently
+    // (<|Bot|> rather than <｜Assistant｜>), so matching on the delimiters
+    // alone would hand it to the wrong builder.
+    if (contains(tmpl, "<|Bot|>") && contains(tmpl, "<|User|>") &&
+        contains(tmpl, "<\xEF\xBD\x9C" "end\xE2\x96\x81" "of\xE2\x96\x81sentence\xEF\xBD\x9C>")) {
+        return ChatTemplateKind::Spark25;
+    }
     if (contains(tmpl, "<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>") &&
         contains(tmpl, "<\xEF\xBD\x9C" "User\xEF\xBD\x9C>") &&
         contains(tmpl, "<\xEF\xBD\x9C" "end\xE2\x96\x81" "of\xE2\x96\x81sentence\xEF\xBD\x9C>")) {
@@ -93,6 +101,7 @@ ChatTemplateKind chat_template_for_arch(ArchKind arch) {
         // gap, still preferable to sending a raw, unformatted prompt.
         case ArchKind::DenseGqa: return ChatTemplateKind::Llama3;
         case ArchKind::Mistral: return ChatTemplateKind::MistralV3;
+        case ArchKind::Spark25: return ChatTemplateKind::Spark25;
         default: return ChatTemplateKind::Unknown;
     }
 }
@@ -265,6 +274,50 @@ std::string apply_chat_template(ChatTemplateKind kind, const std::vector<ChatMes
         }
         if (add_ass) app("<\xEF\xBD\x9C" "Assistant\xEF\xBD\x9C>");
         break;
+
+    case ChatTemplateKind::Spark25: {
+        // Reproduces the template this model family ships in its own
+        // metadata. Three things about it are easy to get wrong:
+        //
+        //  - the system block is ALWAYS emitted, carrying a fixed default
+        //    sentence, with the caller's own system text appended after a
+        //    blank line rather than replacing it;
+        //  - the assistant role marker is <|Bot|>, not <|Assistant|>;
+        //  - every turn is wrapped in the full-width sentence delimiters,
+        //    and the closing one is this model's end-of-sentence token —
+        //    which is exactly what stops generation. Getting the format
+        //    wrong means the model never emits it, never stops, and runs
+        //    to the token limit on every single turn.
+        //
+        // Reasoning blocks are turned OFF here (the template's own opt-out
+        // is to emit a closing </think> in the generation prompt): the
+        // history is rendered the same way, so the conversation stays
+        // self-consistent turn after turn.
+        const std::string sos = "<\xEF\xBD\x9C" "start\xE2\x96\x81" "of\xE2\x96\x81sentence\xEF\xBD\x9C>";
+        const std::string eos = "<\xEF\xBD\x9C" "end\xE2\x96\x81" "of\xE2\x96\x81sentence\xEF\xBD\x9C>";
+        std::string system_extra;
+        for (const auto& m : chat) {
+            if (m.role == "system") { system_extra = m.content; break; }
+        }
+        app(sos + "<|System|>\nyou are a helpful assistant.");
+        if (!system_extra.empty()) app("\n\n" + system_extra);
+        app(eos);
+        bool first_system_seen = false;
+        for (const auto& m : chat) {
+            if (m.role == "system") {
+                // Only the first one belongs to the block above; any later
+                // system message is a turn of its own.
+                if (!first_system_seen) { first_system_seen = true; continue; }
+                app(sos + "<|System|>\n" + m.content + eos);
+            } else if (m.role == "user") {
+                app(sos + "<|User|>" + m.content + eos);
+            } else if (m.role == "assistant") {
+                app(sos + "<|Bot|></think>" + m.content + eos);
+            }
+        }
+        if (add_ass) app(sos + "<|Bot|></think>");
+        break;
+    }
 
     case ChatTemplateKind::Exaone3:
         for (const auto& m : chat) {

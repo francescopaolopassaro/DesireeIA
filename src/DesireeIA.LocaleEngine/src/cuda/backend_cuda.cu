@@ -639,6 +639,91 @@ __global__ void matmul_q4_k_group_kernel(KQuantGroupDesc g,
                   g.y[m], g.bias[m], (lb * nwarps + threadIdx.y) * 4);
 }
 
+// Prefill: one weight read serving MANY activation columns.
+//
+// The decode kernels above are mat-VEC: one column, so every weight byte
+// is read once and used once, and the whole thing is bandwidth-bound.
+// Prefill has hundreds of columns available at once, and running it as
+// hundreds of independent mat-vecs re-reads the entire weight matrix once
+// per token — which is exactly why prefill measured SLOWER per token than
+// decode (30 vs 58 tok/s on gemma-2b) despite being the part that can be
+// batched.
+//
+// Here each warp decodes a weight sub-block ONCE into registers and then
+// multiplies it against TOK activation columns, cutting weight traffic by
+// a factor of TOK. Columns beyond n_tok in the last tile are simply
+// skipped, so no padding of the activation buffer is needed.
+//
+// Layouts: x_qs/x_scale/x_sum are [token][sub-block] (exactly what
+// quantize_q8_0_kernel produces over a flat n_tok*cols activation), and y
+// is [token][row], which is the layout matvec_batch's callers expect.
+template <int nwarps, int TOK>
+__global__ void matmul_q4_k_batch_kernel(const uint8_t* __restrict__ w,
+                                          const int8_t* __restrict__ x_qs,
+                                          const float* __restrict__ x_scale,
+                                          const int32_t* __restrict__ x_sum,
+                                          size_t n_super, size_t rows,
+                                          uint32_t n_tok,
+                                          float* __restrict__ y) {
+    const size_t row = (size_t) blockIdx.x * nwarps + threadIdx.y;
+    if (row >= rows) return;
+    const uint32_t t0 = blockIdx.y * TOK;
+    const size_t n_sub = n_super * 8;
+    const uint8_t* wr = w + row * n_super * 144;
+
+    float acc[TOK];
+    #pragma unroll
+    for (int t = 0; t < TOK; ++t) acc[t] = 0.0f;
+
+    for (size_t sub = threadIdx.x; sub < n_sub; sub += DESIREEIA_CUDA_WARP) {
+        const size_t sblk = sub >> 3;
+        const int j = (int) (sub & 7);
+        const int shift = (j & 1) ? 4 : 0;
+        const int qoff = (j / 2) * 8;
+
+        const uint8_t* b = wr + sblk * 144;
+        uint8_t scv[2], mnv[2];
+        get_scales_pair_k4(j / 2, b + 4, scv, mnv);
+        const int* qs = reinterpret_cast<const int*>(b + 16) + qoff;
+
+        // Decoded once, reused by every column in this tile.
+        int wv[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) wv[k] = (qs[k] >> shift) & 0x0F0F0F0F;
+        const float d    = __half2float(*reinterpret_cast<const __half*>(b));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(b + 2));
+        const float wsc = d * (float) scv[j & 1];
+        const float wmn = dmin * (float) mnv[j & 1];
+
+        #pragma unroll
+        for (int t = 0; t < TOK; ++t) {
+            const uint32_t tk = t0 + (uint32_t) t;
+            if (tk >= n_tok) continue;
+            const size_t idx = (size_t) tk * n_sub + sub;
+            const int* a = reinterpret_cast<const int*>(x_qs + idx * 32);
+            int dot = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) dot = desireeia_dp4a(wv[k], a[k], dot);
+            acc[t] += x_scale[idx] * (wsc * (float) dot - wmn * (float) x_sum[idx]);
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < TOK; ++t) {
+        #pragma unroll
+        for (int off = DESIREEIA_CUDA_WARP / 2; off > 0; off >>= 1) {
+            acc[t] += __shfl_xor_sync(0xffffffff, acc[t], off, DESIREEIA_CUDA_WARP);
+        }
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int t = 0; t < TOK; ++t) {
+            const uint32_t tk = t0 + (uint32_t) t;
+            if (tk < n_tok) y[(size_t) tk * rows + row] = acc[t];
+        }
+    }
+}
+
 // y = W * x with W in Q6_K.
 //
 // Index mapping taken from dequantize_row_q6_K: per half of 128 weights
@@ -743,6 +828,86 @@ static __device__ __forceinline__ void q6k_row_group(
     if (threadIdx.x == 0) {
         y[row0] = bias ? acc0 + bias[row0] : acc0;
         if (has_second) y[row0 + 1] = bias ? acc1 + bias[row0 + 1] : acc1;
+    }
+}
+
+// Q6_K prefill, same idea as matmul_q4_k_batch_kernel: the six-bit
+// weights of a sub-block are unpacked ONCE into registers and then reused
+// across TOK activation columns, instead of being unpacked again for
+// every column.
+template <int nwarps, int TOK>
+__global__ void matmul_q6_k_batch_kernel(const uint8_t* __restrict__ w,
+                                          const int8_t* __restrict__ x_qs,
+                                          const float* __restrict__ x_scale,
+                                          size_t n_super, size_t rows,
+                                          uint32_t n_tok,
+                                          float* __restrict__ y) {
+    const size_t row = (size_t) blockIdx.x * nwarps + threadIdx.y;
+    if (row >= rows) return;
+    const uint32_t t0 = blockIdx.y * TOK;
+    const size_t n_sub = n_super * 8;
+    const uint8_t* wr = w + row * n_super * 210;
+
+    float acc[TOK];
+    #pragma unroll
+    for (int t = 0; t < TOK; ++t) acc[t] = 0.0f;
+
+    for (size_t sub = threadIdx.x; sub < n_sub; sub += DESIREEIA_CUDA_WARP) {
+        const size_t s = sub >> 3;
+        const int idx = (int) (sub & 7);
+        const int half = idx >> 2;
+        const int g = idx & 3;
+
+        const uint8_t* b = wr + s * 210;
+        const int nib_shift = (g < 2) ? 0 : 4;
+        const int h_shift = 2 * g;
+        const uint8_t* ql = b + half * 64 + ((g & 1) ? 32 : 0);
+        const uint8_t* qh = b + 128 + half * 32;
+
+        // Unpacked once, reused by every column in this tile.
+        int vi[8];
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            const int vl = load_int_b2(ql, k);
+            const int vh = load_int_b2(qh, k);
+            vi[k] = __vsubss4((((vl >> nib_shift) & 0x0F0F0F0F) |
+                               ((((vh >> h_shift) & 0x03030303)) << 4)),
+                              0x20202020);
+        }
+        const int8_t* sc = reinterpret_cast<const int8_t*>(b + 192) + half * 8;
+        const float dd = __half2float(*reinterpret_cast<const __half*>(b + 208));
+        const float sc_lo = (float) sc[2 * g + 0];
+        const float sc_hi = (float) sc[2 * g + 1];
+
+        #pragma unroll
+        for (int t = 0; t < TOK; ++t) {
+            const uint32_t tk = t0 + (uint32_t) t;
+            if (tk >= n_tok) continue;
+            const size_t ai = (size_t) tk * n_sub + sub;
+            const int* a = reinterpret_cast<const int*>(x_qs + ai * 32);
+            int dlo = 0, dhi = 0;
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                if (k < 4) dlo = desireeia_dp4a(vi[k], a[k], dlo);
+                else       dhi = desireeia_dp4a(vi[k], a[k], dhi);
+            }
+            acc[t] += x_scale[ai] * dd * (sc_lo * (float) dlo + sc_hi * (float) dhi);
+        }
+    }
+
+    #pragma unroll
+    for (int t = 0; t < TOK; ++t) {
+        #pragma unroll
+        for (int off = DESIREEIA_CUDA_WARP / 2; off > 0; off >>= 1) {
+            acc[t] += __shfl_xor_sync(0xffffffff, acc[t], off, DESIREEIA_CUDA_WARP);
+        }
+    }
+    if (threadIdx.x == 0) {
+        #pragma unroll
+        for (int t = 0; t < TOK; ++t) {
+            const uint32_t tk = t0 + (uint32_t) t;
+            if (tk < n_tok) y[(size_t) tk * rows + row] = acc[t];
+        }
     }
 }
 
@@ -1454,6 +1619,13 @@ struct CudaScratch {
     uint32_t* d_dyn = nullptr;   // [pos, cc_start], updated before each graph launch
     int32_t* d_xsum = nullptr;   // per-sub-block activation sums (Q4_K min term)
     size_t xsum_cap = 0;
+    // Prefill (batched) buffers, kept SEPARATE from everything above on
+    // purpose: none of these is ever captured into a graph, so growing
+    // them costs nothing and cannot invalidate the decode path's graphs.
+    float*   d_bat_x = nullptr;   size_t bat_x_cap = 0;    // n_tok*cols floats
+    uint8_t* d_bat_q = nullptr;   size_t bat_q_cap = 0;    // [int8 qs][float scales]
+    int32_t* d_bat_sum = nullptr; size_t bat_sum_cap = 0;  // n_tok*nb sums
+    float*   d_bat_y = nullptr;   size_t bat_y_cap = 0;    // n_tok*rows floats
     // Whole-layer episode buffers.
     float* d_xn = nullptr;
     float* d_xn2 = nullptr;
@@ -1772,6 +1944,10 @@ void cuda_backend_shutdown() {
     if (g_scratch.d_bv) { cudaFree(g_scratch.d_bv); g_scratch.d_bv = nullptr; }
     if (g_scratch.d_stage2) { cudaFree(g_scratch.d_stage2); g_scratch.d_stage2 = nullptr; }
     if (g_scratch.d_xsum) { cudaFree(g_scratch.d_xsum); g_scratch.d_xsum = nullptr; }
+    if (g_scratch.d_bat_x) { cudaFree(g_scratch.d_bat_x); g_scratch.d_bat_x = nullptr; }
+    if (g_scratch.d_bat_q) { cudaFree(g_scratch.d_bat_q); g_scratch.d_bat_q = nullptr; }
+    if (g_scratch.d_bat_sum) { cudaFree(g_scratch.d_bat_sum); g_scratch.d_bat_sum = nullptr; }
+    if (g_scratch.d_bat_y) { cudaFree(g_scratch.d_bat_y); g_scratch.d_bat_y = nullptr; }
     g_scratch.xsum_cap = 0;
     g_scratch.xin_cap = 0; g_scratch.qbuf_cap = 0; g_scratch.kvbuf_cap = 0;
     g_scratch.rope_cap = 0; g_scratch.bq_cap = 0; g_scratch.bkv_cap = 0;
@@ -2050,6 +2226,80 @@ int matmul_kquant_cuda_resident(int format, const void* d_w, size_t rows, size_t
     if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
 
     cudaMemcpyAsync(y, g_scratch.d_y, rows * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return DESIREEIA_ERR_IO;
+    return DESIREEIA_OK;
+}
+
+// Batched prefill mat-mul: every activation column uploaded once, one
+// quantization pass over all of them, ONE kernel, one download, one
+// synchronization — against the per-token loop's n of each.
+//
+// Only Q4_K is batched here. Other formats return NOT_SUPPORTED and the
+// caller keeps its per-column path, which stays correct; extending this
+// is a matter of writing the equivalent kernel for them, not of changing
+// anything around it.
+int matmul_kquant_cuda_batch(int format, const void* d_w, size_t rows, size_t cols,
+                              const float* x, size_t n_tok, float* y) {
+    // Escape hatch, same purpose as DESIREEIA_CUDA_NO_GROUP: batching must
+    // be a pure scheduling change, and that has to be checkable against
+    // the per-column path rather than argued.
+    static const bool batch_enabled = std::getenv("DESIREEIA_CUDA_NO_BATCH") == nullptr;
+    if (!batch_enabled) return DESIREEIA_ERR_NOT_SUPPORTED;
+    if (format != DESIREEIA_CUDA_FMT_Q4_K && format != DESIREEIA_CUDA_FMT_Q6_K) {
+        return DESIREEIA_ERR_NOT_SUPPORTED;
+    }
+    if (!d_w || rows == 0 || n_tok == 0 || cols == 0 || cols % 256 != 0) {
+        return DESIREEIA_ERR_NOT_SUPPORTED;
+    }
+
+    ScopedTimer prof_t(profile_counters().ns_cuda_resident);
+    profile_counters().calls_cuda_resident.fetch_add((int64_t) n_tok, std::memory_order_relaxed);
+
+    const size_t nb = cols / 32;
+    const size_t n_elem = n_tok * cols;
+    const size_t n_blk = n_tok * nb;
+    const size_t n_out = n_tok * rows;
+
+    auto grow = [](void** p, size_t& cap, size_t need_bytes) {
+        if (need_bytes <= cap && *p) return true;
+        if (*p) cudaFree(*p);
+        *p = nullptr; cap = 0;
+        if (cudaMalloc(p, need_bytes) != cudaSuccess) return false;
+        cap = need_bytes;
+        return true;
+    };
+    if (!grow((void**) &g_scratch.d_bat_x, g_scratch.bat_x_cap, n_elem * sizeof(float))) return DESIREEIA_ERR_IO;
+    if (!grow((void**) &g_scratch.d_bat_q, g_scratch.bat_q_cap, n_blk * 32 + n_blk * sizeof(float))) return DESIREEIA_ERR_IO;
+    if (!grow((void**) &g_scratch.d_bat_sum, g_scratch.bat_sum_cap, n_blk * sizeof(int32_t))) return DESIREEIA_ERR_IO;
+    if (!grow((void**) &g_scratch.d_bat_y, g_scratch.bat_y_cap, n_out * sizeof(float))) return DESIREEIA_ERR_IO;
+
+    cudaStream_t stream = scratch_stream();
+    cudaMemcpyAsync(g_scratch.d_bat_x, x, n_elem * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+    int8_t* d_xq = reinterpret_cast<int8_t*>(g_scratch.d_bat_q);
+    float* d_xscale = reinterpret_cast<float*>(g_scratch.d_bat_q + n_blk * 32);
+    // One quantization over the whole flat activation: the kernel is
+    // already per-32-block, so a flat n_tok*cols input yields exactly the
+    // [token][sub-block] layout the batched kernel indexes.
+    quantize_q8_0_kernel<<<(unsigned) n_blk, 32, 0, stream>>>(g_scratch.d_bat_x, n_elem,
+                                                               d_xq, d_xscale, g_scratch.d_bat_sum);
+
+    constexpr int kTok = 8;
+    const dim3 block(DESIREEIA_CUDA_WARP, kMatmulQ80Warps);
+    const dim3 grid((unsigned) ((rows + kMatmulQ80Warps - 1) / kMatmulQ80Warps),
+                    (unsigned) ((n_tok + kTok - 1) / kTok));
+    if (format == DESIREEIA_CUDA_FMT_Q4_K) {
+        matmul_q4_k_batch_kernel<kMatmulQ80Warps, kTok><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(d_w), d_xq, d_xscale, g_scratch.d_bat_sum,
+            cols / 256, rows, (uint32_t) n_tok, g_scratch.d_bat_y);
+    } else {
+        matmul_q6_k_batch_kernel<kMatmulQ80Warps, kTok><<<grid, block, 0, stream>>>(
+            static_cast<const uint8_t*>(d_w), d_xq, d_xscale,
+            cols / 256, rows, (uint32_t) n_tok, g_scratch.d_bat_y);
+    }
+    if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
+
+    cudaMemcpyAsync(y, g_scratch.d_bat_y, n_out * sizeof(float), cudaMemcpyDeviceToHost, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) return DESIREEIA_ERR_IO;
     return DESIREEIA_OK;
 }

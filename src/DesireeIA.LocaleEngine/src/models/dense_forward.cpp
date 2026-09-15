@@ -388,22 +388,45 @@ static size_t row_bytes_of(const MatVec& m, size_t total_rows) {
 // quantized kernels.
 static void matvec_batch(const MatVec& m, size_t r, size_t c, const float* x, size_t n_tok, float* y) {
 #ifdef DESIREEIA_CUDA_ENABLED
-    // Same backend gate as matvec above. No device batched kernel written
-    // yet (out of scope for Phase 1, see docs/CUDAPiano.md): calls the
-    // existing per-token kernel one column at a time. Correct but not
-    // optimized — batch optimization is explicitly a later phase, not
-    // invented here.
-    if (g_active_backend == DESIREEIA_BACKEND_CUDA && m.format == MatVecFormat::Q8_0) {
-        const bool resident = m.cuda_qs && m.cuda_scale;
-        for (size_t tk = 0; tk < n_tok; ++tk) {
-            if (resident) {
+    // Same backend gate as matvec above. This still calls the per-token
+    // kernel one column at a time (a true batched kernel, reading each
+    // weight once for ALL columns, is the real fix and is separate); what
+    // it does do is stop restricting that to Q8_0. Every K-quant used to
+    // fall through to the CPU branch below, which meant a Q4_K_M model —
+    // i.e. the common case — ran its ENTIRE prefill on CPU while decode
+    // ran on the GPU. Measured on gemma-2b: prefill was 30 tok/s against
+    // 58 tok/s decode, slower per token than decode despite prefill being
+    // the part that can actually be batched.
+    if (g_active_backend == DESIREEIA_BACKEND_CUDA) {
+        if (m.format == MatVecFormat::Q8_0 && m.cuda_qs && m.cuda_scale) {
+            for (size_t tk = 0; tk < n_tok; ++tk) {
                 matmul_q8_0_cuda_resident(m.cuda_qs.get(), m.cuda_scale.get(), r, c, x + tk * c, y + tk * r);
-            } else {
-                matmul_q8_0_cuda(m.raw.data(), r, c, x + tk * c, y + tk * r);
             }
+            apply_lora_batch(m, r, c, x, n_tok, y);
+            return;
         }
-        apply_lora_batch(m, r, c, x, n_tok, y);
-        return;
+        const int cuda_fmt = cuda_fmt_of(m.format);
+        if (cuda_fmt != 0 && m.cuda_qs) {
+            // One episode for every column, each weight read once for all
+            // of them. Only some formats have a batched kernel; the rest
+            // fall through to the per-column loop below.
+            if (n_tok > 1 &&
+                matmul_kquant_cuda_batch(cuda_fmt, m.cuda_qs.get(), r, c, x, n_tok, y) == DESIREEIA_OK) {
+                apply_lora_batch(m, r, c, x, n_tok, y);
+                return;
+            }
+            bool all_ok = true;
+            for (size_t tk = 0; tk < n_tok && all_ok; ++tk) {
+                all_ok = matmul_kquant_cuda_resident(cuda_fmt, m.cuda_qs.get(), r, c,
+                                                     x + tk * c, y + tk * r) == DESIREEIA_OK;
+            }
+            if (all_ok) {
+                apply_lora_batch(m, r, c, x, n_tok, y);
+                return;
+            }
+            // Any failure falls through to the CPU path below, which
+            // recomputes every column from scratch: correct either way.
+        }
     }
 #endif
     switch (m.format) {

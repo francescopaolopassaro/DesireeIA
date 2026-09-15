@@ -46,7 +46,11 @@ private:
     int32_t bos_id_ = -1;
     int32_t eos_id_ = -1;
     int32_t unk_id_ = -1;
-    bool add_bos_default_ = false;
+    // Mirrors tokenizer.ggml.add_bos_token. True when the model says
+    // nothing, matching the format's own default and keeping every model
+    // that predates this check behaving exactly as before; load() then
+    // overwrites it with whatever the file actually declares.
+    bool add_bos_default_ = true;
 
     // Special-token cache (CONTROL/USER_DEFINED/UNKNOWN), sorted by
     // decreasing text length so the longest match wins.

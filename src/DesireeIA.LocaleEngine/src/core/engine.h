@@ -441,6 +441,12 @@ DESIREEIA_INTERNAL bool cuda_upload_weights(int format, const uint8_t* data, siz
                                            void** out_d_qs, void** out_d_scale);
 DESIREEIA_INTERNAL int matmul_kquant_cuda_resident(int format, const void* d_w, size_t rows, size_t cols,
                                                   const float* x, float* y);
+// Batched (prefill) form: n_tok activation columns in one episode, each
+// weight read once for all of them instead of once per column. y is
+// [token][row]. Returns NOT_SUPPORTED for formats without a batched
+// kernel, so the caller falls back to its per-column path.
+DESIREEIA_INTERNAL int matmul_kquant_cuda_batch(int format, const void* d_w, size_t rows, size_t cols,
+                                               const float* x, size_t n_tok, float* y);
 DESIREEIA_INTERNAL void cuda_free_device(void* p);
 DESIREEIA_INTERNAL void cuda_backend_shutdown();
 DESIREEIA_INTERNAL int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows, size_t cols,
