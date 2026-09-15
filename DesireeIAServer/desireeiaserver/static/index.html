@@ -1,0 +1,546 @@
+<!--
+DesireeIA
+Copyright (c) Passaro Francesco Paolo. All rights reserved.
+Licensed under the DesireeIA License - see LICENSE and the "License"
+section of README.md for full terms: no modification, no unauthorized
+integration, no AI training/ingestion without explicit written consent
+from the author.
+
+Chat UI for the DesireeIA server: talks to its own /v1/chat/completions
+(SSE streaming), /v1/models, /props and /config endpoints — no build step,
+no framework, served as a static file by FastAPI (see app.py's
+_static_directory). Kept to one file on purpose: this is an operator
+console bundled with the server binary, not a product with its own
+release cycle.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DesireeIA</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1115; --panel: #171a21; --border: #262b36; --border-2: #333a4a;
+      --text: #e6e6e6; --muted: #8b93a3; --accent: #4f8cff; --accent-2: #3a6fd8;
+      --ok: #5bd68a; --err: #ff7b72; --warn: #e6b45b;
+      --bubble-user: #1f3a5f; --bubble-assistant: #1c2028;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--text); height: 100vh; overflow: hidden;
+    }
+    #app { display: flex; height: 100vh; }
+
+    /* --- sidebar --- */
+    #sidebar {
+      width: 280px; min-width: 220px; max-width: 360px; flex-shrink: 0;
+      background: var(--panel); border-right: 1px solid var(--border);
+      display: flex; flex-direction: column; padding: 0.75rem;
+      overflow-y: auto;
+    }
+    #sidebar h1 { font-size: 1rem; margin: 0.25rem 0 0.75rem; font-weight: 600; }
+    .field { margin-bottom: 0.85rem; }
+    .field label {
+      display: block; font-size: 0.72rem; color: var(--muted);
+      text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 0.3rem;
+    }
+    select, input[type=number], input[type=text], input[type=password], textarea {
+      width: 100%; background: #0f1115; color: var(--text);
+      border: 1px solid var(--border-2); border-radius: 6px;
+      padding: 0.4rem 0.5rem; font-size: 0.85rem; font-family: inherit;
+    }
+    select:focus, input:focus, textarea:focus { outline: 1px solid var(--accent); }
+    .range-row { display: flex; align-items: center; gap: 0.5rem; }
+    .range-row input[type=range] { flex: 1; accent-color: var(--accent); }
+    .range-row span {
+      width: 3rem; text-align: right; font-variant-numeric: tabular-nums;
+      font-size: 0.8rem; color: var(--muted);
+    }
+    .btn {
+      background: var(--accent); color: white; border: none; border-radius: 6px;
+      padding: 0.45rem 0.8rem; font-size: 0.85rem; cursor: pointer; font-weight: 500;
+    }
+    .btn:hover { background: var(--accent-2); }
+    .btn:disabled { opacity: 0.5; cursor: default; }
+    .btn-secondary { background: #262b36; }
+    .btn-secondary:hover { background: #333a4a; }
+    .btn-row { display: flex; gap: 0.5rem; }
+    #settings-status { font-size: 0.75rem; margin-top: 0.4rem; min-height: 1rem; }
+    #settings-status.ok { color: var(--ok); }
+    #settings-status.err { color: var(--err); }
+    hr.sep { border: none; border-top: 1px solid var(--border); margin: 0.9rem 0; }
+    #status-line {
+      margin-top: auto; padding-top: 0.75rem; font-size: 0.72rem; color: var(--muted);
+      display: flex; align-items: center; gap: 0.4rem;
+    }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex-shrink: 0; }
+    .dot.ok { background: var(--ok); }
+    .dot.err { background: var(--err); }
+    .dot.warn { background: var(--warn); }
+
+    /* --- chat column --- */
+    #chat-col { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    #messages {
+      flex: 1; overflow-y: auto; padding: 1.25rem 1.5rem;
+      display: flex; flex-direction: column; gap: 0.9rem;
+    }
+    .msg { max-width: 46rem; margin: 0 auto; width: 100%; display: flex; }
+    .msg.user { justify-content: flex-end; }
+    .bubble {
+      max-width: 80%; padding: 0.6rem 0.85rem; border-radius: 10px;
+      white-space: pre-wrap; word-wrap: break-word; line-height: 1.45; font-size: 0.92rem;
+    }
+    .msg.user .bubble { background: var(--bubble-user); }
+    .msg.assistant .bubble { background: var(--bubble-assistant); border: 1px solid var(--border); }
+    .bubble.streaming::after {
+      content: '▍'; opacity: 0.6; animation: blink 1s step-start infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+    .bubble .meta {
+      display: block; margin-top: 0.4rem; font-size: 0.7rem; color: var(--muted);
+    }
+    .bubble.error { border-color: var(--err); color: var(--err); }
+    .empty-hint {
+      margin: auto; color: var(--muted); font-size: 0.9rem; text-align: center;
+    }
+
+    #composer {
+      border-top: 1px solid var(--border); padding: 0.85rem 1.5rem 1.1rem;
+      display: flex; justify-content: center;
+    }
+    #composer-inner { max-width: 46rem; width: 100%; display: flex; gap: 0.6rem; align-items: flex-end; }
+    #prompt {
+      flex: 1; resize: none; min-height: 2.4rem; max-height: 10rem;
+      padding: 0.55rem 0.75rem; font-size: 0.92rem; line-height: 1.4;
+    }
+    #send-btn, #stop-btn { flex-shrink: 0; padding: 0.55rem 1.1rem; }
+    #stop-btn { background: #4a2020; display: none; }
+    #stop-btn:hover { background: #5c2828; }
+    #stop-btn.visible { display: inline-block; }
+    #send-btn.hidden { display: none; }
+
+    ::-webkit-scrollbar { width: 10px; }
+    ::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 5px; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <h1>DesireeIA</h1>
+
+    <div class="field">
+      <label for="model-select">Model</label>
+      <select id="model-select"></select>
+    </div>
+
+    <div class="field">
+      <label for="system-prompt">System prompt</label>
+      <textarea id="system-prompt" rows="2" placeholder="(optional)"></textarea>
+    </div>
+
+    <hr class="sep">
+
+    <div class="field">
+      <label>Temperature <span id="temperature-val"></span></label>
+      <div class="range-row">
+        <input type="range" id="temperature" min="0" max="2" step="0.05">
+      </div>
+    </div>
+    <div class="field">
+      <label>Top-p <span id="top_p-val"></span></label>
+      <div class="range-row">
+        <input type="range" id="top_p" min="0" max="1" step="0.01">
+      </div>
+    </div>
+    <div class="field">
+      <label>Top-k</label>
+      <input type="number" id="top_k" min="0" step="1">
+    </div>
+    <div class="field">
+      <label>Repeat penalty</label>
+      <input type="number" id="repeat_penalty" min="0" step="0.01">
+    </div>
+    <div class="field">
+      <label>Max tokens (n_predict)</label>
+      <input type="number" id="n_predict" min="1" step="1">
+    </div>
+
+    <div class="btn-row">
+      <button class="btn" id="save-settings">Save to server</button>
+      <button class="btn btn-secondary" id="reload-settings">Reload</button>
+    </div>
+    <div id="settings-status"></div>
+
+    <div id="status-line">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">connecting…</span>
+    </div>
+  </aside>
+
+  <div id="chat-col">
+    <div id="messages">
+      <div class="empty-hint" id="empty-hint">Start a conversation below.</div>
+    </div>
+    <div id="composer">
+      <div id="composer-inner">
+        <textarea id="prompt" placeholder="Message DesireeIA… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+        <button class="btn" id="send-btn">Send</button>
+        <button class="btn" id="stop-btn">Stop</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---- state -------------------------------------------------------
+  const state = {
+    messages: [],          // [{role, content}]
+    controller: null,      // AbortController for the in-flight stream
+    settings: null,        // last settings object fetched from /config
+  };
+
+  const $ = (id) => document.getElementById(id);
+  const el = {
+    modelSelect: $('model-select'),
+    systemPrompt: $('system-prompt'),
+    messages: $('messages'),
+    emptyHint: $('empty-hint'),
+    prompt: $('prompt'),
+    sendBtn: $('send-btn'),
+    stopBtn: $('stop-btn'),
+    statusDot: $('status-dot'),
+    statusText: $('status-text'),
+    settingsStatus: $('settings-status'),
+    saveSettings: $('save-settings'),
+    reloadSettings: $('reload-settings'),
+    sliders: {
+      temperature: $('temperature'),
+      top_p: $('top_p'),
+    },
+    numbers: {
+      top_k: $('top_k'),
+      repeat_penalty: $('repeat_penalty'),
+      n_predict: $('n_predict'),
+    },
+  };
+
+  function setStatus(kind, text) {
+    el.statusDot.className = 'dot ' + kind;
+    el.statusText.textContent = text;
+  }
+
+  // ---- API helpers ---------------------------------------------------
+  // All requests go through fetch; errors follow this server's OpenAI-style
+  // envelope ({error:{message,type,code}}), which errorMessage() unwraps so
+  // both the chat bubble and the settings status line can show something a
+  // person can act on instead of a raw HTTP status.
+  async function errorMessage(resp) {
+    let body = null;
+    try { body = await resp.json(); } catch (_) { /* not JSON, fall through */ }
+    if (body && body.error && body.error.message) return body.error.message;
+    return `HTTP ${resp.status}`;
+  }
+
+  async function fetchJSON(url, opts) {
+    const resp = await fetch(url, opts);
+    if (!resp.ok) throw new Error(await errorMessage(resp));
+    return resp.json();
+  }
+
+  // ---- health / model list -------------------------------------------
+  async function refreshHealth() {
+    try {
+      const h = await fetchJSON('/health');
+      if (h.status === 'ok') setStatus('ok', 'connected · ' + (h.engine_version || h.version));
+      else if (h.status === 'loading') setStatus('warn', 'loading model…');
+      else setStatus('err', h.status);
+    } catch (e) {
+      setStatus('err', 'unreachable');
+    }
+  }
+
+  async function refreshModels() {
+    let data;
+    try {
+      data = await fetchJSON('/v1/models');
+    } catch (e) {
+      return;
+    }
+    const models = data.data || [];
+    const previous = el.modelSelect.value;
+    el.modelSelect.innerHTML = '';
+    if (models.length === 0) {
+      const opt = document.createElement('option');
+      opt.textContent = '(no model loaded)';
+      opt.value = '';
+      el.modelSelect.appendChild(opt);
+      el.modelSelect.disabled = true;
+      return;
+    }
+    el.modelSelect.disabled = false;
+    for (const m of models) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.id + (m.meta && m.meta.state ? ` (${m.meta.state})` : '');
+      el.modelSelect.appendChild(opt);
+    }
+    // Keep the previous selection if it still exists; otherwise fall back
+    // to whatever the server reports as loaded first.
+    if (models.some(m => m.id === previous)) el.modelSelect.value = previous;
+  }
+
+  // ---- settings panel --------------------------------------------------
+  // /config's shape is {settings: {...}, path: "..."}; POST expects the same
+  // {settings: {...}} envelope back (settings_api.py). Only the fields this
+  // panel actually edits are round-tripped, matching how config.py's
+  // _apply_overrides merges a partial update onto the existing Settings.
+  function applySettingsToForm(s) {
+    state.settings = s;
+    el.sliders.temperature.value = s.temperature;
+    $('temperature-val').textContent = Number(s.temperature).toFixed(2);
+    el.sliders.top_p.value = s.top_p;
+    $('top_p-val').textContent = Number(s.top_p).toFixed(2);
+    el.numbers.top_k.value = s.top_k;
+    el.numbers.repeat_penalty.value = s.repeat_penalty;
+    el.numbers.n_predict.value = s.n_predict;
+  }
+
+  async function loadSettings() {
+    try {
+      const data = await fetchJSON('/config');
+      applySettingsToForm(data.settings);
+      el.settingsStatus.textContent = '';
+    } catch (e) {
+      el.settingsStatus.className = 'err';
+      el.settingsStatus.textContent = 'could not load settings: ' + e.message;
+    }
+  }
+
+  async function saveSettings() {
+    const updates = {
+      temperature: Number(el.sliders.temperature.value),
+      top_p: Number(el.sliders.top_p.value),
+      top_k: parseInt(el.numbers.top_k.value, 10),
+      repeat_penalty: Number(el.numbers.repeat_penalty.value),
+      n_predict: parseInt(el.numbers.n_predict.value, 10),
+    };
+    el.settingsStatus.className = '';
+    el.settingsStatus.textContent = 'saving…';
+    try {
+      const data = await fetchJSON('/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ settings: updates }),
+      });
+      applySettingsToForm(data.settings);
+      el.settingsStatus.className = 'ok';
+      el.settingsStatus.textContent = 'saved to ' + data.saved;
+      setTimeout(() => { el.settingsStatus.textContent = ''; }, 3000);
+    } catch (e) {
+      el.settingsStatus.className = 'err';
+      el.settingsStatus.textContent = 'save failed: ' + e.message;
+    }
+  }
+
+  el.sliders.temperature.addEventListener('input', () => {
+    $('temperature-val').textContent = Number(el.sliders.temperature.value).toFixed(2);
+  });
+  el.sliders.top_p.addEventListener('input', () => {
+    $('top_p-val').textContent = Number(el.sliders.top_p.value).toFixed(2);
+  });
+  el.saveSettings.addEventListener('click', saveSettings);
+  el.reloadSettings.addEventListener('click', loadSettings);
+
+  // ---- chat rendering -------------------------------------------------
+  function renderMessages() {
+    el.messages.innerHTML = '';
+    if (state.messages.length === 0) {
+      el.messages.appendChild(el.emptyHint);
+      return;
+    }
+    for (const m of state.messages) {
+      const row = document.createElement('div');
+      row.className = 'msg ' + m.role;
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = m.content;
+      row.appendChild(bubble);
+      el.messages.appendChild(row);
+    }
+    el.messages.scrollTop = el.messages.scrollHeight;
+  }
+
+  function addMessage(role, content) {
+    state.messages.push({ role, content });
+    renderMessages();
+    return state.messages[state.messages.length - 1];
+  }
+
+  // ---- SSE streaming ---------------------------------------------------
+  // Uses fetch + a manual ReadableStream reader rather than EventSource:
+  // EventSource can only send GET requests, and chat needs POST with a JSON
+  // body (the messages array, sampling params). The server's stream is
+  // still standard SSE ("data: {...}\n\n", closed by "data: [DONE]\n\n" —
+  // see chat.py's sse()/_chat_stream()), only the client transport differs.
+  async function streamChat(messages) {
+    const controller = new AbortController();
+    state.controller = controller;
+    el.sendBtn.classList.add('hidden');
+    el.stopBtn.classList.add('visible');
+
+    const assistantMsg = addMessage('assistant', '');
+    const bubbleEls = () => el.messages.querySelectorAll('.msg.assistant .bubble');
+
+    let resp;
+    try {
+      resp = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model: el.modelSelect.value || undefined,
+          messages: messages,
+          stream: true,
+          temperature: Number(el.sliders.temperature.value),
+          top_p: Number(el.sliders.top_p.value),
+          top_k: parseInt(el.numbers.top_k.value, 10),
+          repeat_penalty: Number(el.numbers.repeat_penalty.value),
+          max_tokens: parseInt(el.numbers.n_predict.value, 10),
+        }),
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') { finishStreaming(); return; }
+      assistantMsg.content = '[request failed: ' + e.message + ']';
+      renderMessages();
+      finishStreaming();
+      return;
+    }
+
+    if (!resp.ok) {
+      assistantMsg.content = '[' + (await errorMessage(resp)) + ']';
+      renderMessages();
+      const bubbles = bubbleEls();
+      if (bubbles.length) bubbles[bubbles.length - 1].classList.add('error');
+      finishStreaming();
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let usage = null;
+
+    // Mark the bubble as actively streaming (cursor blink) until the
+    // final chunk or an abort/error ends the loop.
+    renderMessages();
+    let lastBubbles = bubbleEls();
+    if (lastBubbles.length) lastBubbles[lastBubbles.length - 1].classList.add('streaming');
+
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n\n');
+        buf = lines.pop(); // keep the last, possibly incomplete, event
+        for (const line of lines) {
+          const dataLine = line.split('\n').find(l => l.startsWith('data: '));
+          if (!dataLine) continue;
+          const payload = dataLine.slice(6);
+          if (payload === '[DONE]') continue;
+          let evt;
+          try { evt = JSON.parse(payload); } catch (_) { continue; }
+          const choice = (evt.choices && evt.choices[0]) || {};
+          const delta = choice.delta && choice.delta.content;
+          if (delta) {
+            assistantMsg.content += delta;
+            const bubbles = bubbleEls();
+            if (bubbles.length) bubbles[bubbles.length - 1].textContent = assistantMsg.content;
+            el.messages.scrollTop = el.messages.scrollHeight;
+          }
+          if (evt.usage) usage = evt.usage;
+        }
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        assistantMsg.content += '\n[stream error: ' + e.message + ']';
+        renderMessages();
+      }
+    } finally {
+      const bubbles = bubbleEls();
+      if (bubbles.length) {
+        const last = bubbles[bubbles.length - 1];
+        last.classList.remove('streaming');
+        last.textContent = assistantMsg.content;
+        if (usage) {
+          const meta = document.createElement('span');
+          meta.className = 'meta';
+          meta.textContent = `${usage.completion_tokens ?? '?'} tokens`;
+          last.appendChild(meta);
+        }
+      }
+      finishStreaming();
+    }
+  }
+
+  function finishStreaming() {
+    state.controller = null;
+    el.sendBtn.classList.remove('hidden');
+    el.stopBtn.classList.remove('visible');
+  }
+
+  el.stopBtn.addEventListener('click', () => {
+    if (state.controller) state.controller.abort();
+  });
+
+  // ---- composer ---------------------------------------------------------
+  function autoGrow() {
+    el.prompt.style.height = 'auto';
+    el.prompt.style.height = Math.min(el.prompt.scrollHeight, 160) + 'px';
+  }
+  el.prompt.addEventListener('input', autoGrow);
+
+  function send() {
+    const text = el.prompt.value.trim();
+    if (!text || state.controller) return;
+    el.prompt.value = '';
+    autoGrow();
+
+    if (state.messages.length === 0 && el.systemPrompt.value.trim()) {
+      state.messages.push({ role: 'system', content: el.systemPrompt.value.trim() });
+    }
+    addMessage('user', text);
+
+    const history = state.messages.map(m => ({ role: m.role, content: m.content }));
+    streamChat(history);
+  }
+
+  el.sendBtn.addEventListener('click', send);
+  el.prompt.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+
+  // ---- boot ---------------------------------------------------------
+  async function boot() {
+    await Promise.all([refreshHealth(), refreshModels(), loadSettings()]);
+    renderMessages();
+    // Health and the model list can change from another client (a model
+    // finishing loading, /config being edited elsewhere), so both are
+    // polled rather than fetched once at load.
+    setInterval(refreshHealth, 5000);
+    setInterval(refreshModels, 8000);
+  }
+  boot();
+})();
+</script>
+</body>
+</html>

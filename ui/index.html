@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DesireeIA</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; font-family: system-ui, sans-serif; background: #0f1115; color: #e6e6e6; }
+    main { max-width: 40rem; margin: 4rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.4rem; }
+    .card { background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 1rem; margin-top: 1rem; }
+    .row { display: flex; justify-content: space-between; padding: 0.25rem 0; }
+    .ok { color: #5bd68a; }
+    .err { color: #ff7b72; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>DesireeIA</h1>
+    <p>The chat UI is under construction. This page reports server status.</p>
+    <div class="card" id="health"><span>checking /health...</span></div>
+    <div class="card" id="version"></div>
+  </main>
+  <script>
+    fetch('/health').then(r => r.json()).then(h => {
+      const el = document.getElementById('health');
+      const ok = h.status === 'ok' && h.version;
+      el.innerHTML = '<div class="row"><span>server</span><span class="' + (ok ? 'ok' : 'err') + '">' + h.version + '</span></div>'
+        + '<div class="row"><span>engine</span><span class="' + (h.engine_available ? 'ok' : 'err') + '">' + (h.engine_version || 'unavailable') + '</span></div>';
+      document.getElementById('version').textContent =
+        'engine import error: ' + (h.engine_import_error || 'none');
+    }).catch(() => {
+      document.getElementById('health').innerHTML = '<span class="err">cannot reach /health</span>';
+    });
+  </script>
+</body>
+</html>
