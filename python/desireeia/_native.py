@@ -34,35 +34,96 @@ _LIB_NAMES = {
     "linux": "libDesireeIALocaleEngine.so",
 }
 
+# Python sys.platform -> (fname suffix, arch candidates in priority order).
+# The bundle ships the engine under desireeia/lib/<RID>/ following the same
+# .NET RID convention used by Build/runtimes/<RID>/native/ (win-x64,
+# linux-x64, osx-x64, osx-arm64, ...).
+_RID_BY_BASE = {
+    "win": "win-{arch}",
+    "osx": "osx-{arch}",
+    "linux": "linux-{arch}",
+}
+
+_ARCH_MAP = {
+    "win":    {"amd64": "x64", "x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"},
+    "osx":    {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64", "amd64": "x64"},
+    "linux":  {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "arm", "armv8l": "arm64"},
+}
+
+def _candidate_rids() -> list[str]:
+    """The .NET RIDs this machine could match, most specific first."""
+    import platform
+    sysname = platform.system().lower()
+    machine_raw = platform.machine().lower()
+
+    base = None
+    for key in ("win", "osx", "linux", "windows", "darwin"):
+        if sysname == key:
+            base = {"windows": "win", "darwin": "osx"}.get(key, key)
+            break
+    if base is None:
+        return []
+
+    arch_map = _ARCH_MAP.get(base, {})
+    arch = arch_map.get(machine_raw, "")
+    if not arch:
+        return []
+    return [f"{base}-{arch}"]
+
+
 def _find_lib() -> ctypes.CDLL:
+    env = os.environ.get("DESIREEIA_NATIVE_LIB")
+    if env:
+        if not os.path.isfile(env):
+            raise OSError(f"DESIREEIA_NATIVE_LIB points to a missing file: {env}")
+        return _load_with_deps(env)
+
     name = _LIB_NAMES.get(sys.platform)
     if name is None:
         raise OSError(f"Unsupported platform: {sys.platform}")
 
-    search_dirs = []
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    search_dirs: list[str] = []
 
-    # 1. Same directory as this file (development layout)
-    search_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+    # 1. Bundled per-platform library: desireeia/lib/<RID>/<fname>
+    for rid in _candidate_rids():
+        search_dirs.append(os.path.join(pkg_dir, "lib", rid))
 
-    # 2. Alongside the Python package root
-    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    search_dirs.append(pkg_root)
+    # 2. Same directory as this package (development layout)
+    search_dirs.append(pkg_dir)
 
-    # 3. Standard ctypes search (system paths, LD_LIBRARY_PATH, etc.)
+    # 3. Alongside the Python package root
+    search_dirs.append(os.path.dirname(pkg_dir))
+
+    # 4. Plain ctypes search (system paths, LD_LIBRARY_PATH, PATH, ...)
     try:
-        return ctypes.CDLL(name)
+        return _load_with_deps(name)
     except OSError:
         pass
 
     for d in search_dirs:
         candidate = os.path.join(d, name)
         if os.path.isfile(candidate):
-            return ctypes.CDLL(candidate)
+            return _load_with_deps(candidate)
 
     raise OSError(
-        f"Cannot find {name}. Place it next to the desireeia package "
-        f"or add its directory to PATH / LD_LIBRARY_PATH."
+        f"Cannot find {name}. Ship it next to the desireeia package, bundle it "
+        f"under desireeia/lib/<RID>/ (Build/python.ps1 does this automatically), "
+        f"set DESIREEIA_NATIVE_LIB to its path, or add its directory to "
+        f"PATH / LD_LIBRARY_PATH."
     )
+
+
+def _load_with_deps(path: str) -> ctypes.CDLL:
+    """Load the engine, making sibling runtime DLLs (MinGW: libstdc++-6.dll
+    and friends) discoverable: on Windows the loader does NOT search the
+    engine's own directory for its dependencies, so the bundle dir must be
+    registered as a DLL search dir first."""
+    if sys.platform == "win32":
+        dll_dir = os.path.dirname(os.path.abspath(path))
+        if dll_dir and os.path.isdir(dll_dir):
+            os.add_dll_directory(dll_dir)
+    return ctypes.CDLL(path)
 
 _lib: ctypes.CDLL | None = None
 _lib_lock = threading.Lock()

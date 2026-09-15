@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "desireeia"
@@ -17,3 +17,11 @@ keywords = ["llm", "inference", "local", "gguf", "desireeia"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["desireeia*"]
+
+# The native engine for every platform this build was produced for. The RID
+# convention matches Build/runtimes/<RID>/native/ (win-x64, linux-x64,
+# osx-x64, osx-arm64): python _native.py resolves the current machine's RID
+# and loads desireeia/lib/<RID>/<libname>. Empty placeholders are shipped
+# along as documented gaps, never faked.
+[tool.setuptools.package-data]
+"desireeia" = ["lib/*/*"]
