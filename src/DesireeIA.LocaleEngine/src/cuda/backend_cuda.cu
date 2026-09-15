@@ -1520,7 +1520,19 @@ std::unordered_map<const void*, LayerGraph> g_layer_graphs;
 
 // Any buffer reallocation invalidates every captured graph, since the
 // captured nodes hold the old addresses.
+// Opt-in diagnostics: DESIREEIA_CUDA_DEBUG=1 reports graph invalidation and
+// any runtime CUDA error. Kept because the failure mode these were written
+// to chase is SILENT - wrong output, no error - so the next time something
+// similar happens there is already a way to see what the backend is doing.
+static bool cuda_debug_enabled() {
+    static const bool on = std::getenv("DESIREEIA_CUDA_DEBUG") != nullptr;
+    return on;
+}
+
 void invalidate_graphs() {
+    if (cuda_debug_enabled() && !g_layer_graphs.empty()) {
+        std::fprintf(stderr, "[cuda] invalidate_graphs: dropping %zu layer graphs\n", g_layer_graphs.size());
+    }
     for (auto& kv : g_ffn_graphs) {
         if (kv.second.exec) cudaGraphExecDestroy(kv.second.exec);
         if (kv.second.graph) cudaGraphDestroy(kv.second.graph);
@@ -1596,10 +1608,21 @@ bool scratch_reserve(size_t nb, size_t rows) {
 }
 
 // Grow-only buffers for the fused attention episode.
+// EVERY buffer this reserves is baked into the captured per-layer graphs
+// as a fixed device address, so any reallocation here has to drop those
+// graphs first — otherwise the next replay reads freed VRAM. This is the
+// same failure that made the KV cache corrupt output past its first grow
+// (see cuda_kv_cache_reserve); it is latent here rather than routine only
+// because these shapes usually settle on the first token. One case where
+// it does not settle: an architecture whose n_rot differs per layer (a
+// hybrid sliding-window model rotating 64 dims on full layers and 256 on
+// local ones) grows d_rope on a LATER layer than the one that captured
+// its graph first.
 bool scratch_reserve_attn(size_t q_dim, size_t kv_dim, size_t n_rot, size_t pos_bytes) {
     (void) pos_bytes;
     auto grow_f = [](float*& p, size_t& cap, size_t need) {
         if (need <= cap && p) return true;
+        invalidate_graphs();
         if (p) cudaFree(p);
         p = nullptr; cap = 0;
         if (cudaMalloc(&p, need * sizeof(float)) != cudaSuccess) return false;
@@ -1615,6 +1638,7 @@ bool scratch_reserve_attn(size_t q_dim, size_t kv_dim, size_t n_rot, size_t pos_
     // launch fail silently.
     if (!grow_f(g_scratch.d_attn, g_scratch.attn_cap, q_dim)) return false;
     if (g_scratch.kvbuf_cap < kv_dim) {
+        invalidate_graphs();
         if (g_scratch.d_kbuf) cudaFree(g_scratch.d_kbuf);
         if (g_scratch.d_vbuf) cudaFree(g_scratch.d_vbuf);
         g_scratch.d_kbuf = nullptr; g_scratch.d_vbuf = nullptr; g_scratch.kvbuf_cap = 0;
@@ -1625,6 +1649,7 @@ bool scratch_reserve_attn(size_t q_dim, size_t kv_dim, size_t n_rot, size_t pos_
     if (!grow_f(g_scratch.d_rope, g_scratch.rope_cap, n_rot)) return false;
     if (!grow_f(g_scratch.d_bq, g_scratch.bq_cap, q_dim)) return false;
     if (g_scratch.bkv_cap < kv_dim) {
+        invalidate_graphs();
         if (g_scratch.d_bk) cudaFree(g_scratch.d_bk);
         if (g_scratch.d_bv) cudaFree(g_scratch.d_bv);
         g_scratch.d_bk = nullptr; g_scratch.d_bv = nullptr; g_scratch.bkv_cap = 0;
@@ -1634,6 +1659,7 @@ bool scratch_reserve_attn(size_t q_dim, size_t kv_dim, size_t n_rot, size_t pos_
     }
     const size_t stage2_need = (q_dim / 32) * 32 + (q_dim / 32) * sizeof(float);
     if (stage2_need > g_scratch.stage2_cap) {
+        invalidate_graphs();
         if (g_scratch.d_stage2) cudaFree(g_scratch.d_stage2);
         g_scratch.d_stage2 = nullptr; g_scratch.stage2_cap = 0;
         if (cudaMalloc(&g_scratch.d_stage2, stage2_need) != cudaSuccess) return false;
@@ -2086,6 +2112,14 @@ int matmul_q8_0_cuda_resident_group(const CudaQ80Job* jobs, size_t n, size_t col
 // cuda_kv_cache_upload, so the mirror starts back aligned.
 bool cuda_kv_cache_reserve(size_t total_bytes) {
     if (total_bytes <= g_scratch.kv_bytes && g_scratch.d_kcache) return true;
+    // The captured per-layer graphs bake in d_kcache/d_vcache as fixed
+    // addresses. Reallocating underneath them without dropping the graphs
+    // leaves every replay reading FREED VRAM from that point on — output
+    // stays perfect until the cache first grows (the host cache starts at
+    // 512 positions and doubles), then collapses into token garbage and
+    // never recovers, which is exactly how this was found. Every other
+    // grow path in this file already invalidates; this one did not.
+    invalidate_graphs();
     if (g_scratch.d_kcache) cudaFree(g_scratch.d_kcache);
     if (g_scratch.d_vcache) cudaFree(g_scratch.d_vcache);
     g_scratch.d_kcache = nullptr;
@@ -2100,6 +2134,23 @@ bool cuda_kv_cache_reserve(size_t total_bytes) {
     }
     g_scratch.kv_bytes = total_bytes;
     return true;
+}
+
+// Reads the whole device cache back into the host buffers.
+//
+// Needed because the whole-layer fused path writes the KV cache ONLY on
+// device (kv_quantize_kernel inside the graph) and then skips the host
+// write_kv_cache entirely, so after any decoding through that path the
+// device copy is the authoritative one and the host copy is stale. Any
+// code that re-lays-out the cache from the host side (grow_cache) has to
+// pull the device copy down FIRST, or it re-uploads stale data over the
+// real thing.
+bool cuda_kv_cache_download(void* k_host, void* v_host, size_t total_bytes) {
+    if (!g_scratch.d_kcache || total_bytes > g_scratch.kv_bytes) return false;
+    cudaStream_t stream = scratch_stream();
+    cudaMemcpyAsync(k_host, g_scratch.d_kcache, total_bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(v_host, g_scratch.d_vcache, total_bytes, cudaMemcpyDeviceToHost, stream);
+    return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
 // Reloads the whole host cache onto device (after a grow/reset).
@@ -2157,6 +2208,9 @@ int cuda_attention_out(const void* d_wo_qs, const void* d_wo_scale,
         g_scratch.q_cap = q_dim;
     }
     if (q_dim > g_scratch.attn_cap) {
+        // d_attn is shared with the whole-layer graphs, so growing it here
+        // has to drop them too (same reason as scratch_reserve_attn).
+        invalidate_graphs();
         if (g_scratch.d_attn) cudaFree(g_scratch.d_attn);
         g_scratch.d_attn = nullptr;
         g_scratch.attn_cap = 0;
@@ -2523,8 +2577,19 @@ int cuda_layer_forward(const CudaLayerArgs& a) {
         }
     }
 
-    if (cudaGraphLaunch(lg.exec, stream) != cudaSuccess) return DESIREEIA_ERR_IO;
-    if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
+    if (cudaGraphLaunch(lg.exec, stream) != cudaSuccess) {
+        if (std::getenv("DESIREEIA_CUDA_DEBUG")) std::fprintf(stderr, "[cuda] graph launch failed pos=%u\n", a.pos);
+        return DESIREEIA_ERR_IO;
+    }
+    {
+        const cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            if (std::getenv("DESIREEIA_CUDA_DEBUG")) {
+                std::fprintf(stderr, "[cuda] error after launch pos=%u: %s\n", a.pos, cudaGetErrorString(e));
+            }
+            return DESIREEIA_ERR_IO;
+        }
+    }
     // Only the last layer of the token brings x back and waits: the
     // intermediate layers just queue behind each other on the stream.
     if (a.download_x) {

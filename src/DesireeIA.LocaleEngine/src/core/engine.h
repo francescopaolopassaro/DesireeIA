@@ -482,6 +482,11 @@ DESIREEIA_INTERNAL int matmul_q8_0_cuda_ffn_gated(const void* d_up_qs, const voi
 DESIREEIA_INTERNAL bool cuda_kv_cache_reserve(size_t total_bytes);
 DESIREEIA_INTERNAL bool cuda_kv_cache_upload(const void* k_host, const void* v_host,
                                             size_t total_bytes);
+// Pulls the device cache back to the host. Required before any host-side
+// re-layout of the cache, because the whole-layer fused path writes the KV
+// cache on device only and leaves the host copy stale.
+DESIREEIA_INTERNAL bool cuda_kv_cache_download(void* k_host, void* v_host,
+                                              size_t total_bytes);
 DESIREEIA_INTERNAL bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v,
                                            size_t bytes);
 

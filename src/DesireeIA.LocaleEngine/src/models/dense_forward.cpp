@@ -1996,6 +1996,21 @@ void DenseForward::grow_cache(size_t needed) {
     // not both — no point paying for an allocation that stays unused.
     if (kv_quantized_) {
         const size_t row_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
+#ifdef DESIREEIA_CUDA_ENABLED
+        // The whole-layer fused path writes the KV cache ONLY on device and
+        // then skips write_kv_cache, so by now the host copy is stale and
+        // the device one is authoritative. Pull it down BEFORE re-laying
+        // it out below, otherwise the re-upload at the end of this function
+        // overwrites every position generated so far with stale bytes.
+        //
+        // This is what made long generations collapse: output stayed
+        // perfect up to the first growth (the cache starts at 512
+        // positions), then attention read a wiped cache for everything
+        // before that point and never recovered.
+        if (cuda_kv_ready_ && cache_capacity_ > 0 && g_active_backend == DESIREEIA_BACKEND_CUDA) {
+            cuda_kv_cache_download(k_cache_q_.data(), v_cache_q_.data(), k_cache_q_.size());
+        }
+#endif
         std::vector<uint8_t> nk(cfg_.n_layers * new_cols * row_bytes, 0);
         std::vector<uint8_t> nv(cfg_.n_layers * new_cols * row_bytes, 0);
         if (cache_capacity_ > 0) {

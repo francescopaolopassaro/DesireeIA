@@ -418,10 +418,18 @@ static int CmdChat(string[] rest)
     }
 
     var maxTokens = GetIntOption(rest, "--max-tokens", 512);
-    var (model, _) = Open(rest[0], args: rest);
+    var (model, plan) = Open(rest[0], args: rest);
     using (model)
     {
         ApplySamplingOptions(model, rest);
+
+        // Which model and which backend are actually active, before the
+        // first prompt: with auto-detection the answer isn't obvious from
+        // the command line, and knowing whether a run went to the GPU or
+        // quietly fell back to CPU is the first thing worth seeing.
+        Console.WriteLine();
+        Console.WriteLine($"model    : {Path.GetFileName(rest[0])}");
+        Console.WriteLine($"backend  : {plan.Backend}   threads: {plan.ThreadCount}   dense: {plan.DenseQuantization}   max-tokens: {maxTokens}");
 
         Console.Write("System prompt (press Enter to skip): ");
         var systemPrompt = Console.ReadLine()?.Trim() ?? "";
@@ -641,6 +649,10 @@ static int CmdChat(string[] rest)
 
             Console.Write("assistant> ");
             var sb = new System.Text.StringBuilder();
+            // Timed separately from the decode loop: the first token also
+            // pays for the prompt (prefill), so folding it into the
+            // per-token rate would understate the real decode speed.
+            var swPrefill = System.Diagnostics.Stopwatch.StartNew();
             int next;
             try
             {
@@ -657,12 +669,16 @@ static int CmdChat(string[] rest)
                 Console.WriteLine();
                 continue;
             }
+            swPrefill.Stop();
             var stopped = model.IsEndOfGeneration(next);
+            var swDecode = System.Diagnostics.Stopwatch.StartNew();
+            int generated = 0;
             if (!stopped)
             {
                 var piece = model.TokenPiece(next) ?? "";
                 sb.Append(piece);
                 Console.Write(piece);
+                generated = 1;
                 for (int i = 1; i < maxTokens; i++)
                 {
                     next = model.NextToken();
@@ -670,9 +686,20 @@ static int CmdChat(string[] rest)
                     piece = model.TokenPiece(next) ?? "";
                     sb.Append(piece);
                     Console.Write(piece);
+                    generated++;
                 }
             }
+            swDecode.Stop();
             Console.WriteLine();
+
+            // Per-turn stats: tokens produced, decode rate, and how long the
+            // prompt itself took before the first token appeared.
+            if (generated > 1)
+            {
+                var decodeMs = swDecode.Elapsed.TotalMilliseconds;
+                var rate = decodeMs > 0 ? (generated - 1) * 1000.0 / decodeMs : 0.0;
+                Console.WriteLine($"[{generated} tokens | {rate:F1} tok/s | prefill {swPrefill.Elapsed.TotalMilliseconds:F0} ms | {plan.Backend}]");
+            }
             Console.WriteLine();
 
             lastAssistantResponse = sb.ToString();
