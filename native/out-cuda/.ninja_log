@@ -89,3 +89,7 @@
 6187	7102	8111812851837844	DesireeIALocaleEngine.lib	a2c3d7e6b40fb0b2
 269	8529	8111812792675066	CMakeFiles/desireeia_selftest.dir/tests/selftest.cpp.obj	67b2ab4dec34495e
 8529	8846	8111812875275053	desireeia_selftest.exe	b1a199921fdd6428
+12	5080	8111818874093257	CMakeFiles/DesireeIALocaleEngine.dir/src/models/dense_forward.cpp.obj	6069a36953802e2b
+5084	7644	8111818924809009	CMakeFiles/DesireeIALocaleEngine.dir/cmake_device_link.obj	b83d995b94205ba
+7644	8415	8111818950401259	DesireeIALocaleEngine.dll	a2c3d7e6b40fb0b2
+7644	8415	8111818950401259	DesireeIALocaleEngine.lib	a2c3d7e6b40fb0b2

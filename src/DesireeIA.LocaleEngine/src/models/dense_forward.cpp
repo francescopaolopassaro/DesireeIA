@@ -2581,27 +2581,39 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 }
 
                 write_kv_cache(l, pos, kp, vp);
+            }
 
-                // Same SWA masking as the decode path (see the extended
-                // note there): narrows the range instead of adding an
-                // additive mask, so it reduces work on local layers instead
-                // of adding to it.
-                const bool is_swa = cfg_.n_swa > 0 && cfg_.layer_is_swa(l);
-                const uint32_t cc_start = is_swa
-                    ? ((pos + 1 > cfg_.n_swa) ? (pos + 1 - cfg_.n_swa) : 0)
-                    : 0;
-                float* aout = attn_out_all.data() + p * q_dim;
-                parallel_units(n_head, [&](size_t h_begin, size_t h_end) {
-                for (uint32_t h = (uint32_t) h_begin; h < (uint32_t) h_end; ++h) {
+            // Attention for the whole batch in ONE dispatch over every
+            // (token, head) pair.
+            //
+            // It used to sit inside the token loop above, which dispatched
+            // the thread pool once per token per layer with only n_head
+            // units of work each — for a 600-token prompt on a 36-layer
+            // model that is ~21k dispatches of 16 units apiece, most of
+            // the pool idle every time, and it allocated a fresh scores
+            // vector per head per token per layer (~350k heap allocations
+            // for one prefill). Every (token, head) pair is independent
+            // and reads only KV positions written by the loop above, which
+            // has now fully completed, so one dispatch over the product is
+            // the same arithmetic with the work actually spread out.
+            {
+            const size_t attn_units = n_tokens * (size_t) n_head;
+            parallel_units(attn_units, [&](size_t u_begin, size_t u_end) {
+                // One scratch buffer per worker range, not per unit.
+                std::vector<float> scores_buf((size_t) col0 + n_tokens, 0.0f);
+                for (size_t u = u_begin; u < u_end; ++u) {
+                    const size_t p = u / (size_t) n_head;
+                    const uint32_t h = (uint32_t) (u % (size_t) n_head);
+                    const uint32_t pos = col0 + (uint32_t) p;
+                    const float* qp = q_all.data() + p * q_dim;
+                    const bool is_swa = cfg_.n_swa > 0 && cfg_.layer_is_swa(l);
+                    const uint32_t cc_start = is_swa
+                        ? ((pos + 1 > cfg_.n_swa) ? (pos + 1 - cfg_.n_swa) : 0)
+                        : 0;
+                    float* aout = attn_out_all.data() + p * q_dim;
                     const uint32_t hkv = h / heads_per_kv;
                     const float* qh = qp + (size_t) h * cfg_.head_dim;
-                    // Each head writes into its own local scores slice
-                    // (a per-head buffer allocated here, not shared like in
-                    // the decode path): the batch path processes one token
-                    // at a time, but the heads within a token stay
-                    // independent of each other.
-                    std::vector<float> scores_h_local((size_t) pos + 1, 0.0f);
-                    float* scores_h = scores_h_local.data();
+                    float* scores_h = scores_buf.data();
                     float* oh = aout + (size_t) h * cfg_.head_dim;
                     if (kv_quantized_) {
                         const size_t row_bytes = kv_q_row_bytes_;
@@ -2647,7 +2659,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         }
                     }
                 }
-                });
+            });
             }
 
             // Per-head output gate (see DenseQuirks::attn_gate): computed
