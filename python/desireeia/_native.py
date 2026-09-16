@@ -260,6 +260,9 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.desireeia_context_size.argtypes = [c_void_p]
     lib.desireeia_context_size.restype = c_uint64
 
+    lib.desireeia_context_length_trained.argtypes = [c_void_p]
+    lib.desireeia_context_length_trained.restype = c_uint32
+
     # tokenize
     lib.desireeia_tokenize.argtypes = [
         c_void_p, c_char_p, c_int32,

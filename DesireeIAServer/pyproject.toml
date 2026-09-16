@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "desireeia-server"
-version = "0.0.1"
+version = "0.0.3"
 description = "OpenAI-compatible API server and web UI for the DesireeIA local LLM engine"
 readme = "README.md"
 license = {text = "Proprietary"}
@@ -14,10 +14,20 @@ authors = [
 ]
 keywords = ["llm", "inference", "local", "desireeia", "openai", "server"]
 dependencies = [
-    "desireeia>=0.1.0",
+    "desireeia>=0.0.1",
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "pydantic>=2.6",
+    # Needed for the /transcribe route's UploadFile/multipart parameter.
+    "python-multipart>=0.0.9",
+    # Backs POST /transcribe (voice input in the web UI). Bundled in the
+    # main package rather than an optional extra - faster-whisper
+    # (CTranslate2-based) rather than openai-whisper: no PyTorch
+    # dependency, a much smaller install. The feature still only runs
+    # when the server is started with --enable-whisper (see
+    # transcription.py / transcribe_api.py); this only controls what pip
+    # installs, not what's active at runtime.
+    "faster-whisper>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +38,7 @@ dev = [
 
 [project.scripts]
 desireeia-server = "desireeiaserver.cli:main"
+desireeia-server-ctl = "desireeiaserver.ctl:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

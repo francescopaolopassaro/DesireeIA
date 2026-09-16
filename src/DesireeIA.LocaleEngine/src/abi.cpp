@@ -149,6 +149,13 @@ DESIREEIA_API size_t desireeia_context_size(const desireeia_ctx* ctx) {
     return desireeia::engine_context_size(ctx);
 }
 
+DESIREEIA_API uint32_t desireeia_context_length_trained(const desireeia_ctx* ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    return desireeia::engine_context_length_trained(ctx);
+}
+
 DESIREEIA_API desireeia_error desireeia_tokenize(desireeia_ctx* ctx,
                                         const char* text,
                                         int32_t add_bos,

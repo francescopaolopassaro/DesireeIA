@@ -2,9 +2,9 @@
 [![Version](https://img.shields.io/badge/version-0.1--beta-blue.svg)](#)
 [![Status](https://img.shields.io/badge/status-stabilizing-orange.svg)](#)
 
-We are currently in **Beta 0.1**, actively building, testing, and stabilizing the platform.
+We are currently in **Version 0.1**, actively building, testing, and stabilizing the platform.
 
-> **Beta 0.1 Notice:** DesireeIA is under active development. Features, APIs, and infrastructure are being continuously refined for stability, efficiency, and overall performance.
+> **Version 0.1 Notice:** DesireeIA is under active development. Features, APIs, and infrastructure are being continuously refined for stability, efficiency, and overall performance.
 
 ---
 
@@ -22,7 +22,7 @@ The project was set aside for a while as other priorities took over, but it came
 
 ## 📌 Project Overview
 
-DesireeIA is designed to provide high-performance AI integration tailored for practical enterprise environments. Our primary focus during this early beta phase is delivering maximum efficiency on standard corporate hardware while building a robust, flexible external integration layer.
+DesireeIA is designed to provide high-performance AI integration tailored for practical enterprise environments. Our primary focus during this early first version phase is delivering maximum efficiency on standard corporate hardware while building a robust, flexible external integration layer.
 
 ---
 
@@ -48,7 +48,7 @@ DesireeIA is designed to provide high-performance AI integration tailored for pr
 - [x] Core C# integration infrastructure (Beta 0.1)
 - [x] Performance and memory benchmarking on enterprise laptop profiles
 - [x] Advanced hallucination mitigation and model tuning for Spark
-- [ ] Multi-language bindings (Python SDK expansion)
+- [x] Multi-language bindings (Python SDK + OpenAI-compatible server, see "Python server" below)
 - [ ] Comprehensive API documentation and deployment guides
 
 ---
@@ -536,26 +536,117 @@ dotnet run --project cli/DesireeIA.Cli -- chat <model.gguf> [--temp T] [--top-k 
 
 These are the exact commands used to validate this engine end to end
 (generation quality, self-test parity, and — where noted — the CUDA
-backend), built as a self-contained CLI executable on Windows:
+backend), built as a self-contained CLI executable on Windows.
+`<desireeia_source>` below is this repository's root on whatever machine
+you're running from (e.g. `C:\path\to\DesireeIA`); `<path-to-model>` is
+wherever you keep your own `.gguf` checkpoints:
 
 ```cmd
 :: Gemma 3 (4B) — recommended chat sampling
-C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\Users\fpassaro\AppData\Local\Kodinn\google_gemma-3-4b-it-Q4_K_M.gguf" --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
+<desireeia_source>\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "<path-to-model>\google_gemma-3-4b-it-Q4_K_M.gguf" --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
 
 :: Gemma 2B — same sampling, force the CUDA backend explicitly
-C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\Users\fpassaro\Desktop\JOBS\dwn\gemma-2b-it.Q4_K_M.gguf" --backend cuda --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
+<desireeia_source>\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "<path-to-model>\gemma-2b-it.Q4_K_M.gguf" --backend cuda --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
 
 :: Qwen2.5-Coder (3B, Q8_0) — coding-oriented sampling
-C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\path\to\Qwen2.5-Coder-3B-Q8_0.gguf" --temp 0.3 --top-k 40 --top-p 0.9 --max-tokens 2048
+<desireeia_source>\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "<path-to-model>\Qwen2.5-Coder-3B-Q8_0.gguf" --temp 0.3 --top-k 40 --top-p 0.9 --max-tokens 2048
 
 :: Spark-X2.5 4B — hybrid sliding-window attention architecture
-C:\Sorgenti\Personal\DesireeIA\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "C:\Users\fpassaro\Downloads\Spark-X2.5-4B-Q4_K_M.gguf" --backend cuda --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
+<desireeia_source>\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "<path-to-model>\Spark-X2.5-4B-Q4_K_M.gguf" --backend cuda --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
 ```
 
 `--backend` is optional on every command above — omitting it lets the
 engine auto-detect the strongest hardware backend available, which is
 CUDA whenever a compatible device is present. It's shown explicitly here
 only to make it easy to force one side or the other for comparison.
+
+## Python server (OpenAI-compatible API + web UI)
+
+`DesireeIAServer/` is a FastAPI server that puts an OpenAI-compatible
+HTTP API (`/v1/chat/completions`, streaming and non-streaming, `/v1/models`,
+`/v1/embeddings`, tokenize/detokenize) and a self-hosted, dependency-free
+chat web UI in front of this same engine — no separate inference backend,
+the engine is always DesireeIA. On top of the OpenAI surface it adds:
+
+- **Router mode** — point it at a folder of checkpoints instead of one
+  fixed model; it discovers, loads/unloads, and switches between them,
+  with optional parallel replicas per model and idle-timeout unloading to
+  free VRAM/RAM automatically.
+- **Real tool/function calling** — the model can call a built-in web
+  search / weather lookup, and (opt-in, off by default) a sandboxed
+  Python execution tool plus file read/write/list/search tools scoped to
+  a workspace folder you pick.
+- **Voice input, metrics, hardening** — optional speech-to-text via
+  faster-whisper, a Prometheus `/metrics` endpoint, API-key auth, request
+  size limits and security headers.
+
+Full flag reference, architecture notes and the web UI's own feature list
+live in `DesireeIAServer/README.md`. Published on PyPI since 2026-09-16:
+**[`desireeia-server`](https://pypi.org/project/desireeia-server/)**
+(depends on the separately published
+**[`desireeia`](https://pypi.org/project/desireeia/)** package, which
+bundles the native engine for the platforms it's built for — see
+"Download and run" above for what's currently built).
+
+### Install
+
+```bash
+# Windows / Linux / macOS — same command everywhere; the desireeia
+# dependency bundles the native engine for every platform it's built
+# for and picks the right one at runtime (see its README linked above
+# for exactly which platforms and the Windows VC++ Redistributable
+# prerequisite).
+pip install desireeia-server
+```
+
+Installing from this repository instead of PyPI (e.g. while developing):
+
+```bash
+# Windows (PowerShell)
+pip install <desireeia_source>\python <desireeia_source>\DesireeIAServer
+
+# Linux / macOS
+pip install <desireeia_source>/python <desireeia_source>/DesireeIAServer
+```
+
+### Run
+
+```bash
+# Windows / Linux / macOS — identical invocation everywhere
+desireeia-server --model <path-to-model>/model.gguf --port 8080
+# open http://127.0.0.1:8080
+```
+
+Router mode (no fixed model — manages whatever's in a folder):
+
+```bash
+desireeia-server --models-dir <path-to-models-folder> --port 8080
+```
+
+`desireeia-server --help` lists the full flag surface (backend selection,
+sampling defaults, `--enable-python-tool`, `--enable-whisper`, API keys,
+CORS, and more) — it's the same binary and the same flags on every OS.
+
+### Stop
+
+The server runs in the foreground by default (logs in the terminal it was
+started from) — **Ctrl+C** stops it, on every OS.
+
+### Start / stop / restart in the background
+
+`desireeia-server-ctl` — installed alongside `desireeia-server`, identical
+command on Windows/Linux/macOS — runs the server detached and tracks it,
+no manual PID handling:
+
+```bash
+desireeia-server-ctl start -- --model model.gguf --port 8080
+desireeia-server-ctl status     # "running (pid ...)" or "stopped"
+desireeia-server-ctl stop
+desireeia-server-ctl restart -- --model model.gguf --port 8080
+```
+
+Everything after `--` is forwarded to `desireeia-server` unchanged. Logs
+go to `<data-dir>/server.log` (`~/.desireeia/server.log` by default).
 
 ## Third-party notices
 

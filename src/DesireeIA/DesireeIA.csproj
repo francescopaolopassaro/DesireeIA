@@ -9,6 +9,28 @@
     <AssemblyName>DesireeIA</AssemblyName>
   </PropertyGroup>
 
+  <!-- NuGet package metadata. Version 0.0.1: first public release, matching
+       the versioning already used for the desireeia/desireeia-server PyPI
+       packages. -->
+  <PropertyGroup>
+    <PackageId>DesireeIA</PackageId>
+    <Version>0.0.1</Version>
+    <Authors>Passaro Francesco Paolo</Authors>
+    <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
+    <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
+    <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    <PackageIcon>icon.png</PackageIcon>
+    <PackageProjectUrl>https://github.com/francescopaolopassaro/DesireeIA</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/francescopaolopassaro/DesireeIA</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="$(MSBuildThisFileDirectory)..\..\LICENSE" Pack="true" PackagePath="" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\images\web-app-manifest-512x512.png" Pack="true" PackagePath="icon.png" />
+    <None Include="$(MSBuildThisFileDirectory)README.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+
   <!--
     Il motore nativo viene COMPILATO E COPIATO dalla build .NET.
 
@@ -92,12 +114,35 @@
     packs each one under the standard runtimes\<RID>\native\ NuGet convention,
     so `dotnet pack` yields a single package that works on every platform it
     was built for, with no rebuild needed by the consumer.
+
+    Explicit per-file items rather than a %(RecursiveDir)-based wildcard: the
+    wildcard form (tried first) produced a doubled path in the packed nupkg
+    (runtimes\linux-x64\native\linux-x64\native\...) - %(RecursiveDir) did
+    not resolve the way the NuGet docs describe for this SDK version, and
+    with only two real RIDs today an explicit list is both correct and no
+    harder to maintain. Each item is guarded by Exists() so a RID that
+    hasn't been built yet (osx-x64/osx-arm64/linux-arm64 placeholders) is
+    silently omitted rather than failing the pack.
   -->
   <ItemGroup>
-    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\**\native\*"
-          Pack="true"
-          PackagePath="runtimes\%(RecursiveDir)"
-          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes')" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\win-x64\native\DesireeIALocaleEngine.dll"
+          Pack="true" PackagePath="runtimes\win-x64\native\DesireeIALocaleEngine.dll"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes\win-x64\native\DesireeIALocaleEngine.dll')" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\win-x64\native\cudart64_13.dll"
+          Pack="true" PackagePath="runtimes\win-x64\native\cudart64_13.dll"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes\win-x64\native\cudart64_13.dll')" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\linux-x64\native\DesireeIALocaleEngine.so"
+          Pack="true" PackagePath="runtimes\linux-x64\native\DesireeIALocaleEngine.so"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes\linux-x64\native\DesireeIALocaleEngine.so')" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\linux-arm64\native\DesireeIALocaleEngine.so"
+          Pack="true" PackagePath="runtimes\linux-arm64\native\DesireeIALocaleEngine.so"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes\linux-arm64\native\DesireeIALocaleEngine.so')" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\osx-x64\native\libDesireeIALocaleEngine.dylib"
+          Pack="true" PackagePath="runtimes\osx-x64\native\libDesireeIALocaleEngine.dylib"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes\osx-x64\native\libDesireeIALocaleEngine.dylib')" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\osx-arm64\native\libDesireeIALocaleEngine.dylib"
+          Pack="true" PackagePath="runtimes\osx-arm64\native\libDesireeIALocaleEngine.dylib"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\Build\runtimes\osx-arm64\native\libDesireeIALocaleEngine.dylib')" />
   </ItemGroup>
 
 </Project>

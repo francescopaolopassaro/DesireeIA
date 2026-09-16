@@ -784,6 +784,13 @@ size_t engine_context_size(const desireeia_ctx* ctx) {
     return n;
 }
 
+uint32_t engine_context_length_trained(const desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
+    if (!c) return 0;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    return c->gf ? c->gf->trained_context_length() : 0;
+}
+
 bool engine_tokenize(desireeia_ctx* ctx, const std::string& text, bool add_bos, std::vector<int32_t>& out_ids) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;

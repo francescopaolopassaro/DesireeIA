@@ -1,0 +1,24 @@
+# Only DesireeIAServer/Dockerfile reads this build context (repo root).
+# Keep it excluding everything that image doesn't need: native/CI build
+# trees, model weights, VCS metadata, editor state.
+.git/
+.vs/
+.vscode/
+docs/
+bin/
+obj/
+native/out/
+native/out-cuda/
+native/out-winx64/
+Build/win-x64/
+Build/linux-x64/
+Build/_linux-x64-cli-tmp/
+Build/dist/
+Build/runtimes/
+*.gguf
+*.safetensors
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+DesireeIAServer/build/

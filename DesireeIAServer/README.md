@@ -12,8 +12,27 @@ used anywhere in code, docs or identifiers.
 
 ## Quick start
 
+Published on PyPI since 2026-09-16:
+https://pypi.org/project/desireeia-server/ (depends on
+https://pypi.org/project/desireeia/).
+
+### Install from PyPI
+
 ```bash
-pip install ./python ./DesireeIAServer
+pip install desireeia-server
+```
+
+This also installs its `desireeia` dependency (the inference engine
+wrapper, with prebuilt native binaries bundled — see
+[desireeia's README](../Build/Python/README.md#bundled-platforms) for the
+per-OS prerequisites, e.g. the VC++ Redistributable on Windows).
+
+### Run
+
+Identical on Windows, Linux and macOS — `desireeia-server` is a normal
+console command once installed:
+
+```bash
 desireeia-server --model path/to/model.gguf --port 8080
 # open http://127.0.0.1:8080
 ```
@@ -25,6 +44,34 @@ it becomes selectable without a restart.
 
 ```bash
 desireeia-server --models-dir ./models
+```
+
+By default the server runs in the foreground (logs print to the terminal).
+To stop it: **Ctrl+C** in that terminal, on any OS.
+
+### Start / stop / restart in the background
+
+`desireeia-server-ctl` (installed alongside `desireeia-server`, identical
+command on Windows/Linux/macOS) runs the server as a detached background
+process and tracks it for you — no manual PID handling:
+
+```bash
+desireeia-server-ctl start -- --model path/to/model.gguf --port 8080
+desireeia-server-ctl status     # "running (pid ...)" or "stopped"
+desireeia-server-ctl stop
+desireeia-server-ctl restart -- --model path/to/model.gguf --port 8080
+```
+
+Everything after `--` is forwarded to `desireeia-server` unchanged (same
+flags as running it directly). Logs go to `<data-dir>/server.log`
+(`~/.desireeia/server.log` by default) and the PID is tracked in
+`<data-dir>/server.pid` - `stop` reads it from there, so it always works
+even across different terminal sessions.
+
+### Dev install from the repo (instead of PyPI)
+
+```bash
+pip install <desireeia_source>/python <desireeia_source>/DesireeIAServer   # Windows: use \ instead of /
 ```
 
 The engine, backend and sampling surface you can steer:

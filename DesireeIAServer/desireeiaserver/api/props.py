@@ -27,4 +27,6 @@ def props(request: Request):
         "config_path": str(settings.resolved_config_path),
         "parallel": settings.parallel,
         "server_version": __version__,
+        "tools": {"run_python": settings.enable_python_tool},
+        "whisper": settings.enable_whisper,
     }

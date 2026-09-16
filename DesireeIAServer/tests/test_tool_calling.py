@@ -50,6 +50,53 @@ def test_extract_tool_call_valid():
     assert result == {"name": "get_weather", "arguments": {"location": "Rome"}}
 
 
+def test_extract_tool_call_function_call_tag():
+    text = '<function_call>{"name": "get_weather", "arguments": {"location": "Rome"}}</function_call>'
+    assert toolcalling.extract_tool_call(text) == {"name": "get_weather", "arguments": {"location": "Rome"}}
+
+
+def test_extract_tool_call_function_named_tag_with_arguments_key():
+    text = '<function=get_weather>{"arguments": {"location": "Rome"}}</function>'
+    assert toolcalling.extract_tool_call(text) == {"name": "get_weather", "arguments": {"location": "Rome"}}
+
+
+def test_extract_tool_call_function_named_tag_bare_args():
+    text = '<function name="get_weather">{"location": "Rome"}</function>'
+    assert toolcalling.extract_tool_call(text) == {"name": "get_weather", "arguments": {"location": "Rome"}}
+
+
+def test_extract_tool_call_function_inline_name():
+    text = '<function>get_weather{"location": "Rome"}</function>'
+    assert toolcalling.extract_tool_call(text) == {"name": "get_weather", "arguments": {"location": "Rome"}}
+
+
+def test_extract_tool_call_arg_key_value_tags():
+    # Observed directly from a real local model asked to call list_files:
+    # instead of a JSON arguments object it invented its own per-argument
+    # tag pair.
+    text = "<tool_call>list_files<arg_key>path</arg_key><arg_value>.</arg_value></tool_call>"
+    assert toolcalling.extract_tool_call(text) == {"name": "list_files", "arguments": {"path": "."}}
+
+
+def test_extract_tool_call_arg_key_value_tags_multiple_args():
+    text = (
+        "<tool_call>write_file"
+        "<arg_key>path</arg_key><arg_value>notes.txt</arg_value>"
+        "<arg_key>content</arg_key><arg_value>hello</arg_value>"
+        "</tool_call>"
+    )
+    assert toolcalling.extract_tool_call(text) == {
+        "name": "write_file", "arguments": {"path": "notes.txt", "content": "hello"},
+    }
+
+
+def test_extract_tool_call_prefers_first_recognized_dialect():
+    # A response that happens to contain both should not error - the first
+    # match wins, same behavior as before this could ever happen.
+    text = '<tool_call>{"name": "a", "arguments": {}}</tool_call> then <function_call>{"name": "b", "arguments": {}}</function_call>'
+    assert toolcalling.extract_tool_call(text)["name"] == "a"
+
+
 def test_extract_tool_call_no_marker_returns_none():
     assert toolcalling.extract_tool_call("just a normal answer") is None
 
@@ -70,36 +117,6 @@ def test_render_tool_call_text_roundtrips():
 def test_render_tool_call_text_accepts_json_string_arguments():
     text = toolcalling.render_tool_call_text("get_weather", '{"location": "Rome"}')
     assert toolcalling.extract_tool_call(text) == {"name": "get_weather", "arguments": {"location": "Rome"}}
-
-
-class TestToolCallStreamFilter:
-    def test_passes_through_normal_text_char_by_char(self):
-        filt = toolcalling.ToolCallStreamFilter()
-        out = "".join(filt.feed(c) for c in "Hello there!")
-        assert out == "Hello there!"
-        assert filt.is_tool_call is False
-
-    def test_detects_tool_call_fed_char_by_char(self):
-        filt = toolcalling.ToolCallStreamFilter()
-        text = '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
-        out = "".join(filt.feed(c) for c in text)
-        assert out == ""  # nothing forwarded - it's a tool call, not chat text
-        assert filt.is_tool_call is True
-
-    def test_flushes_buffered_prefix_once_it_diverges(self):
-        filt = toolcalling.ToolCallStreamFilter()
-        # "<tool" is a valid prefix of "<tool_call>" but "<toolbox"  diverges
-        # at the 6th character ('b' where 'c' is expected).
-        out = "".join(filt.feed(c) for c in "<toolbox is open")
-        assert out == "<toolbox is open"
-        assert filt.is_tool_call is False
-
-    def test_leading_whitespace_before_marker_does_not_break_detection(self):
-        filt = toolcalling.ToolCallStreamFilter()
-        text = '  <tool_call>{"name": "x", "arguments": {}}</tool_call>'
-        out = "".join(filt.feed(c) for c in text)
-        assert out == ""
-        assert filt.is_tool_call is True
 
 
 # -- end-to-end wiring --------------------------------------------------------
@@ -195,15 +212,58 @@ def test_chat_stream_detects_tool_call(client, fake_desireeia, monkeypatch):
     lines = [line for line in text.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"]
     payloads = [json.loads(line[6:]) for line in lines]
 
-    content_deltas = [p["choices"][0]["delta"].get("content", "") for p in payloads]
-    assert "".join(content_deltas) == ""  # no raw tool-call JSON ever shown as chat text
-
+    # Content streams through live and unconditionally now (see chat.py's
+    # _chat_stream) - the raw "<tool_call>...>" markup IS visible as
+    # content deltas while streaming. What matters is that the FINAL chunk
+    # still correctly reports it as a tool call, not plain text.
     tool_call_chunks = [p for p in payloads if p["choices"][0]["delta"].get("tool_calls")]
     assert len(tool_call_chunks) == 1
     call = tool_call_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
     assert call["function"]["name"] == "get_weather"
     assert json.loads(call["function"]["arguments"]) == {"location": "Milan"}
     assert tool_call_chunks[0]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_chat_stream_detects_tool_call_prefaced_with_explanatory_text(client, fake_desireeia, monkeypatch):
+    # Regression test: a weak model that ignores "respond with ONLY the
+    # tool call" and adds explanatory prose FIRST ("To do that, I need to
+    # call...") used to never be detected at all - detection only looked
+    # at whether the response's OPENING characters matched a known tool-
+    # call marker. extract_tool_call() searches the whole accumulated
+    # text, not just the start, specifically so this case is still caught.
+    _emit_as_single_token(
+        fake_desireeia, monkeypatch,
+        'To check that, I need to call a tool:\n\n'
+        '<tool_call>{"name": "get_weather", "arguments": {"location": "Milan"}}</tool_call>',
+    )
+    with client.stream("POST", "/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "weather in Milan?"}],
+        "tools": [WEATHER_TOOL],
+        "stream": True,
+    }) as response:
+        text = "".join(response.iter_text())
+    lines = [line for line in text.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"]
+    payloads = [json.loads(line[6:]) for line in lines]
+    tool_call_chunks = [p for p in payloads if p["choices"][0]["delta"].get("tool_calls")]
+    assert len(tool_call_chunks) == 1
+    call = tool_call_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert call["function"]["name"] == "get_weather"
+    assert tool_call_chunks[0]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_chat_sync_detects_tool_call_prefaced_with_explanatory_text(client, fake_desireeia, monkeypatch):
+    _emit_as_single_token(
+        fake_desireeia, monkeypatch,
+        'To check that, I need to call a tool:\n\n'
+        '<tool_call>{"name": "get_weather", "arguments": {"location": "Milan"}}</tool_call>',
+    )
+    r = client.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "weather in Milan?"}],
+        "tools": [WEATHER_TOOL],
+    })
+    choice = r.json()["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
 def test_chat_stream_without_tool_call_streams_normally(client, fake_desireeia, monkeypatch):
@@ -218,6 +278,25 @@ def test_chat_stream_without_tool_call_streams_normally(client, fake_desireeia, 
     payloads = [json.loads(line[6:]) for line in lines]
     content = "".join(p["choices"][0]["delta"].get("content", "") for p in payloads)
     assert content == "Hello there, friend!"
+
+
+def test_chat_stream_short_reply_resembling_a_tool_call_prefix_is_not_lost(client, fake_desireeia, monkeypatch):
+    # A reply that merely starts with "<" and never becomes a real,
+    # parseable tool call (extract_tool_call finds nothing) must still
+    # reach the client as ordinary content - content streams through live
+    # now, so this mostly guards against a regression back to any kind of
+    # mid-stream withholding.
+    _emit_as_single_token(fake_desireeia, monkeypatch, "<to")
+    with client.stream("POST", "/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [WEATHER_TOOL],
+        "stream": True,
+    }) as response:
+        text = "".join(response.iter_text())
+    lines = [line for line in text.splitlines() if line.startswith("data: ") and line[6:] != "[DONE]"]
+    payloads = [json.loads(line[6:]) for line in lines]
+    content = "".join(p["choices"][0]["delta"].get("content", "") for p in payloads)
+    assert content == "<to"
 
 
 def test_tool_result_message_round_trips_through_a_follow_up_request(client, fake_desireeia, monkeypatch):

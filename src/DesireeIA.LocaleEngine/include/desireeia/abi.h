@@ -149,6 +149,15 @@ DESIREEIA_API desireeia_error desireeia_predict(desireeia_ctx* ctx,
 DESIREEIA_API desireeia_error desireeia_next_token(desireeia_ctx* ctx, int32_t* out_token);
 DESIREEIA_API size_t desireeia_context_size(const desireeia_ctx* ctx);
 
+/* The model's own trained/declared max context length (GGUF metadata key
+ * "<arch>.context_length"), 0 if unknown/unavailable for this model's
+ * architecture. Informational only: the engine's KV cache grows
+ * dynamically as tokens are processed and is NOT capped by this value -
+ * callers that want a fixed context window (e.g. to mirror another
+ * engine's behavior, or to budget UI/VRAM around it) should read this once
+ * after desireeia_create() and enforce it themselves. */
+DESIREEIA_API uint32_t desireeia_context_length_trained(const desireeia_ctx* ctx);
+
 /* Tokenizer (SentencePiece Unigram or byte-level BPE, auto-detected from
  * the model's metadata). Query-size convention: call with out_ids=NULL
  * (or max_ids=0) to get the number of tokens needed in out_count,

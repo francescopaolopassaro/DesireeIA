@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 
 from .. import toolcalling
 from ..generation import GenerationRunner, run_sync
+from ..metrics import metrics
 from ..sampling import CodegenParams, resolve
 from ..slots import Slot
 from ..token_stats import TokenTracker
@@ -197,31 +198,36 @@ def _tool_call_chunk(request_id: str, created: int, model_id: str, tool_call: di
 
 async def _chat_stream(runner: GenerationRunner, request_id: str, created: int,
                        model_id: str, tools_active: bool) -> AsyncGenerator[str, None]:
+    # Content streams through live, unconditionally - no mid-stream
+    # buffering/hiding. Tool-call detection runs once, on the FULL
+    # accumulated text, after generation ends (extract_tool_call searches
+    # the whole string, not just its start). Earlier this tried to decide
+    # from the opening characters alone whether a response was "becoming"
+    # a tool call, so it could hide/lose output correctly for the exact
+    # format it expected - but a weak model that prefaces its tool call
+    # with explanatory prose ("To do that, I'll call...") never matches
+    # from the start, so the embedded tool call further into the text was
+    # never even checked for. Trading a brief flash of raw "<tool_call>...>"
+    # markup (only for the rarer case where a real tool call IS found) for
+    # actually detecting it is the right trade - the alternative was
+    # simply not detecting these at all.
     full_text = ""
-    tool_filter = toolcalling.ToolCallStreamFilter() if tools_active else None
     try:
         async for step in runner.events():
             if step.final:
-                if tool_filter is not None and tool_filter.is_tool_call:
-                    tool_call = toolcalling.extract_tool_call(full_text)
-                    if tool_call is not None:
-                        final = _tool_call_chunk(request_id, created, model_id, tool_call)
-                    else:
-                        # Looked like a tool call from the opening tag but
-                        # failed to parse (malformed JSON) - degrade to
-                        # showing the raw text rather than silently
-                        # dropping the model's output.
-                        final = _chat_chunk(request_id, created, model_id, full_text, step.finish_reason)
+                tool_call = toolcalling.extract_tool_call(full_text) if tools_active else None
+                if tool_call is not None:
+                    final = _tool_call_chunk(request_id, created, model_id, tool_call)
+                    metrics.record_tool_call()
                 else:
                     final = _chat_chunk(request_id, created, model_id, "", step.finish_reason)
                 final["usage"] = runner.tracker.usage(model_id)
                 final["timings"] = runner.tracker.timings()
+                metrics.record_generation(runner.tracker.prompt_n, runner.tracker.predicted_n)
                 yield sse(final)
             elif step.piece:
                 full_text += step.piece
-                forward = step.piece if tool_filter is None else tool_filter.feed(step.piece)
-                if forward:
-                    yield sse(_chat_chunk(request_id, created, model_id, forward, None))
+                yield sse(_chat_chunk(request_id, created, model_id, step.piece, None))
         yield "data: [DONE]\n\n"
     finally:
         runner.cancel()
@@ -253,10 +259,12 @@ async def chat_completions(request: Request):
         )
 
     text, finish_reason, tracker = run_sync(producer)
+    metrics.record_generation(tracker.prompt_n, tracker.predicted_n)
     tool_call = toolcalling.extract_tool_call(text) if tools_active else None
     if tool_call is not None:
         message = {"role": "assistant", "content": None, "tool_calls": [_tool_call_message(tool_call)]}
         finish_reason = "tool_calls"
+        metrics.record_tool_call()
     else:
         message = {"role": "assistant", "content": text}
     return {

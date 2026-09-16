@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -85,3 +87,22 @@ def test_ui_served_at_root(client):
 def test_models_dir_created_on_startup(tmp_path, fake_desireeia):
     create_app(Settings(models_dir=tmp_path / "auto", data_dir=tmp_path / "data"))
     assert (tmp_path / "auto").is_dir()
+
+
+def test_system_prompt_survives_a_server_restart(client):
+    # Regression test: the default system prompt used to live ONLY in the
+    # browser's localStorage - a real server restart (a fresh process, no
+    # memory of what any browser had typed) always lost it, even though
+    # every other sampling setting here (temperature, top_p, ...) already
+    # round-trips through POST/GET /config and the on-disk config file.
+    r = client.post("/config", json={"settings": {"system_prompt": "Always answer in Italian."}})
+    assert r.status_code == 200
+    assert r.json()["settings"]["system_prompt"] == "Always answer in Italian."
+
+    # Simulate a restart: a brand-new Settings loaded fresh from the same
+    # config file, with no shared process state with the client above.
+    saved_path = Path(r.json()["saved"])
+    from desireeiaserver.config import Settings as SettingsCls, load_config
+
+    reloaded = load_config(saved_path, SettingsCls())
+    assert reloaded.system_prompt == "Always answer in Italian."

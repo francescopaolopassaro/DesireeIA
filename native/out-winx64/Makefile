@@ -64,6 +64,16 @@ CMAKE_BINARY_DIR = C:\Sorgenti\Personal\DesireeIA\native\out-winx64
 #=============================================================================
 # Targets provided globally by CMake.
 
+# Special rule for the target test
+test:
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Running tests..."
+	"C:\Program Files\CMake\bin\ctest.exe" $(ARGS)
+.PHONY : test
+
+# Special rule for the target test
+test/fast: test
+.PHONY : test/fast
+
 # Special rule for the target edit_cache
 edit_cache:
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --cyan "Running CMake cache editor..."
@@ -127,6 +137,56 @@ DesireeIALocaleEngine: cmake_check_build_system
 DesireeIALocaleEngine/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/build
 .PHONY : DesireeIALocaleEngine/fast
+
+#=============================================================================
+# Target rules for targets named desireeia_selftest
+
+# Build rule for target.
+desireeia_selftest: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 desireeia_selftest
+.PHONY : desireeia_selftest
+
+# fast build rule for target.
+desireeia_selftest/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_selftest.dir\build.make CMakeFiles/desireeia_selftest.dir/build
+.PHONY : desireeia_selftest/fast
+
+#=============================================================================
+# Target rules for targets named desireeia_kernel_bench
+
+# Build rule for target.
+desireeia_kernel_bench: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\Makefile2 desireeia_kernel_bench
+.PHONY : desireeia_kernel_bench
+
+# fast build rule for target.
+desireeia_kernel_bench/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_kernel_bench.dir\build.make CMakeFiles/desireeia_kernel_bench.dir/build
+.PHONY : desireeia_kernel_bench/fast
+
+C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.obj: C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.obj
+.PHONY : C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.obj
+
+# target to build an object file
+C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_kernel_bench.dir\build.make CMakeFiles/desireeia_kernel_bench.dir/C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.obj
+.PHONY : C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.obj
+
+C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.i: C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.i
+.PHONY : C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.i
+
+# target to preprocess a source file
+C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_kernel_bench.dir\build.make CMakeFiles/desireeia_kernel_bench.dir/C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.i
+.PHONY : C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.i
+
+C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.s: C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.s
+.PHONY : C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.s
+
+# target to generate assembly for a file
+C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_kernel_bench.dir\build.make CMakeFiles/desireeia_kernel_bench.dir/C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.s
+.PHONY : C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.cpp.s
 
 src/abi.obj: src/abi.cpp.obj
 .PHONY : src/abi.obj
@@ -560,6 +620,30 @@ src/models/moe_route.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/models/moe_route.cpp.s
 .PHONY : src/models/moe_route.cpp.s
 
+src/models/prerouter.obj: src/models/prerouter.cpp.obj
+.PHONY : src/models/prerouter.obj
+
+# target to build an object file
+src/models/prerouter.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/models/prerouter.cpp.obj
+.PHONY : src/models/prerouter.cpp.obj
+
+src/models/prerouter.i: src/models/prerouter.cpp.i
+.PHONY : src/models/prerouter.i
+
+# target to preprocess a source file
+src/models/prerouter.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/models/prerouter.cpp.i
+.PHONY : src/models/prerouter.cpp.i
+
+src/models/prerouter.s: src/models/prerouter.cpp.s
+.PHONY : src/models/prerouter.s
+
+# target to generate assembly for a file
+src/models/prerouter.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/models/prerouter.cpp.s
+.PHONY : src/models/prerouter.cpp.s
+
 src/models/ssm_forward.obj: src/models/ssm_forward.cpp.obj
 .PHONY : src/models/ssm_forward.obj
 
@@ -872,6 +956,30 @@ src/vision/vision_image.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles\DesireeIALocaleEngine.dir\build.make CMakeFiles/DesireeIALocaleEngine.dir/src/vision/vision_image.cpp.s
 .PHONY : src/vision/vision_image.cpp.s
 
+tests/selftest.obj: tests/selftest.cpp.obj
+.PHONY : tests/selftest.obj
+
+# target to build an object file
+tests/selftest.cpp.obj:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_selftest.dir\build.make CMakeFiles/desireeia_selftest.dir/tests/selftest.cpp.obj
+.PHONY : tests/selftest.cpp.obj
+
+tests/selftest.i: tests/selftest.cpp.i
+.PHONY : tests/selftest.i
+
+# target to preprocess a source file
+tests/selftest.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_selftest.dir\build.make CMakeFiles/desireeia_selftest.dir/tests/selftest.cpp.i
+.PHONY : tests/selftest.cpp.i
+
+tests/selftest.s: tests/selftest.cpp.s
+.PHONY : tests/selftest.s
+
+# target to generate assembly for a file
+tests/selftest.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles\desireeia_selftest.dir\build.make CMakeFiles/desireeia_selftest.dir/tests/selftest.cpp.s
+.PHONY : tests/selftest.cpp.s
+
 # Help Target
 help:
 	@echo The following are some of the valid targets for this Makefile:
@@ -880,7 +988,13 @@ help:
 	@echo ... depend
 	@echo ... edit_cache
 	@echo ... rebuild_cache
+	@echo ... test
 	@echo ... DesireeIALocaleEngine
+	@echo ... desireeia_kernel_bench
+	@echo ... desireeia_selftest
+	@echo ... C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.obj
+	@echo ... C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.i
+	@echo ... C_/Sorgenti/Personal/DesireeIA/bench/kernel_bench.s
 	@echo ... src/abi.obj
 	@echo ... src/abi.i
 	@echo ... src/abi.s
@@ -935,6 +1049,9 @@ help:
 	@echo ... src/models/moe_route.obj
 	@echo ... src/models/moe_route.i
 	@echo ... src/models/moe_route.s
+	@echo ... src/models/prerouter.obj
+	@echo ... src/models/prerouter.i
+	@echo ... src/models/prerouter.s
 	@echo ... src/models/ssm_forward.obj
 	@echo ... src/models/ssm_forward.i
 	@echo ... src/models/ssm_forward.s
@@ -974,6 +1091,9 @@ help:
 	@echo ... src/vision/vision_image.obj
 	@echo ... src/vision/vision_image.i
 	@echo ... src/vision/vision_image.s
+	@echo ... tests/selftest.obj
+	@echo ... tests/selftest.i
+	@echo ... tests/selftest.s
 .PHONY : help
 
 

@@ -123,6 +123,21 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
+    /// The model's own trained/declared max context length (GGUF metadata
+    /// key "&lt;arch&gt;.context_length"), or 0 if unknown for this model's
+    /// architecture. Informational only: the engine's KV cache grows
+    /// dynamically as tokens are processed and is NOT capped by this value -
+    /// callers that want a fixed context window (e.g. to mirror another
+    /// engine's behavior, or to budget a UI around it) should read this once
+    /// after loading and enforce it themselves.
+    /// </summary>
+    public uint TrainedContextLength()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return NativeMethods.desireeia_context_length_trained(_context);
+    }
+
+    /// <summary>
     /// Tokenizes the text with the model's tokenizer (SentencePiece or BPE,
     /// auto-detected). Returns null if the model does not have a recognized
     /// tokenizer (see <see cref="HasTokenizer"/>).

@@ -35,6 +35,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/DesireeIALocaleEngine.dir/src/models/dense_forward.cpp.obj.d"
   "CMakeFiles/DesireeIALocaleEngine.dir/src/models/moe_route.cpp.obj"
   "CMakeFiles/DesireeIALocaleEngine.dir/src/models/moe_route.cpp.obj.d"
+  "CMakeFiles/DesireeIALocaleEngine.dir/src/models/prerouter.cpp.obj"
+  "CMakeFiles/DesireeIALocaleEngine.dir/src/models/prerouter.cpp.obj.d"
   "CMakeFiles/DesireeIALocaleEngine.dir/src/models/ssm_forward.cpp.obj"
   "CMakeFiles/DesireeIALocaleEngine.dir/src/models/ssm_forward.cpp.obj.d"
   "CMakeFiles/DesireeIALocaleEngine.dir/src/quant/quant.cpp.obj"

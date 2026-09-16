@@ -339,6 +339,10 @@ void engine_destroy(desireeia_ctx* ctx);
 bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, int32_t& out_token);
 bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token);
 size_t engine_context_size(const desireeia_ctx* ctx);
+// The model's own trained/declared max context length (GGUF
+// "<arch>.context_length"), 0 if unknown. Informational only - the engine's
+// KV cache grows dynamically and is not capped by this value.
+uint32_t engine_context_length_trained(const desireeia_ctx* ctx);
 bool engine_tokenize(desireeia_ctx* ctx, const std::string& text, bool add_bos, std::vector<int32_t>& out_ids);
 bool engine_token_piece(desireeia_ctx* ctx, int32_t id, std::string& out);
 // which: 0=BOS 1=EOS 2=UNK 3=PAD (desireeia_special_token in abi.h).

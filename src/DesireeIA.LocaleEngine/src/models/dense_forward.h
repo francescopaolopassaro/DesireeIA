@@ -365,6 +365,7 @@ public:
         return (uint64_t) cache_cols_ * cfg_.n_layers * cfg_.n_head_kv * cfg_.head_dim * 2 * sizeof(float);
     }
     bool weight_cache_enabled() const override { return cache_enabled_; }
+    uint32_t trained_context_length() const override { return n_ctx_train_; }
 
     // Diagnostic only: which tensor/check made the last load_layer_data or
     // step() call fail. The ABI reports failures as a bare error code with no

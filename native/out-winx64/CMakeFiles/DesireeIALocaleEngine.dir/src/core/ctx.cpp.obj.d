@@ -231,6 +231,7 @@ CMakeFiles/DesireeIALocaleEngine.dir/src/core/ctx.cpp.obj: \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/thread_pool.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/dense_forward.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/core/forward_iface.h \
+ C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/prerouter.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/ssm_forward.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/models/bert_forward.h \
  C:/Sorgenti/Personal/DesireeIA/src/DesireeIA.LocaleEngine/src/vision/vision_gguf.h \

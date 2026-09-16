@@ -35,7 +35,18 @@ def build_plan(
     if err != Error.OK:
         raise RuntimeError(f"Hardware probe failed: {Error(err).name}")
 
-    override_native = _nat.Plan()
+    # Bug fixed here: this used to construct a blank, all-zero `_nat.Plan()`
+    # and never populate it from `overrides` - `overrides.to_native()` was
+    # never called, so every field a caller explicitly set (thread_count,
+    # kv_compression, batch_union, expert_prefetch, dense_quantization,
+    # ...) was silently discarded and replaced by whatever the native
+    # auto-detect logic picks for a zeroed field. The C# binding
+    # (DesireeIAEngine.cs BuildPlan, `overrides.ToNative()`) always did
+    # this correctly; only this Python wrapper had the gap - which is why
+    # a server built on this wrapper (desireeiaserver) measured
+    # dramatically lower decode throughput than the CLI on the identical
+    # model/hardware, despite requesting the same plan.
+    override_native = overrides.to_native() if overrides is not None else _nat.Plan()
     override_ptr = _nat.ctypes.pointer(override_native) if overrides is not None else None
     plan_out = _nat.Plan()
 

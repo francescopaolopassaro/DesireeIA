@@ -34,6 +34,7 @@ def test_parse_long_flags():
         "--parallel", "4",
         "--models-dir", r"C:\models",
         "--n-predict", "1024",
+        "--system-prompt", "Be concise.",
     ])
     assert settings.model == "model.gguf"
     assert settings.alias == "name"
@@ -44,6 +45,7 @@ def test_parse_long_flags():
     assert settings.backend == "cuda"
     assert settings.parallel == 4
     assert settings.n_predict == 1024
+    assert settings.system_prompt == "Be concise."
     assert settings.resolved_models_dir == Path(r"C:\models")
 
 

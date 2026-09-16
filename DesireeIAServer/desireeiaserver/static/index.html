@@ -20,7 +20,11 @@ server binary, not a product with its own release cycle.
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>DesireeIA</title>
-  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%236d8dff'/%3E%3Ccircle cx='32' cy='32' r='30' fill='none' stroke='%23a06dff' stroke-width='3'/%3E%3Cpath d='M32 20c-5 0-8.5 3.8-8.5 9 0 3.3 1.5 6 4.3 8.3V41c0 .8.7 1.5 1.5 1.5h5.4c.8 0 1.5-.7 1.5-1.5v-3.7c2.8-2.3 4.3-5 4.3-8.3 0-5.2-3.5-9-8.5-9z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="icon" type="image/png" href="/favicon-96x96.png" sizes="96x96">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="shortcut icon" href="/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/site.webmanifest">
   <style>
     :root {
       color-scheme: dark;
@@ -74,9 +78,10 @@ server binary, not a product with its own release cycle.
     }
     #brand .mark {
       width: 30px; height: 30px; border-radius: 50%; flex-shrink: 0;
+      background: #fff; padding: 5px;
       box-shadow: 0 0 0 1px rgba(255,255,255,0.08) inset, 0 4px 12px rgba(109,141,255,0.25);
     }
-    #brand .mark svg, #empty-state .mark svg { width: 100%; height: 100%; display: block; }
+    #brand .mark img, #empty-state .mark img { width: 100%; height: 100%; display: block; object-fit: contain; }
     #brand .label { font-size: 1rem; font-weight: 650; letter-spacing: -0.01em; }
 
     .section { margin-bottom: 1.4rem; }
@@ -167,6 +172,29 @@ server binary, not a product with its own release cycle.
     .model-row .del-btn svg { width: 13px; height: 13px; }
     .models-empty { font-size: 0.76rem; color: var(--muted); padding: 0.5rem 0.1rem; }
 
+    /* -- sessions -- */
+    #sessions-list { display: flex; flex-direction: column; gap: 0.3rem; overflow-y: auto; flex: 1; min-height: 0; }
+    .session-row {
+      display: flex; align-items: center; gap: 0.45rem;
+      font-size: 0.8rem; padding: 0.5rem 0.6rem; border-radius: var(--radius-sm);
+      background: var(--panel); border: 1px solid var(--border); cursor: pointer;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .session-row:hover { border-color: var(--border-strong); }
+    .session-row.active { border-color: var(--accent); background: var(--accent-soft); }
+    .session-row .title {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; color: var(--text-dim);
+    }
+    .session-row.active .title { color: var(--text); }
+    .session-row .del-btn {
+      background: none; border: none; color: var(--muted); cursor: pointer;
+      padding: 0.1rem; flex-shrink: 0; display: flex; border-radius: 4px;
+      transition: color 0.15s, background 0.15s;
+    }
+    .session-row .del-btn:hover { color: var(--err); background: var(--err-soft); }
+    .session-row .del-btn svg { width: 13px; height: 13px; }
+    .sessions-empty { font-size: 0.76rem; color: var(--muted); padding: 0.5rem 0.1rem; }
+
     #upload-status { font-size: 0.72rem; margin-top: 0.5rem; min-height: 1rem; }
     #upload-status.ok { color: var(--ok); }
     #upload-status.err { color: var(--err); }
@@ -204,8 +232,21 @@ server binary, not a product with its own release cycle.
       font-size: 0.88rem; font-weight: 600; overflow: hidden; text-overflow: ellipsis;
       white-space: nowrap; max-width: 26rem;
     }
+    #model-select {
+      font-size: 0.88rem; font-weight: 600; width: 22rem; max-width: 40vw;
+      background: transparent; border: 1px solid transparent; padding: 0.15rem 0.4rem;
+      margin-left: -0.4rem; border-radius: var(--radius-sm);
+    }
+    #model-select:hover, #model-select:focus { border-color: var(--border-strong); background: var(--panel); }
     #chat-header .sub { font-size: 0.72rem; color: var(--muted); }
     #chat-header .spacer { flex: 1; }
+    #model-load-btn, #model-unload-btn {
+      background: none; border: 1px solid var(--border-strong); color: var(--text-dim);
+      border-radius: var(--radius-sm); padding: 0.3rem 0.55rem; font-size: 0.74rem;
+      cursor: pointer; font-family: inherit; margin-left: 0.6rem;
+    }
+    #model-load-btn:hover, #model-unload-btn:hover { background: var(--panel); color: var(--text); }
+    #model-load-btn:disabled, #model-unload-btn:disabled { opacity: 0.4; cursor: default; }
     #clear-btn, #settings-btn {
       background: none; border: 1px solid var(--border-strong); color: var(--text-dim);
       border-radius: var(--radius-sm); padding: 0.35rem 0.65rem; font-size: 0.76rem;
@@ -226,23 +267,101 @@ server binary, not a product with its own release cycle.
       box-shadow: var(--shadow-2); z-index: 31; overflow: hidden;
     }
     #app.settings-open #settings-backdrop, #app.settings-open #settings-modal { display: flex; }
+
+    #models-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 30; }
+    #models-modal {
+      display: none; flex-direction: column; position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%, -50%); width: min(520px, calc(100vw - 2rem));
+      max-height: min(82vh, 720px); background: var(--sidebar-bg);
+      border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-2); z-index: 31; overflow: hidden;
+    }
+    #app.models-open #models-backdrop, #app.models-open #models-modal { display: flex; }
+
+    #permissions-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 30; }
+    #permissions-modal {
+      display: none; flex-direction: column; position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%, -50%); width: min(480px, calc(100vw - 2rem));
+      max-height: min(82vh, 720px); background: var(--sidebar-bg);
+      border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-2); z-index: 31; overflow: hidden;
+    }
+    #app.permissions-open #permissions-backdrop, #app.permissions-open #permissions-modal { display: flex; }
+
+    #workspace-browse-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.55); z-index: 30; }
+    #workspace-browse-modal {
+      display: none; flex-direction: column; position: fixed; top: 50%; left: 50%;
+      transform: translate(-50%, -50%); width: min(480px, calc(100vw - 2rem));
+      max-height: min(82vh, 720px); background: var(--sidebar-bg);
+      border: 1px solid var(--border-strong); border-radius: var(--radius-lg);
+      box-shadow: var(--shadow-2); z-index: 31; overflow: hidden;
+    }
+    #app.workspace-browse-open #workspace-browse-backdrop,
+    #app.workspace-browse-open #workspace-browse-modal { display: flex; }
+    #browse-toolbar { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 0.7rem; }
+    #browse-up-btn { flex-shrink: 0; width: 30px; height: 30px; padding: 0; border-radius: 8px; }
+    #browse-up-btn svg { width: 14px; height: 14px; }
+    #browse-up-btn:disabled { opacity: 0.35; cursor: default; }
+    #browse-current-path {
+      font-size: 0.78rem; color: var(--text-dim); font-family: var(--font-mono);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1;
+    }
+    #browse-list { display: flex; flex-direction: column; gap: 0.3rem; max-height: 20rem; overflow-y: auto; }
+    #browse-select-btn:disabled { opacity: 0.45; cursor: default; }
+    .toggle-row {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 0.8rem;
+      padding: 0.6rem 0; border-bottom: 1px solid var(--border);
+    }
+    .toggle-row:last-child { border-bottom: none; }
+    .toggle-row .info { min-width: 0; }
+    .toggle-row .info .name { font-size: 0.85rem; font-weight: 600; margin-bottom: 0.15rem; }
+    .toggle-row .info .desc { font-size: 0.74rem; color: var(--muted); line-height: 1.4; }
+    .switch { position: relative; width: 38px; height: 22px; flex-shrink: 0; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .switch .track {
+      position: absolute; inset: 0; background: var(--panel-2); border: 1px solid var(--border-strong);
+      border-radius: 999px; cursor: pointer; transition: background 0.15s;
+    }
+    .switch .track::before {
+      content: ''; position: absolute; width: 16px; height: 16px; left: 2px; top: 2px;
+      background: var(--text-dim); border-radius: 50%; transition: transform 0.15s, background 0.15s;
+    }
+    .switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+    .switch input:checked + .track::before { transform: translateX(16px); background: #fff; }
     .modal-header {
       display: flex; align-items: center; justify-content: space-between;
       padding: 0.9rem 1.1rem; border-bottom: 1px solid var(--border); flex-shrink: 0;
     }
     .modal-header .modal-title { font-size: 0.95rem; font-weight: 650; }
-    #settings-close {
+    #settings-close, #models-close, #permissions-close, #workspace-browse-close {
       background: none; border: none; color: var(--text-dim); cursor: pointer;
-      padding: 0.3rem; border-radius: 6px;
+      padding: 0.3rem; border-radius: 6px; display: flex; flex-shrink: 0;
     }
-    #settings-close:hover { background: var(--panel); color: var(--text); }
-    #settings-close svg { width: 16px; height: 16px; }
+    #settings-close:hover, #models-close:hover, #permissions-close:hover, #workspace-browse-close:hover {
+      background: var(--panel); color: var(--text);
+    }
+    #settings-close svg, #models-close svg, #permissions-close svg, #workspace-browse-close svg { width: 16px; height: 16px; }
     .modal-body { padding: 1.1rem; overflow-y: auto; }
     .field-hint { font-size: 0.7rem; color: var(--muted); margin-top: 0.3rem; line-height: 1.4; }
 
     /* ============================= attachments ============================= */
-    #attach-btn { flex-shrink: 0; width: 34px; height: 34px; padding: 0; border-radius: 9px; }
-    #attach-btn svg { width: 15px; height: 15px; }
+    #workspace-bar {
+      max-width: 48rem; width: 100%; margin: 0.5rem auto 0;
+      display: flex; align-items: center; gap: 0.5rem;
+      font-size: 0.74rem; color: var(--muted); padding: 0 0.2rem;
+    }
+    #workspace-bar svg { width: 13px; height: 13px; flex-shrink: 0; }
+    #workspace-label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #workspace-bar.active #workspace-label { color: var(--text-dim); }
+    #workspace-set-btn, #workspace-clear-btn {
+      flex-shrink: 0; padding: 0.25rem 0.6rem; font-size: 0.72rem; border-radius: var(--radius-sm);
+    }
+    #attach-btn, #mic-btn { flex-shrink: 0; width: 34px; height: 34px; padding: 0; border-radius: 9px; }
+    #attach-btn svg, #mic-btn svg { width: 15px; height: 15px; }
+    #mic-btn.recording { background: #4a2020; color: #ff8080; animation: mic-pulse 1.2s ease-in-out infinite; }
+    #mic-btn.recording:hover { background: #5c2828; }
+    @keyframes mic-pulse { 50% { box-shadow: 0 0 0 4px rgba(248,113,113,0.25); } }
+    #mic-btn.transcribing { opacity: 0.6; cursor: default; }
     .attachment-chip {
       max-width: 48rem; margin: 0 auto 0.5rem; display: flex; align-items: center; gap: 0.5rem;
       background: var(--panel); border: 1px solid var(--border-strong); border-radius: var(--radius-sm);
@@ -356,6 +475,7 @@ server binary, not a product with its own release cycle.
     }
     #empty-state .mark {
       width: 44px; height: 44px; border-radius: 50%; margin-bottom: 0.3rem;
+      background: #fff; padding: 8px;
       box-shadow: 0 8px 24px rgba(109,141,255,0.25);
     }
     #empty-state .title { font-size: 1rem; font-weight: 600; color: var(--text-dim); }
@@ -418,32 +538,48 @@ server binary, not a product with its own release cycle.
   <aside id="sidebar">
     <div id="sidebar-scroll">
       <div id="brand">
-        <div class="mark">
-          <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <defs>
-              <linearGradient id="logoGrad" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
-                <stop stop-color="#6d8dff"/><stop offset="1" stop-color="#a06dff"/>
-              </linearGradient>
-            </defs>
-            <circle cx="32" cy="32" r="30" fill="url(#logoGrad)"/>
-            <g stroke="rgba(255,255,255,0.55)" stroke-width="1">
-              <line x1="32" y1="6" x2="14" y2="16"/><line x1="32" y1="6" x2="50" y2="16"/>
-              <line x1="14" y1="16" x2="10" y2="32"/><line x1="50" y1="16" x2="54" y2="32"/>
-              <line x1="10" y1="32" x2="18" y2="46"/><line x1="54" y1="32" x2="46" y2="46"/>
-              <line x1="14" y1="16" x2="50" y2="16"/><line x1="10" y1="32" x2="54" y2="32"/>
-            </g>
-            <g fill="#fff">
-              <circle cx="32" cy="6" r="1.6"/><circle cx="14" cy="16" r="1.6"/><circle cx="50" cy="16" r="1.6"/>
-              <circle cx="10" cy="32" r="1.6"/><circle cx="54" cy="32" r="1.6"/>
-              <circle cx="18" cy="46" r="1.6"/><circle cx="46" cy="46" r="1.6"/>
-            </g>
-            <path d="M32 18c-6 0-10 4.6-10 10.8 0 4 1.8 7.2 5.2 10V44c0 1 .8 1.8 1.8 1.8h6c1 0 1.8-.8 1.8-1.8v-5.2c3.4-2.8 5.2-6 5.2-10C42 22.6 38 18 32 18z" fill="#fff"/>
-          </svg>
-        </div>
+        <div class="mark"><img src="/OnlyLogoWhite.svg" alt="DesireeIA"></div>
         <div class="label">DesireeIA</div>
       </div>
 
-      <div class="section">
+      <div class="section" style="flex:1; display:flex; flex-direction:column; min-height:0; margin-bottom:0;">
+        <div class="section-title">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+          Sessions
+        </div>
+        <button class="btn btn-secondary btn-block" id="new-session-btn" style="margin-bottom:0.6rem;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          New chat
+        </button>
+        <div id="sessions-list"></div>
+      </div>
+    </div>
+
+    <div id="status-line">
+      <button id="models-btn" title="Manage models" style="background:none;border:none;color:var(--muted);cursor:pointer;display:flex;align-items:center;gap:0.4rem;padding:0;font-family:inherit;font-size:0.72rem;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M20 6L9 17l-5-5"/></svg>
+        Models
+      </button>
+      <button id="permissions-btn" title="Permissions" style="background:none;border:none;color:var(--muted);cursor:pointer;display:flex;align-items:center;gap:0.4rem;padding:0;font-family:inherit;font-size:0.72rem;margin-left:0.9rem;">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="13" height="13"><path d="M12 15a3 3 0 100-6 3 3 0 000 6z"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
+        Permissions
+      </button>
+      <span style="flex:1"></span>
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">connecting…</span>
+    </div>
+  </aside>
+
+  <div id="models-backdrop"></div>
+  <div id="models-modal" role="dialog" aria-modal="true" aria-labelledby="models-title">
+    <div class="modal-header">
+      <div class="modal-title" id="models-title">Models</div>
+      <button id="models-close" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="section" style="margin-bottom:0;">
         <div class="section-title">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
           Models folder
@@ -457,12 +593,50 @@ server binary, not a product with its own release cycle.
         <div id="upload-status"></div>
       </div>
     </div>
+  </div>
 
-    <div id="status-line">
-      <span class="dot" id="status-dot"></span>
-      <span id="status-text">connecting…</span>
+  <div id="permissions-backdrop"></div>
+  <div id="permissions-modal" role="dialog" aria-modal="true" aria-labelledby="permissions-title">
+    <div class="modal-header">
+      <div class="modal-title" id="permissions-title">Permissions</div>
+      <button id="permissions-close" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
     </div>
-  </aside>
+    <div class="modal-body">
+      <div class="section" style="margin-bottom:0;">
+        <div class="section-title">What the assistant is allowed to do</div>
+        <div class="toggle-row">
+          <div class="info">
+            <div class="name">Internet access (weather &amp; search)</div>
+            <div class="desc">Lets it check real weather (Open-Meteo) and search Wikipedia for general information. No other network access is granted.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="perm-web"><span class="track"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div class="info">
+            <div class="name">Code execution (Python sandbox)</div>
+            <div class="desc">Lets it run Python snippets on this machine via the sandboxed run_python tool. Also requires the server to be started with --enable-python-tool.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="perm-code"><span class="track"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div class="info">
+            <div class="name">File access (attachments &amp; workspace)</div>
+            <div class="desc">Lets you attach text/code files and paste long snippets into the chat, and lets run_python read/write files in its per-session workspace folder.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="perm-files"><span class="track"></span></label>
+        </div>
+        <div class="toggle-row">
+          <div class="info">
+            <div class="name">Microphone (voice input) — temporarily disabled</div>
+            <div class="desc">Lets you record and transcribe speech into the composer. Nothing is sent anywhere until you press record. The mic button is hidden for now regardless of this toggle - see the known issues doc for the transcription reliability bug being worked on.</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="perm-mic"><span class="track"></span></label>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <div id="settings-backdrop"></div>
   <div id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
@@ -475,10 +649,6 @@ server binary, not a product with its own release cycle.
     <div class="modal-body">
       <div class="section">
         <div class="section-title">Model</div>
-        <div class="field">
-          <label for="model-select">Active model</label>
-          <select id="model-select"></select>
-        </div>
         <div class="field">
           <label for="system-prompt">System prompt</label>
           <textarea id="system-prompt" rows="3" placeholder="(optional) instructions the model should always follow"></textarea>
@@ -532,9 +702,11 @@ server binary, not a product with its own release cycle.
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
       </button>
       <div class="title-wrap">
-        <div id="chat-model-name">No model</div>
+        <select id="model-select"></select>
         <div class="sub" id="chat-model-sub">&nbsp;</div>
       </div>
+      <button id="model-unload-btn" title="Unload the active model from memory (frees VRAM/RAM)">Unload</button>
+      <button id="model-load-btn" title="Load the active model into memory" style="display:none;">Load</button>
       <div class="spacer"></div>
       <button id="settings-btn" title="Settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.65 1.65 0 004.6 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 112.83-2.83l.06.06A1.65 1.65 0 009 4.6a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 112.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>
@@ -547,23 +719,7 @@ server binary, not a product with its own release cycle.
     </div>
     <div id="messages">
       <div id="empty-state">
-        <div class="mark">
-          <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-            <circle cx="32" cy="32" r="30" fill="url(#logoGrad)"/>
-            <g stroke="rgba(255,255,255,0.55)" stroke-width="1">
-              <line x1="32" y1="6" x2="14" y2="16"/><line x1="32" y1="6" x2="50" y2="16"/>
-              <line x1="14" y1="16" x2="10" y2="32"/><line x1="50" y1="16" x2="54" y2="32"/>
-              <line x1="10" y1="32" x2="18" y2="46"/><line x1="54" y1="32" x2="46" y2="46"/>
-              <line x1="14" y1="16" x2="50" y2="16"/><line x1="10" y1="32" x2="54" y2="32"/>
-            </g>
-            <g fill="#fff">
-              <circle cx="32" cy="6" r="1.6"/><circle cx="14" cy="16" r="1.6"/><circle cx="50" cy="16" r="1.6"/>
-              <circle cx="10" cy="32" r="1.6"/><circle cx="54" cy="32" r="1.6"/>
-              <circle cx="18" cy="46" r="1.6"/><circle cx="46" cy="46" r="1.6"/>
-            </g>
-            <path d="M32 18c-6 0-10 4.6-10 10.8 0 4 1.8 7.2 5.2 10V44c0 1 .8 1.8 1.8 1.8h6c1 0 1.8-.8 1.8-1.8v-5.2c3.4-2.8 5.2-6 5.2-10C42 22.6 38 18 32 18z" fill="#fff"/>
-          </svg>
-        </div>
+        <div class="mark"><img src="/OnlyLogoWhite.svg" alt="DesireeIA"></div>
         <div class="title">Start a conversation</div>
         <div class="hint">Everything runs locally through this server's own engine — pick a model and tune sampling from Settings, or just start typing to use the default.</div>
       </div>
@@ -576,6 +732,9 @@ server binary, not a product with its own release cycle.
         </button>
         <input type="file" id="attach-input" style="display:none"
                accept=".txt,.md,.markdown,.py,.js,.ts,.jsx,.tsx,.json,.yaml,.yml,.csv,.log,.c,.h,.hpp,.cpp,.cc,.cs,.java,.go,.rs,.rb,.php,.sh,.ps1,.sql,.html,.css,.xml,.ini,.toml,.cfg">
+        <button class="btn btn-secondary" id="mic-btn" type="button" title="Record voice input" style="display:none;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 00-3 3v8a3 3 0 006 0V4a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"/></svg>
+        </button>
         <textarea id="prompt" placeholder="Message DesireeIA… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
         <button class="btn" id="send-btn" title="Send">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 2L11 13M22 2l-7 20-4-9-9-4 20-7z"/></svg>
@@ -583,6 +742,34 @@ server binary, not a product with its own release cycle.
         <button class="btn" id="stop-btn" title="Stop">
           <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
         </button>
+      </div>
+      <div id="workspace-bar">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>
+        <span id="workspace-label">No workspace — code/file tools off</span>
+        <button class="btn btn-secondary" id="workspace-set-btn" type="button">Set</button>
+        <button class="btn btn-secondary" id="workspace-clear-btn" type="button" style="display:none;">Clear</button>
+      </div>
+    </div>
+
+    <div id="workspace-browse-backdrop"></div>
+    <div id="workspace-browse-modal" role="dialog" aria-modal="true" aria-labelledby="workspace-browse-title">
+      <div class="modal-header">
+        <div class="modal-title" id="workspace-browse-title">Choose a workspace folder</div>
+        <button id="workspace-browse-close" title="Close" aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="browse-toolbar">
+          <button class="btn btn-secondary" id="browse-up-btn" type="button" title="Up one level">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+          <span id="browse-current-path"></span>
+        </div>
+        <div id="browse-list"></div>
+        <div class="btn-row" style="margin-top:0.85rem;">
+          <button class="btn" id="browse-select-btn" type="button">Use this folder</button>
+        </div>
       </div>
     </div>
   </div>
@@ -594,10 +781,16 @@ server binary, not a product with its own release cycle.
 
   // ---- state -------------------------------------------------------
   const state = {
-    messages: [],          // [{role, content, tool_calls?, tool_call_id?, name?}]
-    controller: null,      // AbortController for the in-flight stream
-    settings: null,        // last settings object fetched from /config
-    attachment: null,      // {name, content, size} pending file attached to the next message
+    messages: [],           // [{role, content, tool_calls?, tool_call_id?, name?}] - the CURRENT session's
+    controller: null,       // AbortController for the in-flight stream
+    settings: null,         // last settings object fetched from /config
+    attachment: null,       // {name, content, size} pending file attached to the next message
+    sessions: [],           // [{id, title, messages, createdAt, updatedAt}]
+    currentSessionId: null,
+    serverRunPythonEnabled: false,
+    serverWhisperEnabled: false,
+    workspaceId: null,      // model-set via the set_workspace tool - a name, sandboxed under the server's data dir
+    workspacePath: null,    // user-set via the folder-browse modal - a real absolute directory, used in preference to workspaceId
   };
 
   const $ = (id) => document.getElementById(id);
@@ -628,9 +821,36 @@ server binary, not a product with its own release cycle.
     attachBtn: $('attach-btn'),
     attachInput: $('attach-input'),
     attachmentChip: $('attachment-chip'),
+    micBtn: $('mic-btn'),
+    workspaceBar: $('workspace-bar'),
+    workspaceLabel: $('workspace-label'),
+    workspaceSetBtn: $('workspace-set-btn'),
+    workspaceClearBtn: $('workspace-clear-btn'),
+    browseBackdrop: $('workspace-browse-backdrop'),
+    browseModal: $('workspace-browse-modal'),
+    browseClose: $('workspace-browse-close'),
+    browseUpBtn: $('browse-up-btn'),
+    browseCurrentPath: $('browse-current-path'),
+    browseList: $('browse-list'),
+    browseSelectBtn: $('browse-select-btn'),
     clearBtn: $('clear-btn'),
-    chatModelName: $('chat-model-name'),
     chatModelSub: $('chat-model-sub'),
+    modelUnloadBtn: $('model-unload-btn'),
+    modelLoadBtn: $('model-load-btn'),
+    modelsBtn: $('models-btn'),
+    modelsModal: $('models-modal'),
+    modelsBackdrop: $('models-backdrop'),
+    modelsClose: $('models-close'),
+    newSessionBtn: $('new-session-btn'),
+    sessionsList: $('sessions-list'),
+    permissionsBtn: $('permissions-btn'),
+    permissionsModal: $('permissions-modal'),
+    permissionsBackdrop: $('permissions-backdrop'),
+    permissionsClose: $('permissions-close'),
+    permWeb: $('perm-web'),
+    permCode: $('perm-code'),
+    permFiles: $('perm-files'),
+    permMic: $('perm-mic'),
     sliders: {
       temperature: $('temperature'),
       top_p: $('top_p'),
@@ -685,15 +905,29 @@ server binary, not a product with its own release cycle.
   el.settingsBackdrop.addEventListener('click', () => setSettingsOpen(false));
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && el.app.classList.contains('settings-open')) setSettingsOpen(false);
+    if (e.key === 'Escape' && el.app.classList.contains('models-open')) setModelsOpen(false);
+    if (e.key === 'Escape' && el.app.classList.contains('permissions-open')) setPermissionsOpen(false);
+    if (e.key === 'Escape' && el.app.classList.contains('workspace-browse-open')) setWorkspaceOpen(false);
   });
 
   // ---- health / model list -------------------------------------------
   async function refreshHealth() {
     try {
       const h = await fetchJSON('/health');
-      if (h.status === 'ok') setStatus('ok', 'connected · ' + (h.engine_version || h.version));
-      else if (h.status === 'loading') setStatus('warn', 'loading model…');
-      else setStatus('err', h.status);
+      const slots = h.slots || [];
+      if (h.status === 'ok') {
+        setStatus('ok', 'connected · ' + (h.engine_version || h.version));
+      } else if (h.status === 'loading') {
+        setStatus('warn', 'loading model…');
+      } else if (h.status === 'unavailable' && slots.length && slots.every(s => s.state === 'unloaded')) {
+        // Every registered model was deliberately unloaded (see the header's
+        // Unload button) - that is the point of the feature, not a failure,
+        // so this reads as neutral/idle rather than the alarming red "err"
+        // this server status otherwise gets.
+        setStatus('warn', 'connected · model unloaded');
+      } else {
+        setStatus('err', h.status);
+      }
     } catch (e) {
       setStatus('err', 'unreachable');
     }
@@ -702,13 +936,49 @@ server binary, not a product with its own release cycle.
   function updateChatHeader() {
     const opt = el.modelSelect.options[el.modelSelect.selectedIndex];
     if (!opt || !opt.value) {
-      el.chatModelName.textContent = 'No model';
       el.chatModelSub.innerHTML = '&nbsp;';
+      el.modelUnloadBtn.style.display = 'none';
+      el.modelLoadBtn.style.display = 'none';
       return;
     }
-    el.chatModelName.textContent = opt.value;
-    el.chatModelSub.textContent = (opt.dataset.state || '') + (opt.dataset.replicas > 1 ? ` · ${opt.dataset.replicas} slots` : '');
+    const state = opt.dataset.state || '';
+    el.chatModelSub.textContent = state + (opt.dataset.replicas > 1 ? ` · ${opt.dataset.replicas} slots` : '');
+    const loaded = state === 'loaded';
+    el.modelUnloadBtn.style.display = loaded ? '' : 'none';
+    el.modelLoadBtn.style.display = loaded ? 'none' : '';
   }
+
+  async function unloadActiveModel() {
+    const name = el.modelSelect.value;
+    if (!name) return;
+    el.modelUnloadBtn.disabled = true;
+    try {
+      await fetchJSON(`/v1/models/${encodeURIComponent(name)}/unload`, { method: 'POST' });
+      await refreshModels();
+    } catch (e) { /* transient - the next refreshModels() poll will catch up */ }
+    finally { el.modelUnloadBtn.disabled = false; }
+  }
+
+  async function loadActiveModel() {
+    const name = el.modelSelect.value;
+    if (!name) return;
+    el.modelLoadBtn.disabled = true;
+    try {
+      await fetchJSON(`/v1/models/${encodeURIComponent(name)}/load`, { method: 'POST' });
+      await refreshModels();
+    } catch (e) { /* transient - the next refreshModels() poll will catch up */ }
+    finally { el.modelLoadBtn.disabled = false; }
+  }
+  el.modelUnloadBtn.addEventListener('click', unloadActiveModel);
+  el.modelLoadBtn.addEventListener('click', loadActiveModel);
+
+  // ---- models modal -------------------------------------------------------
+  function setModelsOpen(open) {
+    el.app.classList.toggle('models-open', open);
+  }
+  el.modelsBtn.addEventListener('click', () => setModelsOpen(true));
+  el.modelsClose.addEventListener('click', () => setModelsOpen(false));
+  el.modelsBackdrop.addEventListener('click', () => setModelsOpen(false));
 
   async function refreshModels() {
     let data;
@@ -877,6 +1147,176 @@ server binary, not a product with its own release cycle.
     // here beyond letting that retry happen.
   }
 
+  // ---- sticky default system prompt ---------------------------------
+  // Independent of any one session's stored system message: what shows
+  // up in a brand-new chat before you've typed a first message. Without
+  // this, applySessionToUI() reset the field to "" every time because a
+  // new session genuinely has no system message yet - the user had to
+  // retype it before every single new conversation.
+  const DEFAULT_SYSTEM_PROMPT_KEY = 'desireeia_default_system_prompt_v1';
+
+  function loadDefaultSystemPrompt() {
+    try { return localStorage.getItem(DEFAULT_SYSTEM_PROMPT_KEY) || ''; }
+    catch (e) { return ''; }
+  }
+
+  function saveDefaultSystemPrompt(value) {
+    try { localStorage.setItem(DEFAULT_SYSTEM_PROMPT_KEY, value); }
+    catch (e) { /* storage full/unavailable - just won't stick across chats */ }
+  }
+
+  el.systemPrompt.addEventListener('input', () => saveDefaultSystemPrompt(el.systemPrompt.value));
+
+  function currentSessionHasOwnSystemPrompt() {
+    const session = state.sessions.find(s => s.id === state.currentSessionId);
+    return !!(session && session.messages.find(m => m.role === 'system'));
+  }
+
+  // ---- permissions ----------------------------------------------------
+  // What the assistant is allowed to do in THIS browser - persisted to
+  // localStorage like sessions, never sent to or trusted from the server:
+  // these are consent toggles the person at the keyboard controls, not a
+  // server-side security boundary (the server has its own independent gate
+  // for run_python via --enable-python-tool, checked separately).
+  const PERMISSIONS_KEY = 'desireeia_permissions_v1';
+  const DEFAULT_PERMISSIONS = { web: true, code: true, files: true, mic: false };
+
+  function loadPermissions() {
+    try {
+      const raw = localStorage.getItem(PERMISSIONS_KEY);
+      return raw ? { ...DEFAULT_PERMISSIONS, ...JSON.parse(raw) } : { ...DEFAULT_PERMISSIONS };
+    } catch (e) { return { ...DEFAULT_PERMISSIONS }; }
+  }
+
+  const perms = loadPermissions();
+
+  function savePermissions() {
+    try { localStorage.setItem(PERMISSIONS_KEY, JSON.stringify(perms)); }
+    catch (e) { /* storage full/unavailable - toggles just won't survive a reload */ }
+  }
+
+  function applyPermissionsToUI() {
+    el.permWeb.checked = perms.web;
+    el.permCode.checked = perms.code;
+    el.permFiles.checked = perms.files;
+    el.permMic.checked = perms.mic;
+    el.attachBtn.disabled = !perms.files;
+    el.attachBtn.title = perms.files ? 'Attach a text/code file' : 'File access is disabled in Permissions';
+    // Hidden unconditionally for now regardless of the permission/server
+    // capability checks below - voice input still has an open reliability
+    // issue (see ../docs/BUG16092026.md). Restore
+    // `(perms.mic && state.serverWhisperEnabled) ? '' : 'none'` once that's
+    // resolved and verified.
+    el.micBtn.style.display = 'none';
+  }
+
+  function setPermissionsOpen(open) {
+    el.app.classList.toggle('permissions-open', open);
+  }
+  el.permissionsBtn.addEventListener('click', () => setPermissionsOpen(true));
+  el.permissionsClose.addEventListener('click', () => setPermissionsOpen(false));
+  el.permissionsBackdrop.addEventListener('click', () => setPermissionsOpen(false));
+
+  for (const [key, input] of [['web', el.permWeb], ['code', el.permCode], ['files', el.permFiles], ['mic', el.permMic]]) {
+    input.addEventListener('change', () => {
+      perms[key] = input.checked;
+      savePermissions();
+      applyPermissionsToUI();
+    });
+  }
+
+  // ---- workspace selector (below the composer) ---------------------------
+  // run_python and the file tools are only offered to the model at all
+  // when a workspace is set (see activeTools()) - this bar plus the
+  // browse modal below is how a person picks a REAL folder on disk; the
+  // model can also set a name-only sandboxed one itself via the
+  // set_workspace tool when asked for one by name in conversation. A real
+  // picked folder (workspacePath) always wins display-wise when both
+  // happen to be set.
+  function renderWorkspaceBar() {
+    const active = !!(state.workspacePath || state.workspaceId);
+    el.workspaceBar.classList.toggle('active', active);
+    el.workspaceLabel.textContent = state.workspacePath
+      ? `Workspace: ${state.workspacePath}`
+      : state.workspaceId
+        ? `Workspace: ${state.workspaceId} (sandboxed)`
+        : 'No workspace — code/file tools off';
+    el.workspaceLabel.title = el.workspaceLabel.textContent;
+    el.workspaceSetBtn.style.display = active ? 'none' : '';
+    el.workspaceClearBtn.style.display = active ? '' : 'none';
+  }
+
+  el.workspaceSetBtn.addEventListener('click', () => openWorkspaceBrowser());
+  el.workspaceClearBtn.addEventListener('click', () => {
+    state.workspacePath = null;
+    state.workspaceId = null;
+    renderWorkspaceBar();
+  });
+
+  // ---- workspace folder-browse modal --------------------------------------
+  // A web page has no way to get a real OS path out of a native file
+  // picker (the File System Access API only ever hands back an opaque,
+  // sandboxed handle, by design) - but the server runs on this same
+  // machine, so it can walk the real filesystem and this modal lets the
+  // browser pick from THAT instead of typing a path by hand.
+  let browsePath = null;
+
+  function setWorkspaceOpen(open) {
+    el.app.classList.toggle('workspace-browse-open', open);
+  }
+
+  async function renderBrowseList(path) {
+    el.browseList.innerHTML = '<div class="sessions-empty">loading…</div>';
+    let data;
+    try {
+      const qs = path ? ('?path=' + encodeURIComponent(path)) : '';
+      data = await fetchJSON('/tools/workspaces/browse' + qs);
+    } catch (e) {
+      el.browseList.innerHTML = `<div class="sessions-empty">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+    browsePath = data.path;
+    el.browseCurrentPath.textContent = browsePath || '(drives)';
+    el.browseCurrentPath.title = browsePath || '';
+    el.browseUpBtn.disabled = !data.parent;
+    el.browseUpBtn.dataset.parent = data.parent || '';
+    el.browseSelectBtn.disabled = !browsePath;
+
+    if (data.entries.length === 0) {
+      el.browseList.innerHTML = '<div class="sessions-empty">no subfolders here</div>';
+      return;
+    }
+    el.browseList.innerHTML = '';
+    for (const entry of data.entries) {
+      const row = document.createElement('div');
+      row.className = 'session-row';
+      row.innerHTML =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14">' +
+        '<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/></svg>' +
+        `<span class="title">${escapeHtml(entry.name)}</span>`;
+      row.addEventListener('click', () => renderBrowseList(entry.path));
+      el.browseList.appendChild(row);
+    }
+  }
+
+  function openWorkspaceBrowser() {
+    setWorkspaceOpen(true);
+    renderBrowseList(state.workspacePath || '');
+  }
+
+  el.browseUpBtn.addEventListener('click', () => {
+    if (el.browseUpBtn.dataset.parent) renderBrowseList(el.browseUpBtn.dataset.parent);
+  });
+  el.browseSelectBtn.addEventListener('click', () => {
+    if (!browsePath) return;
+    state.workspacePath = browsePath;
+    state.workspaceId = null;
+    renderWorkspaceBar();
+    setWorkspaceOpen(false);
+  });
+  el.browseClose.addEventListener('click', () => setWorkspaceOpen(false));
+  el.browseBackdrop.addEventListener('click', () => setWorkspaceOpen(false));
+
   // ---- chat attachments (text/code files folded into the prompt) --------
   // Local text-only models can't see an image, so this attaches a file's
   // TEXT CONTENT as a fenced code block appended to the message rather than
@@ -912,17 +1352,49 @@ server binary, not a product with its own release cycle.
     if (e.target.closest('.remove-btn')) { state.attachment = null; renderAttachmentChip(); }
   });
 
-  el.attachBtn.addEventListener('click', () => el.attachInput.click());
+  el.attachBtn.addEventListener('click', () => { if (perms.files) el.attachInput.click(); });
   el.attachInput.addEventListener('change', async () => {
     const file = el.attachInput.files[0];
     el.attachInput.value = '';
-    if (!file) return;
+    if (!file || !perms.files) return;
     if (file.size > MAX_ATTACHMENT_BYTES) {
       alert(`"${file.name}" is ${formatBytes(file.size)} — attachments are limited to ${formatBytes(MAX_ATTACHMENT_BYTES)} of text.`);
       return;
     }
     const content = await file.text();
     state.attachment = { name: file.name, content, size: file.size };
+    renderAttachmentChip();
+  });
+
+  // A long or multi-line paste (a log, a stack trace, a whole file's worth
+  // of code) becomes an attachment instead of dumping raw text into the
+  // composer - same fenced-code-block treatment as an uploaded file, so it
+  // renders as code and doesn't blow up the composer's height. A short,
+  // normal paste (a URL, a sentence) is left alone.
+  const PASTE_AS_ATTACHMENT_CHARS = 400;
+  const PASTE_AS_ATTACHMENT_LINES = 8;
+
+  function guessLangFromContent(text) {
+    const head = text.slice(0, 1000);
+    if (/^\s*(def |class \w+.*:|import \w|from \w+ import)/m.test(head)) return 'py';
+    if (/^\s*(function |const |let |export |import .* from )/m.test(head)) return 'js';
+    if (/^\s*#include\s*[<"]/m.test(head)) return 'cpp';
+    if (/^\s*(using System|namespace \w+)/m.test(head)) return 'cs';
+    if (/<\!DOCTYPE html|<html[ >]/i.test(head)) return 'html';
+    if (/^\s*(public|private)?\s*(static\s+)?class\s+\w+/m.test(head)) return 'java';
+    if (/^\s*SELECT\s|^\s*CREATE TABLE/im.test(head)) return 'sql';
+    return '';
+  }
+
+  el.prompt.addEventListener('paste', (e) => {
+    if (!perms.files) return;
+    const text = (e.clipboardData || window.clipboardData).getData('text');
+    if (!text) return;
+    const lineCount = text.split('\n').length;
+    if (text.length < PASTE_AS_ATTACHMENT_CHARS && lineCount < PASTE_AS_ATTACHMENT_LINES) return;
+    e.preventDefault();
+    const lang = guessLangFromContent(text);
+    state.attachment = { name: `pasted-text.${lang || 'txt'}`, content: text, size: text.length };
     renderAttachmentChip();
   });
 
@@ -934,12 +1406,82 @@ server binary, not a product with its own release cycle.
     return `${prefix}Attached file: ${state.attachment.name}\n${fence}`;
   }
 
+  // ---- voice input (microphone -> POST /transcribe) ----------------------
+  // Recording only starts on an explicit click (getUserMedia itself also
+  // requires the browser's own permission prompt) and audio never leaves
+  // the machine except to this same server's /transcribe endpoint, which
+  // is off by default (--enable-whisper) and requires faster-whisper to
+  // even be installed - see transcription.py.
+  let mediaRecorder = null;
+  let recordedChunks = [];
+
+  async function startRecording() {
+    let stream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) {
+      alert('Microphone access was denied or is unavailable: ' + e.message);
+      return;
+    }
+    recordedChunks = [];
+    const mimeType = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm')) ? 'audio/webm' : '';
+    mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+    mediaRecorder.addEventListener('dataavailable', (e) => {
+      if (e.data.size > 0) recordedChunks.push(e.data);
+    });
+    mediaRecorder.addEventListener('stop', async () => {
+      stream.getTracks().forEach((t) => t.stop());
+      const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+      await transcribeAndInsert(blob);
+    });
+    mediaRecorder.start();
+    el.micBtn.classList.add('recording');
+    el.micBtn.title = 'Stop recording';
+  }
+
+  function stopRecording() {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    el.micBtn.classList.remove('recording');
+  }
+
+  async function transcribeAndInsert(blob) {
+    el.micBtn.classList.add('transcribing');
+    el.micBtn.title = 'Transcribing…';
+    const form = new FormData();
+    form.append('audio', blob, 'voice.webm');
+    try {
+      const data = await fetchJSON('/transcribe', { method: 'POST', body: form });
+      const text = (data.text || '').trim();
+      if (text) {
+        el.prompt.value = el.prompt.value ? el.prompt.value + ' ' + text : text;
+        autoGrow();
+        el.prompt.focus();
+      } else {
+        // Silently doing nothing here reads as "the button is broken" -
+        // no speech was detected at all is a real, distinct outcome from
+        // a crash and deserves its own visible message instead of the
+        // composer just staying empty with no explanation.
+        alert('No speech was detected in that recording. Check your microphone input and try again.');
+      }
+    } catch (e) {
+      alert('Transcription failed: ' + e.message);
+    } finally {
+      el.micBtn.classList.remove('transcribing');
+      el.micBtn.title = 'Record voice input';
+    }
+  }
+
+  el.micBtn.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state === 'recording') stopRecording();
+    else startRecording();
+  });
+
   // ---- built-in tools (client-side execution) ---------------------------
   // The server only detects that the model WANTS to call a tool (see
   // toolcalling.py) — actually running one is the client's job, same as a
   // real OpenAI-style tool-calling client. get_weather is a genuine call to
   // a free, no-key weather API (Open-Meteo), not a canned/fake answer.
-  const TOOLS = [{
+  const WEATHER_TOOL = {
     type: 'function',
     function: {
       name: 'get_weather',
@@ -950,7 +1492,133 @@ server binary, not a product with its own release cycle.
         required: ['location'],
       },
     },
-  }];
+  };
+
+  const WEB_SEARCH_TOOL = {
+    type: 'function',
+    function: {
+      name: 'web_search',
+      description: 'Search for general information on any topic and get back short summaries with source ' +
+        'titles. Backed by Wikipedia\'s search - good for facts, people, places, history, concepts; not a full ' +
+        'web index and not a source for breaking news or real-time data (use get_weather for weather).',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'What to search for.' } },
+        required: ['query'],
+      },
+    },
+  };
+
+  const RUN_PYTHON_TOOL = {
+    type: 'function',
+    function: {
+      name: 'run_python',
+      description: 'Run a short Python snippet and get back its stdout/stderr. Use it for calculations, ' +
+        'data processing, or checking that code actually works. Files written with a relative path (e.g. ' +
+        'open("data.csv", "w")) persist in a per-conversation workspace across calls in this chat. No network access; output is truncated.',
+      parameters: {
+        type: 'object',
+        properties: { code: { type: 'string', description: 'Python source code to execute.' } },
+        required: ['code'],
+      },
+    },
+  };
+
+  const LIST_FILES_TOOL = {
+    type: 'function',
+    function: {
+      name: 'list_files',
+      description: 'List the files and folders directly inside one workspace folder (like "ls"/"dir" - ' +
+        'one level, not recursive). Call it again with a subfolder\'s path to look inside that, or use ' +
+        'search_files to find something by name/content across the whole workspace at once.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'Folder to list, relative to the workspace root. Defaults to the root.' } },
+      },
+    },
+  };
+
+  const READ_FILE_TOOL = {
+    type: 'function',
+    function: {
+      name: 'read_file',
+      description: 'Read a text file from the conversation workspace.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'File path, relative to the workspace root.' } },
+        required: ['path'],
+      },
+    },
+  };
+
+  const WRITE_FILE_TOOL = {
+    type: 'function',
+    function: {
+      name: 'write_file',
+      description: 'Create or overwrite a text file in the conversation workspace. Parent folders are created automatically.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'File path, relative to the workspace root.' },
+          content: { type: 'string', description: 'Full text content to write.' },
+        },
+        required: ['path', 'content'],
+      },
+    },
+  };
+
+  const SEARCH_FILES_TOOL = {
+    type: 'function',
+    function: {
+      name: 'search_files',
+      description: 'Search the conversation workspace by file name or file content.',
+      parameters: {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'Text to search for.' } },
+        required: ['query'],
+      },
+    },
+  };
+
+  const SET_WORKSPACE_TOOL = {
+    type: 'function',
+    function: {
+      name: 'set_workspace',
+      description: 'Switch to a different named workspace for file/code tools in this conversation (or create ' +
+        'a new one). Call this when the user asks to use, switch to, or start a specific workspace/project by name.',
+      parameters: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'A short workspace name, e.g. "invoice-project".' } },
+        required: ['name'],
+      },
+    },
+  };
+
+  // Which tools are actually offered to the model on a given request is the
+  // intersection of two independent gates: the user's own Permissions
+  // toggle (client-side, this browser only) AND, for run_python and the
+  // file tools, whether the server was even started with
+  // --enable-python-tool (see /props -> tools.run_python, read at boot by
+  // detectServerTools()) - advertising a tool the server will just 400 on
+  // would be worse than not offering it.
+  function activeTools() {
+    const tools = [];
+    if (perms.web) tools.push(WEATHER_TOOL, WEB_SEARCH_TOOL);
+    // run_python and the file tools all read/write inside a workspace
+    // folder - without one EXPLICITLY selected (the bar under the
+    // composer's browse modal, or the model calling set_workspace itself
+    // after the user asks for one by name) there is nowhere on disk for
+    // them to safely operate, so none of them are offered at all until a
+    // workspace is set. set_workspace itself is the one exception: it has
+    // to be offered with no workspace selected, since it's how one gets picked.
+    const hasWorkspace = !!(state.workspacePath || state.workspaceId);
+    if (perms.code && state.serverRunPythonEnabled && hasWorkspace) tools.push(RUN_PYTHON_TOOL);
+    if (perms.files && state.serverRunPythonEnabled && hasWorkspace) {
+      tools.push(LIST_FILES_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, SEARCH_FILES_TOOL);
+    }
+    if ((perms.code || perms.files) && state.serverRunPythonEnabled) tools.push(SET_WORKSPACE_TOOL);
+    return tools;
+  }
 
   const WEATHER_CODES = {
     0: 'clear sky', 1: 'mainly clear', 2: 'partly cloudy', 3: 'overcast',
@@ -963,6 +1631,7 @@ server binary, not a product with its own release cycle.
   };
 
   async function toolGetWeather(args) {
+    if (!perms.web) throw new Error('internet access is disabled in Permissions');
     const location = (args && args.location || '').trim();
     if (!location) throw new Error('missing "location" argument');
     const geo = await fetchJSON('https://geocoding-api.open-meteo.com/v1/search?count=1&name=' + encodeURIComponent(location));
@@ -978,7 +1647,103 @@ server binary, not a product with its own release cycle.
     };
   }
 
-  const TOOL_IMPLS = { get_weather: toolGetWeather };
+  async function toolWebSearch(args) {
+    if (!perms.web) throw new Error('internet access is disabled in Permissions');
+    const query = (args && args.query || '').trim();
+    if (!query) throw new Error('missing "query" argument');
+    // Wikipedia's search API: no key, CORS-open (with origin=*, a documented
+    // MediaWiki convention), reliable for general-knowledge queries. Not a
+    // full web index - the tool description says so, so the model sets
+    // expectations correctly instead of implying full browsing.
+    const url = 'https://en.wikipedia.org/w/api.php?action=query&list=search&format=json&origin=*' +
+      '&srlimit=4&srsearch=' + encodeURIComponent(query);
+    const data = await fetchJSON(url);
+    const hits = (data.query && data.query.search) || [];
+    if (hits.length === 0) return { results: [], note: `no results for "${query}"` };
+    return {
+      results: hits.map((h) => ({
+        title: h.title,
+        summary: h.snippet.replace(/<[^>]+>/g, ''),
+        url: 'https://en.wikipedia.org/wiki/' + encodeURIComponent(h.title.replace(/ /g, '_')),
+      })),
+    };
+  }
+
+  function requireWorkspace() {
+    // Defense in depth to match activeTools() not offering these tools
+    // at all without a workspace: a model replaying stale conversation
+    // history could still attempt one of these calls even when it
+    // currently shouldn't be able to. A real picked folder (workspacePath)
+    // takes priority when both happen to be set.
+    if (state.workspacePath) return { workspace_path: state.workspacePath };
+    if (state.workspaceId) return { workspace_id: state.workspaceId };
+    throw new Error(
+      'No workspace is selected. Ask the user to pick one (or call set_workspace with a name) before using file or code tools.'
+    );
+  }
+
+  function postTool(path, body) {
+    return fetchJSON(path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  }
+
+  async function toolRunPython(args) {
+    if (!perms.code) throw new Error('code execution is disabled in Permissions');
+    const workspace = requireWorkspace();
+    const code = (args && args.code) || '';
+    if (!code.trim()) throw new Error('missing "code" argument');
+    return postTool('/tools/run_python', { code, ...workspace });
+  }
+
+  async function toolListFiles(args) {
+    if (!perms.files) throw new Error('file access is disabled in Permissions');
+    return postTool('/tools/list_files', { ...requireWorkspace(), path: (args && args.path) || '.' });
+  }
+
+  async function toolReadFile(args) {
+    if (!perms.files) throw new Error('file access is disabled in Permissions');
+    const path = (args && args.path || '').trim();
+    if (!path) throw new Error('missing "path" argument');
+    return postTool('/tools/read_file', { ...requireWorkspace(), path });
+  }
+
+  async function toolWriteFile(args) {
+    if (!perms.files) throw new Error('file access is disabled in Permissions');
+    const path = (args && args.path || '').trim();
+    if (!path) throw new Error('missing "path" argument');
+    const content = (args && args.content) || '';
+    return postTool('/tools/write_file', { ...requireWorkspace(), path, content });
+  }
+
+  async function toolSearchFiles(args) {
+    if (!perms.files) throw new Error('file access is disabled in Permissions');
+    const query = (args && args.query || '').trim();
+    if (!query) throw new Error('missing "query" argument');
+    return postTool('/tools/search_files', { ...requireWorkspace(), query });
+  }
+
+  async function toolSetWorkspace(args) {
+    const name = (args && args.name || '').trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '-').slice(0, 128);
+    if (!name) throw new Error('missing "name" argument');
+    state.workspaceId = name;
+    state.workspacePath = null; // an explicit set_workspace call should actually take effect
+    renderWorkspaceBar();
+    return { workspace: name };
+  }
+
+  const TOOL_IMPLS = {
+    get_weather: toolGetWeather,
+    web_search: toolWebSearch,
+    run_python: toolRunPython,
+    list_files: toolListFiles,
+    read_file: toolReadFile,
+    write_file: toolWriteFile,
+    search_files: toolSearchFiles,
+    set_workspace: toolSetWorkspace,
+  };
 
   // ---- settings panel --------------------------------------------------
   // /config's shape is {settings: {...}, path: "..."}; POST expects the same
@@ -994,6 +1759,17 @@ server binary, not a product with its own release cycle.
     el.numbers.top_k.value = s.top_k;
     el.numbers.repeat_penalty.value = s.repeat_penalty;
     el.numbers.n_predict.value = s.n_predict;
+    // The default system prompt is a real server-side setting (persisted
+    // to config.json, same as temperature/top_p) - it used to live only
+    // in this browser's localStorage, which meant it was never actually
+    // there again after restarting the server (a fresh process has no
+    // idea what any browser had typed). Only apply it here when the
+    // CURRENT session doesn't already have its own system message -
+    // otherwise this would stomp on an existing conversation's prompt
+    // every time /config is polled.
+    if (typeof s.system_prompt === 'string' && !currentSessionHasOwnSystemPrompt()) {
+      el.systemPrompt.value = s.system_prompt;
+    }
   }
 
   async function loadSettings() {
@@ -1014,6 +1790,7 @@ server binary, not a product with its own release cycle.
       top_k: parseInt(el.numbers.top_k.value, 10),
       repeat_penalty: Number(el.numbers.repeat_penalty.value),
       n_predict: parseInt(el.numbers.n_predict.value, 10),
+      system_prompt: el.systemPrompt.value,
     };
     el.settingsStatus.className = '';
     el.settingsStatus.textContent = 'saving…';
@@ -1183,19 +1960,153 @@ server binary, not a product with its own release cycle.
     return { row, bubble };
   }
 
+  // ---- sessions -----------------------------------------------------------
+  // Multiple independent conversations, each with its own message history
+  // and system prompt, switchable from the sidebar. Persisted to
+  // localStorage only (no server-side storage) - this is per-browser
+  // convenience state, not something other clients or Claude ever need to
+  // read, and it survives a reload of this same browser without needing a
+  // new backend surface.
+  const SESSIONS_KEY = 'desireeia_sessions_v1';
+
+  function loadSessionsFromStorage() {
+    try {
+      const raw = localStorage.getItem(SESSIONS_KEY);
+      const parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) { return []; }
+  }
+
+  function saveSessionsToStorage() {
+    try {
+      // Drop a still-empty trailing assistant placeholder before writing:
+      // if the page is reloaded/closed mid-stream, that placeholder is
+      // exactly what addMessage('assistant', '') put there before any
+      // content or tool_calls arrived, and reloading it back verbatim
+      // would show a dead empty bubble in the restored session forever.
+      // The in-memory arrays themselves are untouched, so an ACTUALLY
+      // in-flight stream's rendering is unaffected.
+      const serializable = state.sessions.map((s) => ({
+        ...s,
+        messages: s.messages.filter((m) => !(m.role === 'assistant' && !m.content && !m.tool_calls)),
+      }));
+      localStorage.setItem(SESSIONS_KEY, JSON.stringify(serializable));
+    } catch (e) { /* storage full/unavailable - sessions just won't survive a reload */ }
+  }
+
+  function sessionTitle(messages) {
+    const firstUser = messages.find(m => m.role === 'user' && m.content);
+    if (!firstUser) return 'New chat';
+    const text = firstUser.content.trim().replace(/\s+/g, ' ');
+    return text.length > 40 ? text.slice(0, 40) + '…' : (text || 'New chat');
+  }
+
+  function newSessionRecord() {
+    const id = 'sess_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    return { id, title: 'New chat', messages: [], createdAt: Date.now(), updatedAt: Date.now() };
+  }
+
+  function persistCurrentSession() {
+    if (!state.currentSessionId) return;
+    const session = state.sessions.find(s => s.id === state.currentSessionId);
+    if (!session) return;
+    session.messages = state.messages;
+    session.title = sessionTitle(state.messages);
+    session.updatedAt = Date.now();
+    saveSessionsToStorage();
+    renderSessions();
+  }
+
+  function renderSessions() {
+    if (state.sessions.length === 0) {
+      el.sessionsList.innerHTML = '<div class="sessions-empty">no sessions yet</div>';
+      return;
+    }
+    el.sessionsList.innerHTML = '';
+    const sorted = [...state.sessions].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+    for (const s of sorted) {
+      const row = document.createElement('div');
+      row.className = 'session-row' + (s.id === state.currentSessionId ? ' active' : '');
+      const title = document.createElement('span');
+      title.className = 'title';
+      title.textContent = s.title || 'New chat';
+      title.title = s.title || 'New chat';
+      const del = document.createElement('button');
+      del.className = 'del-btn';
+      del.type = 'button';
+      del.title = 'Delete session';
+      del.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">' +
+        '<path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg>';
+      del.addEventListener('click', (e) => { e.stopPropagation(); deleteSession(s.id); });
+      row.appendChild(title);
+      row.appendChild(del);
+      row.addEventListener('click', () => switchSession(s.id));
+      el.sessionsList.appendChild(row);
+    }
+  }
+
+  function applySessionToUI(session) {
+    state.currentSessionId = session.id;
+    state.messages = session.messages;
+    state.workspaceId = null;   // a manually-set_workspace override doesn't carry across sessions
+    state.workspacePath = null; // nor does a picked folder
+    renderWorkspaceBar();
+    state.attachment = null;
+    renderAttachmentChip();
+    // A session that already has its own system message (an earlier
+    // conversation's first turn) keeps showing that one; a brand-new,
+    // empty session shows the sticky default instead of going blank -
+    // without this, the field reset to "" on every "New chat" click and
+    // the user had to retype their system prompt every single time.
+    const sysMsg = session.messages.find(m => m.role === 'system');
+    el.systemPrompt.value = sysMsg ? sysMsg.content : loadDefaultSystemPrompt();
+    renderMessages();
+    renderSessions();
+  }
+
+  function newSession() {
+    if (state.controller) state.controller.abort();
+    const session = newSessionRecord();
+    state.sessions.push(session);
+    saveSessionsToStorage();
+    applySessionToUI(session);
+  }
+
+  function switchSession(id) {
+    if (id === state.currentSessionId) return;
+    const session = state.sessions.find(s => s.id === id);
+    if (!session) return;
+    if (state.controller) state.controller.abort();
+    applySessionToUI(session);
+  }
+
+  function deleteSession(id) {
+    const idx = state.sessions.findIndex(s => s.id === id);
+    if (idx === -1) return;
+    const wasCurrent = id === state.currentSessionId;
+    state.sessions.splice(idx, 1);
+    saveSessionsToStorage();
+    if (state.sessions.length === 0) { newSession(); return; }
+    if (wasCurrent) switchSession(state.sessions[0].id);
+    else renderSessions();
+  }
+
+  el.newSessionBtn.addEventListener('click', newSession);
+
   function renderMessages() {
     el.messages.innerHTML = '';
     if (state.messages.length === 0) {
       el.messages.appendChild(el.emptyState);
-      return;
+    } else {
+      for (let i = 0; i < state.messages.length; i++) {
+        const m = state.messages[i];
+        if (m.role === 'system') continue; // shown via the sidebar field, not as a bubble
+        const { row } = buildMessageRow(m, i);
+        el.messages.appendChild(row);
+      }
+      el.messages.scrollTop = el.messages.scrollHeight;
     }
-    for (let i = 0; i < state.messages.length; i++) {
-      const m = state.messages[i];
-      if (m.role === 'system') continue; // shown via the sidebar field, not as a bubble
-      const { row } = buildMessageRow(m, i);
-      el.messages.appendChild(row);
-    }
-    el.messages.scrollTop = el.messages.scrollHeight;
+    persistCurrentSession();
   }
 
   function addMessage(role, content) {
@@ -1273,7 +2184,7 @@ server binary, not a product with its own release cycle.
           model: el.modelSelect.value || undefined,
           messages: messagesForRequest(),
           stream: true,
-          tools: TOOLS,
+          tools: activeTools(),
           temperature: Number(el.sliders.temperature.value),
           top_p: Number(el.sliders.top_p.value),
           top_k: parseInt(el.numbers.top_k.value, 10),
@@ -1299,6 +2210,7 @@ server binary, not a product with its own release cycle.
     const decoder = new TextDecoder();
     let buf = '';
     let usage = null;
+    let timings = null;
     const toolCallsAcc = {};
 
     if (bubbleEl) bubbleEl.classList.add('streaming');
@@ -1340,6 +2252,7 @@ server binary, not a product with its own release cycle.
             }
           }
           if (evt.usage) usage = evt.usage;
+          if (evt.timings) timings = evt.timings;
         }
       }
     } catch (e) {
@@ -1379,14 +2292,31 @@ server binary, not a product with its own release cycle.
 
     if (bubbleEl) {
       bubbleEl.innerHTML = renderMarkdownLite(assistantMsg.content || '');
-      if (usage) {
+      const metaText = formatGenerationMeta(usage, timings);
+      if (metaText) {
         const meta = document.createElement('span');
         meta.className = 'meta';
-        meta.textContent = `${usage.completion_tokens ?? '?'} tokens`;
+        meta.textContent = metaText;
         bubbleEl.appendChild(meta);
       }
     }
     finishStreaming();
+  }
+
+  // Mirrors the CLI's "[N tokens | X.X tok/s | prefill Yms | Backend]"
+  // stats line (see cli/DesireeIA.Cli/Program.cs CmdChat) so both front
+  // ends give the same visibility into what a reply actually cost - the
+  // web UI showing nothing here made a normal prefill wait look like it
+  // was just hanging, next to the CLI printing the same wait as a number.
+  function formatGenerationMeta(usage, timings) {
+    if (!usage && !timings) return '';
+    const parts = [];
+    if (usage) parts.push(`${usage.completion_tokens ?? '?'} tokens`);
+    if (timings) {
+      if (timings.predicted_per_second) parts.push(`${timings.predicted_per_second.toFixed(1)} tok/s`);
+      if (timings.prompt_ms) parts.push(`prefill ${Math.round(timings.prompt_ms)}ms`);
+    }
+    return parts.join(' | ');
   }
 
   function finishStreaming() {
@@ -1433,9 +2363,23 @@ server binary, not a product with its own release cycle.
   });
 
   // ---- boot ---------------------------------------------------------
+  async function detectServerTools() {
+    try {
+      const props = await fetchJSON('/props');
+      state.serverRunPythonEnabled = !!(props.tools && props.tools.run_python);
+      state.serverWhisperEnabled = !!props.whisper;
+    } catch (e) { /* /props unreachable - just run without these tools */ }
+  }
+
   async function boot() {
-    await Promise.all([refreshHealth(), refreshModels(), refreshModelsFolder(), loadSettings()]);
-    renderMessages();
+    applyPermissionsToUI();
+
+    state.sessions = loadSessionsFromStorage();
+    if (state.sessions.length === 0) state.sessions.push(newSessionRecord());
+    applySessionToUI(state.sessions[0]);
+
+    await Promise.all([refreshHealth(), refreshModels(), refreshModelsFolder(), loadSettings(), detectServerTools()]);
+    applyPermissionsToUI(); // re-apply: detectServerTools() just learned whether whisper/run_python are on
     // Health and the model list can change from another client (a model
     // finishing loading, /config being edited elsewhere), so both are
     // polled rather than fetched once at load. The models FOLDER also

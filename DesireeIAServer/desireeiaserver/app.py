@@ -12,12 +12,16 @@ import anyio
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.cors import CORSMiddleware
 
 from . import __version__
-from .api import chat, embeddings, errors as api_errors, health, models_files, props, settings_api, tokenize
+from .api import (chat, embeddings, errors as api_errors, health, metrics_api,
+                   models_files, props, settings_api, tokenize, tools_api, transcribe_api)
 from .api.v1 import build_router as build_v1_router
 from .config import Settings
 from .logging_setup import get_logger
+from .middleware import (ApiKeyMiddleware, MaxBodySizeMiddleware,
+                          MetricsMiddleware, SecurityHeadersMiddleware)
 from .models_events import ModelsEventBus
 from .slots import SlotManager
 
@@ -101,7 +105,24 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(chat.router)
     app.include_router(embeddings.router)
     app.include_router(models_files.router)
+    app.include_router(tools_api.router)
+    app.include_router(transcribe_api.router)
+    app.include_router(metrics_api.router)
     app.include_router(build_v1_router())
+
+    # Order matters: the FIRST middleware added ends up OUTERMOST (runs
+    # first on the way in, last on the way out), so SecurityHeaders wraps
+    # everything (headers land even on a 401/413 short-circuit) down to
+    # ApiKey/MaxBodySize rejecting a request before it reaches routing.
+    app.add_middleware(SecurityHeadersMiddleware)
+    app.add_middleware(MetricsMiddleware)
+    app.add_middleware(ApiKeyMiddleware, api_keys=settings.api_keys)
+    app.add_middleware(MaxBodySizeMiddleware, max_bytes=settings.max_request_mb * 1024 * 1024)
+    if settings.cors_origins:
+        app.add_middleware(
+            CORSMiddleware, allow_origins=list(settings.cors_origins),
+            allow_methods=["*"], allow_headers=["*"],
+        )
 
     static_dir = _static_directory(settings)
     if static_dir is not None:

@@ -138,6 +138,18 @@ class LocalModel:
         self._check()
         return _nat.get_lib().desireeia_context_size(self._ctx)
 
+    def trained_context_length(self) -> int:
+        """The model's own trained/declared max context length (GGUF
+        metadata key "<arch>.context_length"), or 0 if unknown for this
+        model's architecture. Informational only: the engine's KV cache
+        grows dynamically as tokens are processed and is NOT capped by this
+        value - callers that want a fixed context window (e.g. to mirror
+        another engine's behavior, or to budget a UI around it) should read
+        this once after loading and enforce it themselves.
+        """
+        self._check()
+        return _nat.get_lib().desireeia_context_length_trained(self._ctx)
+
     # -- tokenizer -----------------------------------------------------------
 
     def tokenize(self, text: str, add_bos: bool = True) -> Optional[List[int]]:

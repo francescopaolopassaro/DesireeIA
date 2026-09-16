@@ -34,6 +34,13 @@ public:
     virtual uint64_t kv_bytes() const = 0;
     virtual bool weight_cache_enabled() const = 0;
 
+    // The model's own trained/declared max context length, read from GGUF
+    // metadata ("<arch>.context_length") at load time. 0 = unknown (the
+    // engine itself has no fixed context cap - the KV cache grows
+    // dynamically - this is purely informational, for callers that want to
+    // show or budget around the model's intended context window).
+    virtual uint32_t trained_context_length() const { return 0; }
+
     // Diagnostic only: which tensor/check made the last step() call fail, if
     // it did. The ABI reports a bare error code with no detail, and this is
     // the cheapest way to get one without plumbing a full logger through

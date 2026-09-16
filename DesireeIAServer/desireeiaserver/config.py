@@ -26,7 +26,8 @@ SERIALIZED_KEYS = (
     "models_autoload", "sleep_idle_seconds", "parallel", "threads",
     "n_gpu_layers", "backend", "ram_budget_mb", "temperature", "top_k",
     "top_p", "repeat_penalty", "repeat_last_n", "frequency_penalty",
-    "presence_penalty", "seed", "n_predict", "log_level", "max_upload_mb",
+    "presence_penalty", "seed", "n_predict", "system_prompt", "log_level",
+    "max_upload_mb", "max_request_mb", "whisper_model",
 )
 
 
@@ -66,11 +67,17 @@ class Settings:
     presence_penalty: float = 0.0
     seed: int = -1
     n_predict: int = 512
+    system_prompt: str = ""
     api_keys: tuple = ()
+    cors_origins: tuple = ()
     log_level: str = "info"
     log_file: Optional[Path] = None
     ui_dir: Optional[Path] = None
     max_upload_mb: int = 100 * 1024
+    max_request_mb: int = 8
+    enable_python_tool: bool = False
+    enable_whisper: bool = False
+    whisper_model: str = "base"
     config_path: Optional[Path] = None
 
     @property
@@ -185,6 +192,8 @@ def parse_args(argv: Optional[List[str]] = None) -> Settings:
     serving.add_argument("--port", type=int, action=_EnvDefault, env="DESIREEIA_PORT", default=None)
     serving.add_argument("--api-key", action="append", dest="api_keys", default=[],
                          help="static API key (repeatable); env DESIREEIA_API_KEY")
+    serving.add_argument("--cors-origin", action="append", dest="cors_origins", default=[],
+                         help="allowed cross-origin caller (repeatable); none = no CORS headers added")
 
     model = parser.add_argument_group("model")
     model.add_argument("--model", action=_EnvDefault, env="DESIREEIA_MODEL", default=None)
@@ -216,6 +225,8 @@ def parse_args(argv: Optional[List[str]] = None) -> Settings:
     sampling.add_argument("--presence-penalty", type=float, default=None)
     sampling.add_argument("--seed", type=int, default=None, help="-1 = random")
     sampling.add_argument("--n-predict", type=int, default=None, help="default max tokens")
+    sampling.add_argument("--system-prompt", default=None,
+                          help="default system prompt for a new conversation")
 
     storage = parser.add_argument_group("storage and logging")
     storage.add_argument("--data-dir", type=Path, action=_EnvDefault,
@@ -226,6 +237,18 @@ def parse_args(argv: Optional[List[str]] = None) -> Settings:
     storage.add_argument("--log-level", choices=("debug", "info", "warning", "error"), default=None)
     storage.add_argument("--log-file", type=Path, default=None)
     storage.add_argument("--max-upload-mb", type=int, default=None)
+    storage.add_argument("--max-request-mb", type=int, default=None,
+                         help="cap on a regular (non-checkpoint-upload) request body")
+
+    tools = parser.add_argument_group("tools")
+    tools.add_argument("--enable-python-tool", "--no-enable-python-tool",
+                       action=argparse.BooleanOptionalAction, default=None,
+                       help="expose POST /tools/run_python (sandboxed code execution for the run_python tool)")
+    tools.add_argument("--enable-whisper", "--no-enable-whisper",
+                       action=argparse.BooleanOptionalAction, default=None,
+                       help="expose POST /transcribe (voice input) - requires the [audio] extra installed")
+    tools.add_argument("--whisper-model", default=None,
+                       help="faster-whisper model size/name (tiny, base, small, medium, large-v3, ...)")
 
     ns = parser.parse_args(argv)
 
@@ -245,5 +268,8 @@ def parse_args(argv: Optional[List[str]] = None) -> Settings:
 
     return _apply_overrides(settings, {
         "api_keys": tuple(ns.api_keys) + tuple(_env_api_keys()),
+        "cors_origins": tuple(ns.cors_origins),
+        "enable_python_tool": ns.enable_python_tool,
+        "enable_whisper": ns.enable_whisper,
         "config_path": ns.config_path,
     })
