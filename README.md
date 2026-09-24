@@ -1,5 +1,5 @@
 # DesireeIA
-[![Version](https://img.shields.io/badge/version-0.2--blue.svg)](#)
+![Version 0.2](https://img.shields.io/badge/version-v0.2-blue)
 [![Status](https://img.shields.io/badge/status-stabilizing-orange.svg)](#)
 
 We are currently in **Version 0.0.2**, actively building, testing, and stabilizing the platform.
