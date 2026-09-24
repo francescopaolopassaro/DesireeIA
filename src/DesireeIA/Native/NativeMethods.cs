@@ -143,6 +143,15 @@ internal static class NativeMethods
     internal static extern uint desireeia_context_length_trained(IntPtr ctx);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_session_reset(IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_session_reuse(IntPtr ctx, int mode);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nuint desireeia_last_reused_tokens(IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_tokenize(IntPtr ctx,
                                                  [MarshalAs(UnmanagedType.LPUTF8Str)] string text,
                                                  int addBos,

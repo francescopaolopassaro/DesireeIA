@@ -20,6 +20,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <algorithm>
 #include <deque>
 #include <filesystem>
 #include <mutex>
@@ -79,7 +80,53 @@ struct EngineContext {
     // (desireeia_next_token returns them one at a time).
     std::vector<int32_t> history;
     std::deque<int32_t> pending;
+
+    // Conversation session (KV prefix reuse). `kv_tokens` is EXACTLY the
+    // token sequence whose K/V are in the cache right now (prompt plus every
+    // generated token already fed back through step()); `kv_valid` says
+    // whether that correspondence still holds. At the next engine_predict
+    // the new prompt is compared with kv_tokens: the common prefix stays in
+    // the cache and only the new tail is prefilled. A chat that re-sends its
+    // whole history every turn (the normal chat-API pattern) then costs one
+    // prefill of the NEW messages instead of the whole conversation again.
+    // Invalidated by anything that makes the cached K/V no longer a function
+    // of the token ids alone: image embeddings, LoRA changes, a failed step.
+    std::vector<int32_t> kv_tokens;
+    bool kv_valid = false;
+    // How many leading kv_tokens got their K/V from a PREFILL (batched step).
+    // Tokens appended by decode steps are computed by the single-token path,
+    // whose floating-point results differ slightly from the batched one:
+    // reusing them is correct but not bit-identical to a full prefill (greedy
+    // can pick a different word at a near tie — measured on gemma3-4b). The
+    // default "exact" mode therefore reuses only prefilled positions: output
+    // identical to a full prefill, and in a chat that is still the whole
+    // history except the last answer (which the app re-tokenizes anyway).
+    size_t kv_prefilled = 0;
+    // 0 = off (always full prefill), 1 = exact (default), 2 = also reuse
+    // decoded tokens (faster, not bit-identical).
+    int session_mode = 1;
+    size_t last_reused = 0;
 };
+
+// Length of the prefix of `tokens` that can be kept from the cache. At least
+// one token is always left to prefill: the logits for the next token come
+// from the last processed position, and the cache does not keep them.
+static size_t reusable_prefix(const EngineContext* c, const int32_t* tokens, size_t n_tokens) {
+    if (c->session_mode == 0 || !c->kv_valid || n_tokens < 2) return 0;
+    const DenseForward* df = dynamic_cast<const DenseForward*>(c->gf);
+    if (!df) return 0;   // recurrent state (SSM) cannot be rewound to a position
+    size_t cached = c->session_mode == 2 ? c->kv_tokens.size() : c->kv_prefilled;
+    size_t limit = std::min({cached, c->kv_tokens.size(), n_tokens - 1, df->cache_len()});
+    size_t n = 0;
+    while (n < limit && c->kv_tokens[n] == tokens[n]) ++n;
+    return n;
+}
+
+static void invalidate_session(EngineContext* c) {
+    c->kv_tokens.clear();
+    c->kv_prefilled = 0;
+    c->kv_valid = false;
+}
 
 namespace {
 // Looks for the LATEST occurrence (most recent = most likely for repeated
@@ -610,14 +657,28 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
 
     c->st.tokens.assign(tokens, tokens + n_tokens);
 
-    c->gf->reset_cache();
+    // Session: keep the K/V of the prefix shared with the previous call and
+    // prefill only what is new; with no shared prefix this is the old full
+    // reset + prefill.
+    const size_t reuse = reusable_prefix(c, tokens, n_tokens);
+    if (reuse > 0) static_cast<DenseForward*>(c->gf)->truncate_cache(reuse);
+    else c->gf->reset_cache();
+    c->last_reused = reuse;
+
     std::vector<float> logits;
-    if (!c->gf->step(*c->st.reader, tokens, n_tokens, logits)) {
+    if (!c->gf->step(*c->st.reader, tokens + reuse, n_tokens - reuse, logits)) {
         c->st.last_error = "dense forward: prefill failed";
         if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
         if (c->st.log) c->st.log(3, c->st.last_error.c_str());
+        c->gf->reset_cache();
+        invalidate_session(c);
         return false;
     }
+    c->kv_tokens.assign(tokens, tokens + n_tokens);
+    // Positions [0, reuse) keep the provenance they had (in exact mode they
+    // were prefilled); [reuse, n_tokens) were just prefilled.
+    c->kv_prefilled = n_tokens;
+    c->kv_valid = true;
     // The history for the repetition penalties is the prompt itself: the
     // first generated token must not repeat what's already written.
     c->history.assign(tokens, tokens + n_tokens);
@@ -660,8 +721,11 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
         c->st.last_error = "dense forward: decode failed";
         if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
         if (c->st.log) c->st.log(3, c->st.last_error.c_str());
+        invalidate_session(c);
         return false;
     }
+    // The token just consumed is now in the cache too.
+    if (c->kv_valid) c->kv_tokens.push_back(tk);
     // `tk` (the token just consumed) enters the history BEFORE sampling:
     // it's exactly the immediate repetition that the penalties need to
     // be able to see.
@@ -712,6 +776,8 @@ bool engine_load_lora(desireeia_ctx* ctx, const char* lora_gguf_path, float scal
         err = "model has no generative forward engine (LoRA requires a dense/MLA model, not a BERT encoder)";
         return false;
     }
+    // Different weights = the cached K/V no longer match the tokens.
+    invalidate_session(c);
     if (!c->gf->load_lora(lora_gguf_path, scale, err)) {
         if (c->st.log) c->st.log(3, err.c_str());
         return false;
@@ -724,7 +790,34 @@ bool engine_clear_lora(desireeia_ctx* ctx) {
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
     if (c->gf) c->gf->clear_lora();
+    invalidate_session(c);
     return true;
+}
+
+bool engine_session_reset(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (c->gf) c->gf->reset_cache();
+    invalidate_session(c);
+    c->has_session = false;
+    c->pending.clear();
+    c->last_reused = 0;
+    return true;
+}
+
+bool engine_set_session_reuse(desireeia_ctx* ctx, int mode) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || mode < 0 || mode > 2) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    c->session_mode = mode;
+    if (mode == 0) invalidate_session(c);
+    return true;
+}
+
+size_t engine_last_reused_tokens(const desireeia_ctx* ctx) {
+    const EngineContext* c = reinterpret_cast<const EngineContext*>(ctx);
+    return c ? c->last_reused : 0;
 }
 
 bool engine_load_prerouter(desireeia_ctx* ctx, const char* path, std::string& err) {
@@ -943,6 +1036,10 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
 
     df->set_embedding_override(std::vector<float>(embd, embd + n_embd), image_token);
 
+    // Image embeddings are not a function of the token ids: the next text
+    // prompt must not reuse these K/V even if its token ids match.
+    invalidate_session(c);
+    c->last_reused = 0;
     c->st.tokens.assign(tokens, tokens + n_tokens);
     c->gf->reset_cache();
     std::vector<float> logits;

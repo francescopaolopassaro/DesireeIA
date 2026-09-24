@@ -338,6 +338,16 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
 void engine_destroy(desireeia_ctx* ctx);
 bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, int32_t& out_token);
 bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token);
+// Conversation session: engine_predict keeps the K/V of the prefix shared
+// with the previous call and prefills only the new tail (see EngineContext::
+// kv_tokens). reset drops the session; set_session_reuse: 0 = off (old
+// always-full-prefill behavior), 1 = exact (default: reuses only prefilled
+// positions, output identical to a full prefill), 2 = also decoded tokens;
+// last_reused_tokens reports how many prompt tokens the last engine_predict
+// took from the cache.
+bool engine_session_reset(desireeia_ctx* ctx);
+bool engine_set_session_reuse(desireeia_ctx* ctx, int mode);
+size_t engine_last_reused_tokens(const desireeia_ctx* ctx);
 size_t engine_context_size(const desireeia_ctx* ctx);
 // The model's own trained/declared max context length (GGUF
 // "<arch>.context_length"), 0 if unknown. Informational only - the engine's

@@ -1,5 +1,6 @@
 C:/Sorgenti/Personal/DesireeIA/native/out-cuda/CMakeFiles/DesireeIALocaleEngine.dir
 C:/Sorgenti/Personal/DesireeIA/native/out-cuda/CMakeFiles/desireeia_selftest.dir
+C:/Sorgenti/Personal/DesireeIA/native/out-cuda/CMakeFiles/desireeia_session_test.dir
 C:/Sorgenti/Personal/DesireeIA/native/out-cuda/CMakeFiles/desireeia_kernel_bench.dir
 C:/Sorgenti/Personal/DesireeIA/native/out-cuda/CMakeFiles/test.dir
 C:/Sorgenti/Personal/DesireeIA/native/out-cuda/CMakeFiles/edit_cache.dir

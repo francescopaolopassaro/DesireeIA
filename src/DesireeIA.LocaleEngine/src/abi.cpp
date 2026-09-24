@@ -32,7 +32,7 @@ namespace {
 #define DESIREEIA_EMIT(level, msg) emit_impl(__FILE__, __LINE__, __func__, (level), (msg))
 
 DESIREEIA_API const char* desireeia_version(void) {
-    return "0.1.0";
+    return "0.1.1";
 }
 
 DESIREEIA_API desireeia_error desireeia_set_logger(desireeia_log_cb cb, void* user) {
@@ -154,6 +154,27 @@ DESIREEIA_API uint32_t desireeia_context_length_trained(const desireeia_ctx* ctx
         return 0;
     }
     return desireeia::engine_context_length_trained(ctx);
+}
+
+DESIREEIA_API desireeia_error desireeia_session_reset(desireeia_ctx* ctx) {
+    if (!ctx) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+    return desireeia::engine_session_reset(ctx) ? DESIREEIA_OK : DESIREEIA_ERR_UNDEFINED;
+}
+
+DESIREEIA_API desireeia_error desireeia_set_session_reuse(desireeia_ctx* ctx, int32_t mode) {
+    if (!ctx || mode < 0 || mode > 2) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+    return desireeia::engine_set_session_reuse(ctx, (int) mode) ? DESIREEIA_OK : DESIREEIA_ERR_UNDEFINED;
+}
+
+DESIREEIA_API size_t desireeia_last_reused_tokens(const desireeia_ctx* ctx) {
+    if (!ctx) {
+        return 0;
+    }
+    return desireeia::engine_last_reused_tokens(ctx);
 }
 
 DESIREEIA_API desireeia_error desireeia_tokenize(desireeia_ctx* ctx,

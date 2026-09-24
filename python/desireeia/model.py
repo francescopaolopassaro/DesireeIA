@@ -150,6 +150,29 @@ class LocalModel:
         self._check()
         return _nat.get_lib().desireeia_context_length_trained(self._ctx)
 
+    # -- conversation session (KV prefix reuse) ------------------------------
+
+    def set_session_reuse(self, mode: int = 1) -> None:
+        """How predict() reuses the K/V cache of the previous call, so a chat
+        that re-sends its whole history pays only for the new messages.
+        1 = exact (default): output identical to a full prefill.
+        2 = also reuse generated tokens (faster, not bit-identical).
+        0 = always full prefill (behavior before 0.0.2)."""
+        self._check()
+        rc = _nat.get_lib().desireeia_set_session_reuse(self._ctx, int(mode))
+        if rc != 0:
+            raise ValueError(f"invalid session reuse mode {mode} (rc={rc})")
+
+    def reset_session(self) -> None:
+        """Drop the conversation session: the next prompt is prefilled in full."""
+        self._check()
+        _nat.get_lib().desireeia_session_reset(self._ctx)
+
+    def last_reused_tokens(self) -> int:
+        """Prompt tokens the last predict() took from the cache (0 = full prefill)."""
+        self._check()
+        return int(_nat.get_lib().desireeia_last_reused_tokens(self._ctx))
+
     # -- tokenizer -----------------------------------------------------------
 
     def tokenize(self, text: str, add_bos: bool = True) -> Optional[List[int]]:

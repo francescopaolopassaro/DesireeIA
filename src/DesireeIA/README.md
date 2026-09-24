@@ -29,6 +29,22 @@ await foreach (var piece in model.StreamAsync(model.Tokenize("Hello!")!, new Gen
 }
 ```
 
+## Conversation session
+
+A chat usually re-sends its whole history every turn. `LocalModel` keeps the
+KV cache between calls and prefills only the tokens that are new since the
+previous prompt, so each turn costs the new messages, not the whole
+conversation again. It's on by default and exact: the output is identical to
+a full prefill.
+
+```csharp
+model.SessionReuse = SessionReuseMode.Exact;        // default
+// SessionReuseMode.IncludeGenerated: also reuse generated tokens (faster, not bit-identical)
+// SessionReuseMode.Off: always prefill everything (behavior before 0.0.2)
+Console.WriteLine(model.LastReusedTokens);           // prompt tokens taken from the cache
+model.ResetSession();                                // start over
+```
+
 ## Bundled platforms
 
 Check the `runtimes/` folder inside the package for the exact platforms

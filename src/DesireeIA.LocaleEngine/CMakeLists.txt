@@ -117,6 +117,11 @@ if(DESIREEIA_BUILD_TESTS)
     endif()
     add_test(NAME desireeia_selftest COMMAND desireeia_selftest)
 
+    # Sessione di conversazione (riuso del prefisso della KV cache) su un modello reale:
+    #   desireeia_session_test <modello.gguf>   (senza argomento viene saltato).
+    add_executable(desireeia_session_test tests/session_test.cpp)
+    target_link_libraries(desireeia_session_test PRIVATE DesireeIALocaleEngine)
+
     # Microbenchmark dei soli kernel: serve a confrontare due varianti in
     # secondi invece che minuti, perche' le misure end-to-end su portatile
     # derivano del 30% per throttling termico (vedi bench/kernel_bench.cpp).

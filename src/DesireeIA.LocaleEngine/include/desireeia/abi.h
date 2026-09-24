@@ -158,6 +158,23 @@ DESIREEIA_API size_t desireeia_context_size(const desireeia_ctx* ctx);
  * after desireeia_create() and enforce it themselves. */
 DESIREEIA_API uint32_t desireeia_context_length_trained(const desireeia_ctx* ctx);
 
+/* Conversation session (KV prefix reuse). desireeia_predict keeps the K/V of
+ * the longest prefix shared with what is already in the cache and prefills
+ * only the new tail: a chat that re-sends its whole history each turn pays
+ * only for the new messages.
+ *   desireeia_session_reset       drops the session (next predict = full prefill)
+ *   desireeia_set_session_reuse   mode 1 (default) = exact: reuses only positions
+ *                                 computed by a previous prefill, output identical
+ *                                 to a full prefill; 2 = also the tokens generated
+ *                                 by decode (faster, not bit-identical: decode and
+ *                                 batched prefill round differently, greedy may pick
+ *                                 another word at a near tie); 0 = always full
+ *                                 prefill (the pre-0.0.2 behavior)
+ *   desireeia_last_reused_tokens  prompt tokens the last predict took from the cache */
+DESIREEIA_API desireeia_error desireeia_session_reset(desireeia_ctx* ctx);
+DESIREEIA_API desireeia_error desireeia_set_session_reuse(desireeia_ctx* ctx, int32_t mode);
+DESIREEIA_API size_t desireeia_last_reused_tokens(const desireeia_ctx* ctx);
+
 /* Tokenizer (SentencePiece Unigram or byte-level BPE, auto-detected from
  * the model's metadata). Query-size convention: call with out_ids=NULL
  * (or max_ids=0) to get the number of tokens needed in out_count,

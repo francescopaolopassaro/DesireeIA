@@ -42,3 +42,17 @@ public enum Quantization
     Q5K = 6,
     Q6K = 7
 }
+
+/// <summary>
+/// How <see cref="LocalModel.Predict"/> reuses the K/V cache of the previous call
+/// (see <see cref="LocalModel.SessionReuse"/>).
+/// </summary>
+public enum SessionReuseMode
+{
+    /// <summary>Always prefill the whole prompt (behavior before 0.0.2).</summary>
+    Off = 0,
+    /// <summary>Reuse only positions computed by a previous prefill: output identical to a full prefill.</summary>
+    Exact = 1,
+    /// <summary>Also reuse generated tokens: more reuse, not bit-identical (decode and prefill round differently).</summary>
+    IncludeGenerated = 2
+}

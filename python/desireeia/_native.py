@@ -263,6 +263,14 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.desireeia_context_length_trained.argtypes = [c_void_p]
     lib.desireeia_context_length_trained.restype = c_uint32
 
+    # conversation session (KV prefix reuse)
+    lib.desireeia_session_reset.argtypes = [c_void_p]
+    lib.desireeia_session_reset.restype = c_int32
+    lib.desireeia_set_session_reuse.argtypes = [c_void_p, c_int32]
+    lib.desireeia_set_session_reuse.restype = c_int32
+    lib.desireeia_last_reused_tokens.argtypes = [c_void_p]
+    lib.desireeia_last_reused_tokens.restype = c_uint64
+
     # tokenize
     lib.desireeia_tokenize.argtypes = [
         c_void_p, c_char_p, c_int32,

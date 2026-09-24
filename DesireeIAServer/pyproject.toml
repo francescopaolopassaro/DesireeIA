@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "desireeia-server"
-version = "0.0.3"
+version = "0.0.4"
 description = "OpenAI-compatible API server and web UI for the DesireeIA local LLM engine"
 readme = "README.md"
 license = {text = "Proprietary"}
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["llm", "inference", "local", "desireeia", "openai", "server"]
 dependencies = [
-    "desireeia>=0.0.1",
+    "desireeia>=0.0.4",
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "pydantic>=2.6",

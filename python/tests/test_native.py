@@ -68,3 +68,35 @@ def test_build_plan_honors_overrides():
 def test_error_codes_roundtrip():
     for code in (0, -1, -2, -3, -4, -5, -6):
         assert Error(code) is not None
+
+_MODEL = os.environ.get("DESIREEIA_TEST_MODEL_PATH")
+
+
+@pytest.mark.skipif(not _MODEL or not os.path.exists(_MODEL), reason="DESIREEIA_TEST_MODEL_PATH not set")
+def test_session_reuses_prefix_and_matches_full_prefill():
+    """Turn 2 = turn-1 prompt + more: exact mode reuses the turn-1 prompt from
+    the KV cache and must produce exactly what a full prefill produces."""
+    model = desireeia.LocalModel.load(_MODEL, desireeia.build_plan(_MODEL))
+    try:
+        turn1 = model.tokenize("Hello, my cat is called Luna.")
+        model.predict(turn1)
+        assert model.last_reused_tokens() == 0
+
+        turn2 = turn1 + model.tokenize(" What is my cat called?", add_bos=False)
+        first_session = model.predict(turn2)
+        rest_session = [model.next_token() for _ in range(8)]
+        assert model.last_reused_tokens() == len(turn1)
+
+        model.reset_session()
+        first_full = model.predict(turn2)
+        rest_full = [model.next_token() for _ in range(8)]
+        assert model.last_reused_tokens() == 0
+        assert [first_session] + rest_session == [first_full] + rest_full
+
+        model.set_session_reuse(0)
+        model.predict(turn2)
+        assert model.last_reused_tokens() == 0
+        with pytest.raises(ValueError):
+            model.set_session_reuse(3)
+    finally:
+        model.close()

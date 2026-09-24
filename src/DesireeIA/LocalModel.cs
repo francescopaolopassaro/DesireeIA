@@ -138,6 +138,47 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
+    /// Conversation session: how <see cref="Predict"/> (and so
+    /// <see cref="StreamAsync"/>/<see cref="ChatStreamAsync"/>) reuses the
+    /// K/V cache of the previous call. A chat that re-sends its whole
+    /// history every turn then prefills only the new messages instead of
+    /// the whole conversation. Default <see cref="SessionReuseMode.Exact"/>.
+    /// </summary>
+    public SessionReuseMode SessionReuse
+    {
+        get => _sessionReuse;
+        set
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var err = NativeMethods.desireeia_set_session_reuse(_context, (int)value);
+            if (err != NativeMethods.Error.Ok)
+                throw new InvalidOperationException($"Set session reuse failed: {err}");
+            _sessionReuse = value;
+        }
+    }
+    private SessionReuseMode _sessionReuse = SessionReuseMode.Exact;
+
+    /// <summary>Drops the conversation session: the next prompt is prefilled in full.</summary>
+    public void ResetSession()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var err = NativeMethods.desireeia_session_reset(_context);
+        if (err != NativeMethods.Error.Ok)
+            throw new InvalidOperationException($"Session reset failed: {err}");
+    }
+
+    /// <summary>How many prompt tokens the last <see cref="Predict"/> took from the cache
+    /// instead of prefilling them (0 = full prefill).</summary>
+    public int LastReusedTokens
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return (int)NativeMethods.desireeia_last_reused_tokens(_context);
+        }
+    }
+
+    /// <summary>
     /// Tokenizes the text with the model's tokenizer (SentencePiece or BPE,
     /// auto-detected). Returns null if the model does not have a recognized
     /// tokenizer (see <see cref="HasTokenizer"/>).

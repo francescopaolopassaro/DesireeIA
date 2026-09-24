@@ -9,12 +9,11 @@
     <AssemblyName>DesireeIA</AssemblyName>
   </PropertyGroup>
 
-  <!-- NuGet package metadata. Version 0.0.1: first public release, matching
-       the versioning already used for the desireeia/desireeia-server PyPI
-       packages. -->
+  <!-- NuGet package metadata. 0.0.1: first public release. 0.0.2: conversation
+       session (KV prefix reuse) - see CHANGELOG.md. -->
   <PropertyGroup>
     <PackageId>DesireeIA</PackageId>
-    <Version>0.0.1</Version>
+    <Version>0.0.2</Version>
     <Authors>Passaro Francesco Paolo</Authors>
     <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
     <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
@@ -23,6 +22,7 @@
     <PackageProjectUrl>https://github.com/francescopaolopassaro/DesireeIA</PackageProjectUrl>
     <RepositoryUrl>https://github.com/francescopaolopassaro/DesireeIA</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>0.0.2: conversation session - Predict reuses the KV cache of the prefix shared with the previous call and prefills only the new tokens (exact by default: output identical to a full prefill). New LocalModel.SessionReuse, ResetSession(), LastReusedTokens. Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>
