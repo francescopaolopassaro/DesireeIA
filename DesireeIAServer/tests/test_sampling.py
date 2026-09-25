@@ -68,7 +68,7 @@ def test_rejects_bad_types():
 def test_max_tokens_resolution():
     assert resolve({"max_tokens": 100}).generation_max_tokens(Settings()) == 100
     assert resolve({}).generation_max_tokens(Settings(n_predict=256)) == 256
-    assert resolve({"max_tokens": 0}).generation_max_tokens(Settings()) == 512
+    assert resolve({"max_tokens": 0}).generation_max_tokens(Settings()) == 2048
 
 
 def test_n_predict_allowed_in_native_mode():

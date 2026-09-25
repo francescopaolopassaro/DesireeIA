@@ -71,6 +71,7 @@ try
     return command switch
     {
         "info" => CmdInfo(rest),
+        "autoconfig" => CmdAutoConfig(rest),
         "tokenize" => CmdTokenize(rest),
         "embed" => CmdEmbed(rest),
         "generate" => await CmdGenerate(rest),
@@ -107,10 +108,11 @@ static void PrintUsage()
         Usage:
           desireeia-cli hw
           desireeia-cli info <model.gguf>
+          desireeia-cli autoconfig <model.gguf>  (parameters chosen for this machine and model)
           desireeia-cli tokenize <model.gguf> "<text>"
           desireeia-cli embed <model.gguf> "<text>"  (BERT encoder only)
           desireeia-cli generate <model.gguf> "<text>" [--max-tokens N] [--chat]
-                     [--temp T] [--top-k K] [--top-p P]
+                     [--temp T] [--top-k K] [--top-p P] [--greedy]
                      [--repeat-penalty R] [--repeat-last-n N] [--seed S]
                      [--stop "<s>"]...  (repeatable: stops generation at the first occurrence,
                                          excluded from the output - see GenerateOptions.StopSequences)
@@ -132,10 +134,11 @@ static void PrintUsage()
           /save <path>    save last assistant response to file
           /saveb64 <path> decode last base64 block and save as binary file
 
-        Sampling: without --temp, generation is greedy (deterministic).
-        --temp 0.8 --repeat-penalty 1.1 is a reasonable starting point;
-        the repeat penalty helps avoid the loops that greedy decoding
-        tends to fall into on long generations.
+        Sampling: without options the automatic defaults are used
+        (--temp 0.7 --top-k 40 --top-p 0.9, see `autoconfig`); --greedy
+        switches to deterministic argmax decoding, which tends to fall into
+        repetitive loops on long generations. The backend, threads and RAM
+        budget are always picked for this machine (--backend cpu|cuda forces one).
         """);
 }
 
@@ -210,6 +213,25 @@ static (LocalModel model, ExecutionPlan plan) Open(string modelPath, int? thread
     }
 
     return (model, plan);
+}
+
+static int CmdAutoConfig(string[] rest)
+{
+    if (rest.Length < 1)
+    {
+        Console.Error.WriteLine("usage: desireeia-cli autoconfig <model.gguf>");
+        return 1;
+    }
+    var c = AutoConfigurator.Configure(rest[0]);
+    var m = c.Model;
+    Console.WriteLine($"model       = {Path.GetFileName(rest[0])} ({m.Architecture}, {m.LayerCount} layers, " +
+                      $"trained context {m.TrainedContextLength}, {m.FileSizeBytes / (1024 * 1024)} MB)");
+    Console.WriteLine($"plan        = {c.Plan}");
+    Console.WriteLine($"sampling    = --temp {c.Sampling.Temperature} --top-k {c.Sampling.TopK} --top-p {c.Sampling.TopP}");
+    Console.WriteLine($"context     = {c.ContextSize}");
+    Console.WriteLine($"max-tokens  = {c.MaxTokens}");
+    foreach (var note in c.Notes) Console.WriteLine($"  - {note}");
+    return 0;
 }
 
 static int CmdInfo(string[] rest)
@@ -349,8 +371,8 @@ static async Task<int> CmdGenerate(string[] rest)
         Console.WriteLine(s.Temperature > 0
             ? $"[sampling: temp={s.Temperature} top-k={s.TopK} top-p={s.TopP} " +
               $"repeat-penalty={s.PenaltyRepeat} (last {s.PenaltyLastN})]"
-            : "[greedy (argmax): deterministic. On long generations it falls into " +
-              "repetitive loops: use --temp 0.8 --repeat-penalty 1.1]");
+            : "[greedy (argmax, --greedy): deterministic. On long generations it falls into " +
+              "repetitive loops: drop --greedy to use the automatic sampling]");
         Console.WriteLine("[NB: no logit-by-logit correctness validation against a " +
                            "reference - see docs/engine_gap_analysis.md]");
     }
@@ -417,7 +439,9 @@ static int CmdChat(string[] rest)
         return 1;
     }
 
-    var maxTokens = GetIntOption(rest, "--max-tokens", 512);
+    var maxTokens = GetIntOption(rest, "--max-tokens",
+        AutoConfigurator.Compute(DesireeIAEngine.DetectHardware(), DesireeIAEngine.BuildPlan(rest[0]),
+                                 ModelTraits.Read(rest[0])).MaxTokens);
     var (model, plan) = Open(rest[0], args: rest);
     using (model)
     {
@@ -725,12 +749,15 @@ static int CmdChat(string[] rest)
 
 static void ApplySamplingOptions(LocalModel model, string[] args)
 {
-    var temp = GetFloatOption(args, "--temp", 0.0f);
+    // Defaults = AutoConfigurator's (never greedy: greedy loops on long
+    // generations). --greedy restores the deterministic argmax decoding.
+    var temp = HasFlag(args, "--greedy") ? 0.0f
+        : GetFloatOption(args, "--temp", AutoConfigurator.DefaultTemperature);
     var options = new SamplingOptions
     {
         Temperature      = temp,
-        TopK             = GetIntOption(args, "--top-k", 40),
-        TopP             = GetFloatOption(args, "--top-p", 0.95f),
+        TopK             = GetIntOption(args, "--top-k", AutoConfigurator.DefaultTopK),
+        TopP             = GetFloatOption(args, "--top-p", AutoConfigurator.DefaultTopP),
         PenaltyRepeat    = GetFloatOption(args, "--repeat-penalty", 1.0f),
         PenaltyLastN     = GetIntOption(args, "--repeat-last-n", 64),
         Seed             = (uint) GetIntOption(args, "--seed", 0)

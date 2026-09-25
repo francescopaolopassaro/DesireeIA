@@ -145,7 +145,7 @@ def generate_options(
     desireeia = _require()
     resolved = max_tokens
     if resolved is None or resolved <= 0:
-        resolved = settings.n_predict if settings.n_predict > 0 else 512
+        resolved = settings.n_predict if settings.n_predict > 0 else 2048
     return desireeia.GenerateOptions(max_tokens=resolved, stop_sequences=stop_sequences)
 
 

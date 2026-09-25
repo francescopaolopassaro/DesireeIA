@@ -47,10 +47,13 @@ class CodegenParams:
             return self.max_tokens
         if self.n_predict:
             return self.n_predict if self.n_predict > 0 else _BIG_CAP
-        return settings.n_predict if settings.n_predict > 0 else 512
+        return settings.n_predict if settings.n_predict > 0 else 2048
 
     def sampling_tuple(self) -> Tuple[str, float, float]:
-        return (self.temperature or 0.0, self.top_k or 40, self.top_p or 0.95)
+        # `is None`, not `or`: an explicit temperature 0 (greedy) must survive.
+        return (0.7 if self.temperature is None else self.temperature,
+                40 if self.top_k is None else self.top_k,
+                0.9 if self.top_p is None else self.top_p)
 
 
 def _optional_float(body: dict, key: str, default: Optional[float]) -> Optional[float]:

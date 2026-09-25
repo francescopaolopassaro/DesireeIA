@@ -94,6 +94,21 @@ public sealed class LocalModel : IDisposable
         return new LocalModel(ctx, modelPath, plan, cb);
     }
 
+    /// <summary>
+    /// Loads the model with the configuration <see cref="AutoConfigurator"/>
+    /// picks for this machine (backend, threads, RAM, non-greedy sampling) and
+    /// applies its sampling. <paramref name="config"/> carries the context size
+    /// and reply length to use with it.
+    /// </summary>
+    public static LocalModel LoadAuto(string modelPath, out AutoConfiguration config,
+                                      ExecutionPlan? overrides = null, Action<string>? logger = null)
+    {
+        config = AutoConfigurator.Configure(modelPath, overrides);
+        var model = Load(modelPath, config.Plan, logger);
+        model.SetSampling(config.Sampling);
+        return model;
+    }
+
     public int Predict(int[] tokens)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

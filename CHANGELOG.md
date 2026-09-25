@@ -1,5 +1,58 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.0.3 · PyPI `desireeia` 0.0.5 · PyPI `desireeia-server` 0.0.5 · engine 0.1.1
+
+### Added — automatic configuration
+
+Loading a model used to need hand-tuning: the native planner already picked
+backend, threads and RAM budget, but sampling defaulted to greedy (argmax),
+which falls into repetitive loops on long generations, and context and reply
+length were left to the caller. The new auto-configuration picks everything
+for the model on the current machine:
+
+| | C# (NuGet) | Python (PyPI) |
+|---|---|---|
+| full configuration | `AutoConfigurator.Configure(path)` | `auto_configure(path)` |
+| pure decision (testable) | `AutoConfigurator.Compute(hw, plan, traits)` | `compute_configuration(hw, plan, traits)` |
+| model facts from the GGUF header | `ModelTraits.Read(path)` | `ModelTraits.read(path)` |
+| load + apply | `LocalModel.LoadAuto(path, out config)` | `LocalModel.load_auto(path)` → `(model, config)` |
+
+- **Hardware**: backend (CUDA / Intel / Metal / CPU), threads and RAM budget
+  from the native planner, as before.
+- **Sampling**: temperature 0.7, top-k 40, top-p 0.9 — never greedy. The
+  `general.sampling.*` values suggested by the GGUF file are reported in the
+  notes.
+- **Context**: target 16384 tokens, never beyond the trained length nor beyond
+  what the KV cache fits in memory (conservative upper-bound estimate: 16-bit
+  keys/values on every layer; weights counted against RAM because VRAM size
+  isn't probed).
+- **Reply length**: 2048 tokens, at most a quarter of the context.
+- `AutoConfiguration.Notes` explains every choice in plain words.
+
+No native change: the engine binaries are the same as 0.0.2 / 0.0.4.
+
+### Changed
+
+- CLI: without `--temp` generation uses the automatic sampling instead of
+  greedy; `--greedy` restores argmax decoding. New `autoconfig <model.gguf>`
+  command; `chat` defaults its reply length to the automatic one.
+- `desireeia-server`: defaults `temperature 0.7`, `top_p 0.9`,
+  `n_predict 2048` (were 0.0 / 0.95 / 512 — greedy by default).
+  `--temperature 0` still selects greedy. A `config.json` saved by an earlier
+  version keeps the values it stored.
+
+### Fixed
+
+- `desireeia-server`: `CodegenParams.sampling_tuple()` replaced an explicit
+  `temperature: 0` with the default (`x or default`); now only a missing value
+  is defaulted.
+
+### Tests
+
+- .NET `AutoConfigTests` (8), Python `test_autoconfig.py` (7): defaults, trained
+  and memory bounds, alignment, KV arithmetic, real GGUF header read.
+- .NET 32/32, Python 41/41, server tests all green.
+
 ## NuGet `DesireeIA` 0.0.2 · PyPI `desireeia` 0.0.4 · PyPI `desireeia-server` 0.0.4 · engine 0.1.1
 
 ### Added — conversation session (KV prefix reuse)

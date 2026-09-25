@@ -43,7 +43,8 @@ def test_version_endpoint(client):
 
 def test_props_expose_sampling_defaults(client, tmp_path):
     body = client.get("/props").json()
-    assert body["default_generation_settings"]["temperature"] == 0.0
+    # Non-greedy by default (same as desireeia.autoconfig).
+    assert body["default_generation_settings"]["temperature"] == 0.7
     assert body["models_dir"] == str(tmp_path / "models")
     assert "config_path" in body
 

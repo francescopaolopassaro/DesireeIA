@@ -13,7 +13,7 @@
        session (KV prefix reuse) - see CHANGELOG.md. -->
   <PropertyGroup>
     <PackageId>DesireeIA</PackageId>
-    <Version>0.0.2</Version>
+    <Version>0.0.3</Version>
     <Authors>Passaro Francesco Paolo</Authors>
     <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
     <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
@@ -22,7 +22,7 @@
     <PackageProjectUrl>https://github.com/francescopaolopassaro/DesireeIA</PackageProjectUrl>
     <RepositoryUrl>https://github.com/francescopaolopassaro/DesireeIA</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>0.0.2: conversation session - Predict reuses the KV cache of the prefix shared with the previous call and prefills only the new tokens (exact by default: output identical to a full prefill). New LocalModel.SessionReuse, ResetSession(), LastReusedTokens. Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
+    <PackageReleaseNotes>0.0.3: automatic configuration - AutoConfigurator picks backend, threads, RAM budget, non-greedy sampling (temp 0.7, top-k 40, top-p 0.9), context and reply length for the model on the current machine. New AutoConfigurator, AutoConfiguration, ModelTraits and LocalModel.LoadAuto. Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>

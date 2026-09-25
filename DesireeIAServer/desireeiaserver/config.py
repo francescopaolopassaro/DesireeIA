@@ -58,15 +58,18 @@ class Settings:
     n_gpu_layers: Optional[int] = None
     backend: Optional[str] = None
     ram_budget_mb: int = 0
-    temperature: float = 0.0
+    # Same defaults as desireeia.autoconfig (never greedy: greedy decoding
+    # falls into repetitive loops on long generations). --temperature 0
+    # still selects greedy explicitly.
+    temperature: float = 0.7
     top_k: int = 40
-    top_p: float = 0.95
+    top_p: float = 0.9
     repeat_penalty: float = 1.0
     repeat_last_n: int = 64
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     seed: int = -1
-    n_predict: int = 512
+    n_predict: int = 2048
     system_prompt: str = ""
     api_keys: tuple = ()
     cors_origins: tuple = ()
@@ -224,7 +227,7 @@ def parse_args(argv: Optional[List[str]] = None) -> Settings:
     sampling.add_argument("--frequency-penalty", type=float, default=None)
     sampling.add_argument("--presence-penalty", type=float, default=None)
     sampling.add_argument("--seed", type=int, default=None, help="-1 = random")
-    sampling.add_argument("--n-predict", type=int, default=None, help="default max tokens")
+    sampling.add_argument("--n-predict", type=int, default=None, help="default max tokens (2048)")
     sampling.add_argument("--system-prompt", default=None,
                           help="default system prompt for a new conversation")
 

@@ -102,6 +102,24 @@ class LocalModel:
 
         return LocalModel(ctx, model_path, plan, cb_ref)
 
+    @staticmethod
+    def load_auto(
+        model_path: str,
+        overrides: Optional[ExecutionPlan] = None,
+        logger: Optional[Callable[[str], None]] = None,
+    ):
+        """Load with the configuration ``auto_configure`` picks for this machine
+        (backend, threads, RAM, non-greedy sampling) and apply its sampling.
+
+        Returns ``(model, config)``: ``config.context_size`` and
+        ``config.max_tokens`` are the limits to use with it.
+        """
+        from .autoconfig import auto_configure
+        config = auto_configure(model_path, overrides)
+        model = LocalModel.load(model_path, config.plan, logger)
+        model.set_sampling(config.sampling)
+        return model, config
+
     # -- guard ---------------------------------------------------------------
 
     def _check(self) -> None:

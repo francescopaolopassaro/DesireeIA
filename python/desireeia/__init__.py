@@ -4,6 +4,11 @@ Usage::
 
     import desireeia
 
+    # Everything picked for this machine and model (backend, threads, RAM,
+    # sampling, context, reply length):
+    model, config = desireeia.LocalModel.load_auto("model.gguf")
+
+    # or by hand:
     plan = desireeia.build_plan("model.gguf")
     with desireeia.LocalModel.load("model.gguf", plan) as model:
         tokens = model.tokenize("Hello, how are you?")
@@ -38,6 +43,13 @@ from .engine import (
     version,
 )
 from .model import LocalModel
+from .autoconfig import (
+    AutoConfiguration,
+    ModelTraits,
+    auto_configure,
+    compute_configuration,
+    read_gguf_metadata,
+)
 from .vision import VisionImageWrapper
 from .generation import (
     StopSequenceScanner,
@@ -45,7 +57,7 @@ from .generation import (
     StructuredOutput,
 )
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 __all__ = [
     # enums
@@ -73,6 +85,12 @@ __all__ = [
     "version",
     # model
     "LocalModel",
+    # auto-configuration
+    "AutoConfiguration",
+    "ModelTraits",
+    "auto_configure",
+    "compute_configuration",
+    "read_gguf_metadata",
     # vision
     "VisionImageWrapper",
     # generation
