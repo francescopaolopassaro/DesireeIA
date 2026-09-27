@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased · NuGet `DesireeIA` 0.1.2 · PyPI `desireeia` 0.1.2 · engine 0.1.2
+## NuGet `DesireeIA` 0.1.3 · PyPI `desireeia` 0.1.3 · engine 0.1.3
+
+### Fixed — SentencePiece tokenization (Gemma and the other SentencePiece vocabularies)
+
+- Segmentation by pair merges, the way these vocabularies were trained:
+  adjacent symbols are merged, the pair whose merged piece scores highest
+  first. The engine picked the highest-scoring split of each word instead,
+  a different segmentation that shredded words into short pieces ("Hello
+  world" came out as "Hello", " w", "or", "ld"; "user" as "us", "er"). The
+  model read text in a form it was never trained on, and prompts took about
+  twice the tokens: the Kodinn agent system prompt is 7,647 tokens on
+  Gemma 3 4B instead of 14,516 - half the prefill time, twice the room in
+  the context. `DESIREEIA_SPM_VITERBI=1` restores the old segmentation.
+- Control and user-defined tokens (`<start_of_turn>`, `<image>`...) are
+  taken whole from the text before segmenting it.
+- `tokenizer.ggml.add_space_prefix` is honoured: Gemma declares false, and
+  every prompt began with a stray space token before `<start_of_turn>`.
+
+## NuGet `DesireeIA` 0.1.2 · PyPI `desireeia` 0.1.2 · engine 0.1.2
 
 ### Added — saved sessions (system prompt without prefill)
 

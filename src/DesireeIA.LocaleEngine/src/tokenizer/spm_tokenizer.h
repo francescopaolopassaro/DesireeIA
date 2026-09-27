@@ -37,11 +37,25 @@ public:
 private:
     struct Entry { int32_t id; float score; };
 
+    // Pair-merge segmentation (how these vocabularies were trained):
+    // adjacent symbols are merged, the pair whose merged piece scores
+    // highest first, until no merged piece exists in the vocabulary. The
+    // highest-scoring split of the whole word (Viterbi, encode_viterbi)
+    // is a different segmentation - "user" came out as "us" + "er".
+    void encode_merge(const std::string& norm, std::vector<int32_t>& out) const;
+    void encode_viterbi(const std::string& norm, std::vector<int32_t>& out) const;
+    void emit_piece(const std::string& piece, std::vector<int32_t>& out) const;
+    // Control and user-defined tokens (<start_of_turn>, <image>...): taken
+    // whole from the text before segmenting it, longest first, bucketed by
+    // their first byte (Gemma has thousands of them).
+    std::vector<std::pair<std::string, int32_t>> specials_[256];
+
     std::unordered_map<std::string, Entry> piece_to_id_;
     std::vector<std::string> id_to_piece_;
     std::unordered_map<int32_t, int32_t> byte_token_id_; // byte value (0-255) -> vocabulary id
     size_t max_piece_cp_ = 1;
     int32_t bos_id_ = -1;
+    bool add_space_prefix_ = true;
     int32_t eos_id_ = -1;
     int32_t unk_id_ = -1;
 };

@@ -95,6 +95,9 @@ struct VocabData {
     int32_t unk_id = -1;
     int32_t pad_id = -1;
     bool add_bos = true;
+    // SentencePiece: prepend the space marker to the text being encoded
+    // (tokenizer.ggml.add_space_prefix; Gemma declares false).
+    bool add_space_prefix = true;
 };
 
 // A MoE expert isn't a single blob but 3 distinct matrices (gate/up/down of

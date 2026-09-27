@@ -600,7 +600,7 @@ real agent system prompt (the one Kodinn sends: tools, rules, workspace).
 | Model | Weights | Prefill 512 | Prefill 2048 | Prefill 8192 | Generation | Agent system prompt, first run | Same, from a saved session |
 |---|---|---:|---:|---:|---:|---|---|
 | Spark-X2.5 4B | Q4_K_M | 1918 | 2073 | 1943 | 46.5 | 8,360 tok in **4.3 s** | **1.0 s** (load + first token) |
-| Gemma 3 4B | Q4_K_M | 2637 | 2624 | 2747 | 59.5 | 14,717 tok in **6.3 s** | **2.0 s** |
+| Gemma 3 4B | Q4_K_M | 2637 | 2624 | 2747 | 59.5 | 8,007 tok in **3.4 s** | **0.9 s** |
 | Qwen2.5-Coder 3B | Q8_0 | 3035 | 3133 | 3024 | 49.7 | 7,724 tok in **3.0 s** | **0.3 s** |
 | MiniCPM5 2B | Q8_0 | 4092 | 4007 | 3670 | 65.6 | 8,224 tok in **2.7 s** | **0.3 s** |
 

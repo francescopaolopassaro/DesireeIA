@@ -253,6 +253,7 @@ public:
         vocab_.unk_id = get_i32("tokenizer.ggml.unknown_token_id", -1);
         vocab_.pad_id = get_i32("tokenizer.ggml.padding_token_id", -1);
         vocab_.add_bos = get_i32("tokenizer.ggml.add_bos_token", 1) != 0;
+        vocab_.add_space_prefix = get_i32("tokenizer.ggml.add_space_prefix", 1) != 0;
 
         if (!arch.empty()) {
             auto it = kv_int_.find(arch + ".block_count");
