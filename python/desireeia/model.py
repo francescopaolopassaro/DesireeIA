@@ -6,6 +6,7 @@ Uses Python context manager protocol (with statement) instead of IDisposable.
 
 from __future__ import annotations
 
+import codecs
 import ctypes
 import os
 import threading
@@ -322,6 +323,15 @@ class LocalModel:
 
     def token_piece(self, token_id: int) -> Optional[str]:
         """Decode a single token id to text. Returns None on error."""
+        raw = self.token_bytes(token_id)
+        if raw is None:
+            return None
+        return raw.decode("utf-8", errors="replace") if raw else ""
+
+    def token_bytes(self, token_id: int) -> Optional[bytes]:
+        """The token's raw bytes, or None on error. A token may hold only part of a
+        UTF-8 character (byte-fallback tokens such as <0xF0>): streaming decodes these
+        through an incremental decoder, see ``stream``."""
         self._check()
         buf = (c_char * 256)()
         with self._lock:
@@ -330,8 +340,7 @@ class LocalModel:
             )
         if err != Error.OK:
             return None
-        raw = buf.value
-        return raw.decode("utf-8", errors="replace") if raw else ""
+        return bytes(buf.value)
 
     @property
     def has_tokenizer(self) -> bool:
@@ -532,21 +541,29 @@ class LocalModel:
         self._check()
         opts = options or GenerateOptions()
         scanner = StopSequenceScanner(opts.stop_sequences)
+        # Stateful: an emoji split over byte tokens came out as U+FFFD per piece.
+        utf8 = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
         token = self.predict(prompt_tokens)
         for _ in range(opts.max_tokens):
             if self.is_end_of_generation(token):
                 break
 
-            piece = self.token_piece(token) or ""
-            emit, stopped = scanner.feed(piece)
-            if emit:
-                yield emit
-            if stopped:
-                return
+            piece = utf8.decode(self.token_bytes(token) or b"")
+            if piece:
+                emit, stopped = scanner.feed(piece)
+                if emit:
+                    yield emit
+                if stopped:
+                    return
 
             token = self.next_token()
 
+        rest = utf8.decode(b"", final=True)
+        if rest:
+            emit, _ = scanner.feed(rest)
+            if emit:
+                yield emit
         tail = scanner.flush()
         if tail:
             yield tail

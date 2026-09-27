@@ -1,5 +1,21 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.1.4 · PyPI `desireeia` 0.1.4 · engine 0.1.3 (unchanged)
+
+### Fixed — emoji and accented characters broken in streamed output
+
+- Streaming decoded every token on its own. A token does not always hold a
+  whole character: byte-fallback tokens (`<0xF0>`, `<0x9F>`, ...) carry one
+  byte of a UTF-8 sequence, so an emoji spans up to four tokens and each
+  piece became U+FFFD ("Ciao! ���" instead of "Ciao! 😊"). `StreamAsync`
+  (C#) and `stream` (Python) now go through a stateful UTF-8 decoder that
+  holds incomplete bytes until the character is whole; a sequence cut off
+  by the end of generation becomes a single U+FFFD.
+- New: `LocalModel.TokenBytes(id)` (C#) and `Model.token_bytes(id)`
+  (Python) return a token's raw bytes; `TokenPiece` / `token_piece` are
+  unchanged for single-token use.
+- The native engine is unchanged: the 0.1.3 binaries ship as they are.
+
 ## NuGet `DesireeIA` 0.1.3 · PyPI `desireeia` 0.1.3 · engine 0.1.3
 
 ### Fixed — SentencePiece tokenization (Gemma and the other SentencePiece vocabularies)

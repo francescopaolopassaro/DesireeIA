@@ -337,12 +337,24 @@ public sealed class LocalModel : IDisposable
     /// </summary>
     public string? TokenPiece(int id)
     {
+        var bytes = TokenBytes(id);
+        return bytes == null ? null : System.Text.Encoding.UTF8.GetString(bytes);
+    }
+
+    /// <summary>
+    /// The token's raw bytes, or null if the id is not valid. A single token is not always a whole
+    /// character: byte-fallback tokens (&lt;0xF0&gt;, &lt;0x9F&gt;, …) carry one byte of a multi-byte UTF-8
+    /// sequence, so an emoji can span four tokens. Decoding each one on its own turns every piece into
+    /// U+FFFD — streaming must go through a stateful decoder (see <see cref="StreamAsync"/>).
+    /// </summary>
+    public byte[]? TokenBytes(int id)
+    {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var buf = new byte[256];
         var err = NativeMethods.desireeia_token_piece(_context, id, buf, (nuint) buf.Length);
         if (err != NativeMethods.Error.Ok) return null;
         var len = Array.IndexOf(buf, (byte) 0);
-        return System.Text.Encoding.UTF8.GetString(buf, 0, len < 0 ? buf.Length : len);
+        return buf.AsSpan(0, len < 0 ? buf.Length : len).ToArray();
     }
 
     public bool HasTokenizer => Tokenize(string.Empty, addBos: false) is not null;
@@ -626,6 +638,8 @@ public sealed class LocalModel : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         options ??= new GenerateOptions();
         var scanner = new StopSequenceScanner(options.StopSequences);
+        // Stateful: keeps the bytes of a character split across tokens until it is complete.
+        var utf8 = new Utf8Stream();
 
         int token;
         using (ct.Register(Cancel))              // Stop interrupts the prefill too
@@ -635,7 +649,8 @@ public sealed class LocalModel : IDisposable
             ct.ThrowIfCancellationRequested();
             if (IsEndOfGeneration(token)) break;
 
-            var piece = TokenPiece(token) ?? "";
+            var piece = utf8.Feed(TokenBytes(token));
+            if (piece.Length == 0) { await Task.Yield(); token = NextToken(); continue; }
             var (emit, stopped) = scanner.Feed(piece);
             if (emit.Length > 0) yield return emit;
             if (stopped) yield break;
@@ -644,6 +659,13 @@ public sealed class LocalModel : IDisposable
             token = NextToken();
         }
 
+        // A character left incomplete when generation stopped (max tokens, end of generation mid-sequence).
+        var rest = utf8.Flush();
+        if (rest.Length > 0)
+        {
+            var (emit, _) = scanner.Feed(rest);
+            if (emit.Length > 0) yield return emit;
+        }
         var tail = scanner.Flush();
         if (tail.Length > 0) yield return tail;
     }

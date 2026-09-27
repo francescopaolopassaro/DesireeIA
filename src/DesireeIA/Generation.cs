@@ -256,3 +256,38 @@ public static class StructuredOutput
         return null;
     }
 }
+
+/// <summary>
+/// Turns the bytes of successive tokens into text without breaking characters. A token may hold only part
+/// of a UTF-8 sequence (byte-fallback tokens such as &lt;0xF0&gt;): an emoji can span four tokens, and
+/// decoding each one alone produced "���" in the output. The decoder keeps the incomplete
+/// bytes and emits the character when its last byte arrives.
+/// </summary>
+public sealed class Utf8Stream
+{
+    private readonly Decoder _decoder = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false).GetDecoder();
+    private readonly char[] _chars = new char[1024];
+
+    /// <summary>Text completed by these bytes; "" while a character is still incomplete.</summary>
+    public string Feed(byte[]? bytes)
+    {
+        if (bytes == null || bytes.Length == 0) return "";
+        var sb = new StringBuilder();
+        int offset = 0;
+        while (offset < bytes.Length)
+        {
+            int take = Math.Min(bytes.Length - offset, 256);
+            int n = _decoder.GetChars(bytes, offset, take, _chars, 0, flush: false);
+            sb.Append(_chars, 0, n);
+            offset += take;
+        }
+        return sb.ToString();
+    }
+
+    /// <summary>End of stream: whatever is still pending (an incomplete sequence becomes U+FFFD, once).</summary>
+    public string Flush()
+    {
+        int n = _decoder.GetChars(Array.Empty<byte>(), 0, 0, _chars, 0, flush: true);
+        return new string(_chars, 0, n);
+    }
+}

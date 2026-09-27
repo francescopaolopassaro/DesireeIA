@@ -13,7 +13,7 @@
        session (KV prefix reuse) - see CHANGELOG.md. -->
   <PropertyGroup>
     <PackageId>DesireeIA</PackageId>
-    <Version>0.1.3</Version>
+    <Version>0.1.4</Version>
     <Authors>Passaro Francesco Paolo</Authors>
     <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
     <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
