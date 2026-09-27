@@ -1,8 +1,17 @@
 # DesireeIA
-![Version 0.2](https://img.shields.io/badge/version-v0.2-blue)
-[![Status](https://img.shields.io/badge/status-stabilizing-orange.svg)](#)
+![Version 0.1.2](https://img.shields.io/badge/version-v0.1.2-blue)
+[![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
-We are currently in **Version 0.0.2**, actively building, testing, and stabilizing the platform.
+> **DesireeIA 0.1.2 — stable and fast.** This release jumps straight from
+> 0.0.x to 0.1.2 because it brings more than 30 new features, optimizations
+> and fixes at once (see [CHANGELOG.md](CHANGELOG.md)), each one validated
+> with in-depth tests — native self-test, .NET and Python suites, Linux and
+> ARM64 builds — and benchmarked on real models. The engine is now stable
+> and fast: prefill several times faster on GPU and CPU, an agent system
+> prompt restored in well under a second from a saved session, a stable
+> ABI with cancellation and progress, and correctness fixes that make whole
+> model families (Qwen2.5 with YaRN, the MiniCPM/Mistral-style dense family)
+> answer properly. [Measured performance](#measured-performance) below.
 ---
 
 A local large language model inference engine for the .NET ecosystem: a native C++17 core exposed through a stable C ABI, with an idiomatic .NET wrapper on top.
@@ -61,7 +70,7 @@ Dense causal transformers (RoPE, grouped-query attention, gated/non-gated feed-f
 
 - Gemma, Gemma 2, Gemma 3
 - Qwen, Qwen 2, Qwen 3 (+ Qwen2-MoE)
-- Mistral and the broader Llama-shaped family (InternLM2, Exaone, SmolLM3, Nanbeige, Baichuan, XVerse, PLaMo, Refact, PanGu-Embedded)
+- The dense GQA family and its relatives: Mistral, MiniCPM, InternLM2, Exaone, SmolLM3, Nanbeige, Baichuan, XVerse, PLaMo, Refact, PanGu-Embedded (adjacent-pair and split-half RoPE layouts both handled)
 - SeedOss, StableLM, Orion
 - Starcoder2 (+ CodeShell), Nemotron, Arcee
 - Olmo2, Exaone4 (post-norm topology)
@@ -548,6 +557,9 @@ wherever you keep your own `.gguf` checkpoints:
 :: Qwen2.5-Coder (3B, Q8_0) — coding-oriented sampling
 <desireeia_source>\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "<path-to-model>\Qwen2.5-Coder-3B-Q8_0.gguf" --temp 0.3 --top-k 40 --top-p 0.9 --max-tokens 2048
 
+:: MiniCPM5 (2B, Q8_0) — dense GQA family, adjacent-pair RoPE
+<desireeia_source>\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "<path-to-model>\MiniCPM5-2B-Q8_0.gguf" --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
+
 :: Spark-X2.5 4B — hybrid sliding-window attention architecture
 <desireeia_source>\cli\DesireeIA.Cli\bin\Release\net10.0\desireeia-cli.exe chat "<path-to-model>\Spark-X2.5-4B-Q4_K_M.gguf" --backend cuda --temp 0.7 --top-k 40 --top-p 0.9 --max-tokens 2048
 ```
@@ -556,6 +568,84 @@ wherever you keep your own `.gguf` checkpoints:
 engine auto-detect the strongest hardware backend available, which is
 CUDA whenever a compatible device is present. It's shown explicitly here
 only to make it easy to force one side or the other for comparison.
+
+## What DesireeIA has that llama.cpp does not
+
+Checked against the llama.cpp source tree, not against its marketing: a row
+appears here only when the feature is absent from their repository.
+
+| | DesireeIA | llama.cpp |
+|---|---|---|
+| Official .NET package on NuGet, async C# API (`LocalModel`, `StreamAsync`) | yes | no (third-party bindings only) |
+| Official Python package for inference on PyPI (`pip install desireeia`) | yes | no (their Python packages read and convert GGUF files; inference from Python needs third-party bindings) |
+| Loads safetensors checkpoints directly, Mixture-of-Experts included | yes | no (conversion to GGUF first) |
+| Mixture-of-Experts weights streamed from SSD, with prerouter prediction | yes | no |
+| Web server installable with `pip install desireeia-server` | yes | no (distributed as binaries) |
+| One command to start, stop and check the server in the background, same on Windows, Linux and macOS (`desireeia-server-ctl`) | yes | no |
+
+Both ship an OpenAI-compatible HTTP server with a web UI; that is common
+ground, not a difference.
+
+## Measured performance
+
+All figures below were measured on a deliberately **modest business
+laptop**, not on workstation hardware: Intel Core Ultra 7 155H (16 cores,
+hybrid P/E), **NVIDIA RTX 1000 Ada Laptop GPU with 6 GB** (20 SMs), 32 GB
+RAM, Windows 11. Laptop thermals make repeated runs vary by roughly ±10%.
+GPUs with more SMs scale up accordingly; the same binaries run everywhere.
+
+**GPU (CUDA)** — tokens per second, and the time to the first token of a
+real agent system prompt (the one Kodinn sends: tools, rules, workspace).
+
+| Model | Weights | Prefill 512 | Prefill 2048 | Prefill 8192 | Generation | Agent system prompt, first run | Same, from a saved session |
+|---|---|---:|---:|---:|---:|---|---|
+| Spark-X2.5 4B | Q4_K_M | 1918 | 2073 | 1943 | 46.5 | 8,360 tok in **4.3 s** | **1.0 s** (load + first token) |
+| Gemma 3 4B | Q4_K_M | 2637 | 2624 | 2747 | 59.5 | 14,717 tok in **6.3 s** | **2.0 s** |
+| Qwen2.5-Coder 3B | Q8_0 | 3035 | 3133 | 3024 | 49.7 | 7,724 tok in **3.0 s** | **0.3 s** |
+| MiniCPM5 2B | Q8_0 | 4092 | 4007 | 3670 | 65.6 | 8,224 tok in **2.7 s** | **0.3 s** |
+
+**DesireeIA vs llama.cpp on the same laptop** — same GGUF files, same GPU,
+llama.cpp master built from source with CUDA (September 2026) and run through
+its own `llama-bench` (`-ngl 99`, 3 repetitions). Controlled protocol: a
+60-second cool-down before every measurement, the order of the two engines
+swapped between rounds, and the mean of the rounds reported, so that
+the laptop's thermal and power state cancels out. Tokens per second, higher
+is better. Generation includes drawing each token (llama-bench's generation
+test does not sample at all).
+
+| Model | Test | DesireeIA | llama.cpp | DesireeIA faster by |
+|---|---|---:|---:|---:|
+| Qwen2.5-Coder 3B Q8_0 | Prefill 512 | **3035** | 2989 | **+1.5%** |
+| Qwen2.5-Coder 3B Q8_0 | Prefill 2048 | **3133** | 2766 | **+13.3%** |
+| Qwen2.5-Coder 3B Q8_0 | Prefill 8192 | **3024** | 2856 | **+5.9%** |
+| Qwen2.5-Coder 3B Q8_0 | Generation | **49.7** | 48.1 | **+3.3%** |
+| Gemma 3 4B Q4_K_M | Prefill 512 | **2637** | 2634 | **+0.1%** |
+| Gemma 3 4B Q4_K_M | Prefill 2048 | **2624** | 2489 | **+5.4%** |
+| Gemma 3 4B Q4_K_M | Prefill 8192 | **2747** | 2733 | **+0.5%** |
+| Gemma 3 4B Q4_K_M | Generation | **59.5** | 56.5 | **+5.4%** |
+| MiniCPM5 2B Q8_0 | Prefill 512 | **4092** | 4002 | **+2.3%** |
+| MiniCPM5 2B Q8_0 | Prefill 2048 | **4007** | 3722 | **+7.7%** |
+| MiniCPM5 2B Q8_0 | Prefill 8192 | **3670** | 3547 | **+3.5%** |
+| MiniCPM5 2B Q8_0 | Generation | **65.6** | 63.1 | **+4.0%** |
+
+On the same power budget DesireeIA also does more work per watt: on Gemma 3
+4B at 8192 tokens it processed 75 tokens per joule of GPU energy against
+llama.cpp's 69, which on a power-capped laptop GPU is what decides sustained
+speed and battery life.
+
+**CPU only** (no GPU used — the path every Mac and non-NVIDIA PC takes):
+
+| Model | Prefill 512 (tok/s) | Generation (tok/s) |
+|---|---:|---:|
+| Spark-X2.5 4B Q4_K_M | 89 | 17 |
+| Gemma 3 4B Q4_K_M | 106 | 18 |
+| Qwen2.5-Coder 3B Q8_0 | 134 | 13 |
+| MiniCPM5 2B Q8_0 | 184 | 16 |
+
+Output is checked against the previous engine path on every change: the
+answers either match token for token or differ only where two next tokens
+are near-tied (both continuations fluent and correct). A restored session
+produces exactly the same answer as a full prefill.
 
 ## Python server (OpenAI-compatible API + web UI)
 

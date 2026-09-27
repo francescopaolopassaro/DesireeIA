@@ -151,7 +151,7 @@ struct DenseQuirks {
     // projection, with no ffn_gate (left unused). The families that need
     // this pass an explicit "no gate" flag in their own graph construction.
     // The `true` default preserves every already-supported architecture in
-    // the Llama/Gemma/Qwen-shaped family, which always had two separate
+    // the dense GQA/Gemma/Qwen family, which always had two separate
     // gate+up projections.
     bool ffn_gated = true;
     enum class PlainFfnAct { Gelu, ReluSqr };
@@ -237,6 +237,14 @@ struct DenseQuirks {
 };
 
 DESIREEIA_INTERNAL DenseQuirks quirks_for(ArchKind kind);
+
+// True for the architectures whose GGUF Q/K weights are laid out for RoPE on
+// ADJACENT pairs of dimensions (2j, 2j+1) - the dense family tagged with the
+// legacy name and its close relatives (internlm2, baichuan, mistral, ...).
+// Every other architecture here rotates split halves (j, j + n_rot/2). The
+// engine's kernels all rotate split halves; DenseForward reorders these
+// models' Q/K rows at load time so the two conventions coincide.
+DESIREEIA_INTERNAL bool arch_rope_adjacent_pairs(const std::string& tag);
 
 // Tokenizer algorithms recognized from the "tokenizer.ggml.model" tag (or
 // equivalent) declared in the format's metadata.

@@ -46,10 +46,10 @@ ChatTemplateKind detect_chat_template(const std::string& tmpl) {
         const bool support_system = contains(tmpl, "<<SYS>>");
         const bool bos_in_history = contains(tmpl, "bos_token + '[INST]");
         const bool strip_msg = contains(tmpl, "content.strip()");
-        if (strip_msg) return ChatTemplateKind::Llama2SysStrip;
-        if (bos_in_history) return ChatTemplateKind::Llama2SysBos;
-        if (support_system) return ChatTemplateKind::Llama2Sys;
-        return ChatTemplateKind::Llama2;
+        if (strip_msg) return ChatTemplateKind::InstSysStrip;
+        if (bos_in_history) return ChatTemplateKind::InstSysBos;
+        if (support_system) return ChatTemplateKind::InstSys;
+        return ChatTemplateKind::Inst;
     }
     if (contains(tmpl, "<|assistant|>") && contains(tmpl, "<|end|>")) return ChatTemplateKind::Phi3;
     if (contains(tmpl, "[gMASK]<sop>")) return ChatTemplateKind::ChatGlm4;
@@ -59,7 +59,7 @@ ChatTemplateKind detect_chat_template(const std::string& tmpl) {
     if (contains(tmpl, "<|user|>") && contains(tmpl, "<|endoftext|>")) return ChatTemplateKind::Zephyr;
     if (contains(tmpl, "<start_of_turn>")) return ChatTemplateKind::Gemma;
     if (contains(tmpl, "<|START_OF_TURN_TOKEN|>") && contains(tmpl, "<|USER_TOKEN|>")) return ChatTemplateKind::CommandR;
-    if (contains(tmpl, "<|start_header_id|>") && contains(tmpl, "<|end_header_id|>")) return ChatTemplateKind::Llama3;
+    if (contains(tmpl, "<|start_header_id|>") && contains(tmpl, "<|end_header_id|>")) return ChatTemplateKind::HeaderId;
     if (contains(tmpl, "[gMASK]sop")) return ChatTemplateKind::ChatGlm3;
     if (contains(tmpl, "<\xE7\x94\xA8\xE6\x88\xB7>")) return ChatTemplateKind::MiniCpm; // "<用户>"
     if (contains(tmpl, "'Assistant: ' + message['content'] + eos_token")) return ChatTemplateKind::DeepSeek2;
@@ -84,7 +84,7 @@ ChatTemplateKind detect_chat_template(const std::string& tmpl) {
     if (contains(tmpl, "[|system|]") && contains(tmpl, "[|assistant|]") && contains(tmpl, "[|endofturn|]")) {
         return ChatTemplateKind::Exaone3;
     }
-    if (contains(tmpl, "<|header_start|>") && contains(tmpl, "<|header_end|>")) return ChatTemplateKind::Llama4;
+    if (contains(tmpl, "<|header_start|>") && contains(tmpl, "<|header_end|>")) return ChatTemplateKind::HeaderIdV4;
     return ChatTemplateKind::Unknown;
 }
 
@@ -99,7 +99,7 @@ ChatTemplateKind chat_template_for_arch(ArchKind arch) {
         // in this shape. An older model without a chat_template in its
         // metadata would be formatted incorrectly by this fallback: known
         // gap, still preferable to sending a raw, unformatted prompt.
-        case ArchKind::DenseGqa: return ChatTemplateKind::Llama3;
+        case ArchKind::DenseGqa: return ChatTemplateKind::HeaderId;
         case ArchKind::Mistral: return ChatTemplateKind::MistralV3;
         case ArchKind::Spark25: return ChatTemplateKind::Spark25;
         default: return ChatTemplateKind::Unknown;
@@ -156,27 +156,27 @@ std::string apply_chat_template(ChatTemplateKind kind, const std::vector<ChatMes
         break;
     }
 
-    case ChatTemplateKind::Llama3:
+    case ChatTemplateKind::HeaderId:
         for (const auto& m : chat) {
             app("<|start_header_id|>" + m.role + "<|end_header_id|>\n\n" + trim(m.content) + "<|eot_id|>");
         }
         if (add_ass) app("<|start_header_id|>assistant<|end_header_id|>\n\n");
         break;
 
-    case ChatTemplateKind::Llama4:
+    case ChatTemplateKind::HeaderIdV4:
         for (const auto& m : chat) {
             app("<|header_start|>" + m.role + "<|header_end|>\n\n" + trim(m.content) + "<|eot|>");
         }
         if (add_ass) app("<|header_start|>assistant<|header_end|>\n\n");
         break;
 
-    case ChatTemplateKind::Llama2:
-    case ChatTemplateKind::Llama2Sys:
-    case ChatTemplateKind::Llama2SysBos:
-    case ChatTemplateKind::Llama2SysStrip: {
-        const bool support_system = kind != ChatTemplateKind::Llama2;
-        const bool bos_in_history = kind == ChatTemplateKind::Llama2SysBos;
-        const bool strip_msg = kind == ChatTemplateKind::Llama2SysStrip;
+    case ChatTemplateKind::Inst:
+    case ChatTemplateKind::InstSys:
+    case ChatTemplateKind::InstSysBos:
+    case ChatTemplateKind::InstSysStrip: {
+        const bool support_system = kind != ChatTemplateKind::Inst;
+        const bool bos_in_history = kind == ChatTemplateKind::InstSysBos;
+        const bool strip_msg = kind == ChatTemplateKind::InstSysStrip;
         bool is_inside_turn = true; // skips the initial BOS (added elsewhere by the tokenizer)
         app("[INST] ");
         for (const auto& m : chat) {

@@ -22,7 +22,7 @@ public sealed class GenerateOptions
     /// <summary>
     /// If any of these strings appears in the generated text, generation
     /// stops and the returned text does NOT include the stop string
-    /// (consistent with the "stop" convention of APIs like Ollama/OpenAI).
+    /// (consistent with the "stop" convention of OpenAI-style APIs).
     /// </summary>
     public IReadOnlyList<string>? StopSequences { get; init; }
 }

@@ -100,8 +100,14 @@ class ModelTraits:
 
     @property
     def kv_bytes_per_token(self) -> int:
-        """Upper-bound KV-cache bytes per context token (16-bit, all layers)."""
-        return 2 * self.layer_count * self.head_count_kv * (self.key_length + self.value_length)
+        """KV-cache bytes per context token with the float32 cache (all layers)."""
+        return self.kv_bytes_per_token_for(False)
+
+    def kv_bytes_per_token_for(self, quantized: bool) -> int:
+        """KV-cache bytes per token as the engine stores it: float32 (4 bytes
+        per value) or Q8_0 with KV compression on (34 bytes per 32 values)."""
+        values = self.layer_count * self.head_count_kv * (self.key_length + self.value_length)
+        return (values * 34 + 31) // 32 if quantized else values * 4
 
     @staticmethod
     def read(model_path: str) -> "ModelTraits":
@@ -171,13 +177,14 @@ def compute_configuration(hw: HardwareProfile, plan: ExecutionPlan, model: Model
 
     budget_mb = plan.ram_budget_mb if plan.ram_budget_mb > 0 else hw.ram_free_mb
     model_mb = max(0, model.file_size_bytes) // (1024 * 1024)
-    kv_per_token = model.kv_bytes_per_token
+    kv_per_token = model.kv_bytes_per_token_for(plan.kv_compression)
     if budget_mb > 0 and kv_per_token > 0:
         free_for_kv_mb = budget_mb - model_mb - SAFETY_MARGIN_MB if budget_mb > model_mb + SAFETY_MARGIN_MB else 0
         by_memory = free_for_kv_mb * 1024 * 1024 // 2 // kv_per_token
         if by_memory < context:
             context = max(MIN_CONTEXT_SIZE, by_memory)
-            notes.append(f"context limited by memory: ~{kv_per_token // 1024} KB of KV cache per token, "
+            notes.append(f"context limited by memory: ~{kv_per_token // 1024} KB of KV cache per token "
+                         f"({'Q8_0' if plan.kv_compression else 'float32'}), "
                          f"{free_for_kv_mb} MB available after the model")
     if context > MIN_CONTEXT_SIZE:
         context -= context % 1024

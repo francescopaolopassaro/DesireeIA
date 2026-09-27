@@ -36,7 +36,10 @@ from .types import (
     VisionConfig,
 )
 from .engine import (
+    abi_version,
     build_plan,
+    gpus,
+    last_error,
     detect_hardware,
     profile_dump,
     profile_reset,
@@ -57,7 +60,7 @@ from .generation import (
     StructuredOutput,
 )
 
-__version__ = "0.0.5"
+__version__ = "0.1.2"
 
 __all__ = [
     # enums
@@ -78,6 +81,9 @@ __all__ = [
     "ToolDefinition",
     "VisionConfig",
     # engine
+    "abi_version",
+    "gpus",
+    "last_error",
     "build_plan",
     "detect_hardware",
     "profile_dump",

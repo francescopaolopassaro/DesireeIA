@@ -101,6 +101,49 @@ public static class DesireeIAEngine
 
     public static void ProfileReset() => Native.NativeMethods.desireeia_profile_reset();
 
+    /// <summary>Interface version of the loaded native engine (0 when it predates the query).</summary>
+    public static int NativeAbiVersion
+    {
+        get
+        {
+            try { return Native.NativeMethods.desireeia_abi_version(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+    }
+
+    /// <summary>
+    /// Throws a clear error when the native engine is older than this wrapper, instead of a
+    /// missing-entry-point crash on the first new call.
+    /// </summary>
+    public static void EnsureAbi()
+    {
+        int v = NativeAbiVersion;
+        if (v < Native.NativeMethods.AbiVersion)
+            throw new InvalidOperationException(
+                $"DesireeIA native engine interface {v} is older than this wrapper ({Native.NativeMethods.AbiVersion}): " +
+                "update the native library that ships with the package.");
+    }
+
+    /// <summary>Text of the last native error raised on the calling thread.</summary>
+    public static string LastError() => Native.NativeMethods.LastError(IntPtr.Zero);
+
+    /// <summary>GPUs the engine can use (empty without CUDA).</summary>
+    public static IReadOnlyList<GpuInfo> Gpus()
+    {
+        var list = new List<GpuInfo>();
+        int n;
+        try { n = Native.NativeMethods.desireeia_gpu_count(); }
+        catch (EntryPointNotFoundException) { return list; }
+        for (int i = 0; i < n; i++)
+        {
+            if (Native.NativeMethods.desireeia_probe_gpu(i, out var g) != Native.NativeMethods.Error.Ok) continue;
+            int len = Array.IndexOf(g.Name, (byte)0);
+            string name = System.Text.Encoding.UTF8.GetString(g.Name, 0, len < 0 ? g.Name.Length : len);
+            list.Add(new GpuInfo(i, name, (long)g.TotalBytes, (long)g.FreeBytes, g.CcMajor, g.CcMinor, g.Multiprocessors));
+        }
+        return list;
+    }
+
     private static Native.NativeMethods.HwInfo NativeMethodsHw(HardwareProfile hw) => new()
     {
         CpuThreads = hw.CpuThreads,

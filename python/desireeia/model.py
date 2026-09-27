@@ -7,6 +7,7 @@ Uses Python context manager protocol (with statement) instead of IDisposable.
 from __future__ import annotations
 
 import ctypes
+import os
 import threading
 from ctypes import (
     c_char, c_char_p, c_float, c_int32, c_uint32, c_uint64, c_void_p,
@@ -27,6 +28,11 @@ from .types import (
 from .vision import VisionImageWrapper
 
 
+def _path_bytes(path) -> bytes:
+    """Paths cross the native ABI as UTF-8 (the engine widens them on Windows)."""
+    return os.fspath(path).encode("utf-8", "surrogateescape")
+
+
 class LocalModel:
     """Loaded model context. Implements context manager (close replaces Dispose).
 
@@ -38,7 +44,7 @@ class LocalModel:
             print(model.token_piece(token))
     """
 
-    __slots__ = ("_ctx", "_closed", "_model_path", "_plan", "_log_cb_ref", "_lock")
+    __slots__ = ("_ctx", "_closed", "_model_path", "_plan", "_log_cb_ref", "_lock", "_progress_ref")
 
     def __init__(
         self,
@@ -53,6 +59,7 @@ class LocalModel:
         self._log_cb_ref = log_cb_ref  # prevent GC of the callback
         self._closed = False
         self._lock = threading.Lock()  # native ctx is NOT thread-safe
+        self._progress_ref = None      # keeps the progress callback alive
 
     # -- properties ----------------------------------------------------------
 
@@ -73,6 +80,8 @@ class LocalModel:
         logger: Optional[Callable[[str], None]] = None,
     ) -> LocalModel:
         """Load a model from disk. Raises RuntimeError on failure."""
+        from .engine import ensure_abi, last_error
+        ensure_abi()
         lib = _nat.get_lib()
         # desireeia_create's argtypes declare this parameter as LOG_CB (a
         # CFUNCTYPE), not a plain c_void_p — ctypes only auto-converts None
@@ -98,7 +107,8 @@ class LocalModel:
             byref(ctx),
         )
         if err != Error.OK:
-            raise RuntimeError(f"Model load failed: {Error(err).name}")
+            detail = last_error()
+            raise RuntimeError(f"Model load failed: {Error(err).name}" + (f" - {detail}" if detail else ""))
 
         return LocalModel(ctx, model_path, plan, cb_ref)
 
@@ -137,9 +147,46 @@ class LocalModel:
             err = _nat.get_lib().desireeia_predict(
                 self._ctx, arr, len(tokens), byref(out)
             )
+        if err == Error.CANCELLED:
+            raise InterruptedError("Prefill cancelled")
         if err != Error.OK:
-            raise RuntimeError(f"Predict failed: {Error(err).name}")
+            from .engine import last_error
+            detail = last_error(self._ctx)
+            raise RuntimeError(f"Predict failed: {Error(err).name}" + (f" - {detail}" if detail else ""))
         return out.value
+
+    def cancel(self) -> None:
+        """Stop a predict() running on another thread at the next layer: that
+        call raises InterruptedError and the session is dropped. Does not take
+        the model lock (the running predict holds it)."""
+        if not self._closed and self._ctx:
+            _nat.get_lib().desireeia_cancel(self._ctx)
+
+    def set_prefill_progress(self, callback) -> None:
+        """callback(done_layers, total_layers) after each layer of a
+        multi-token prefill, on the predicting thread. None removes it."""
+        self._check()
+        if callback is None:
+            self._progress_ref = cast(None, _nat.PROGRESS_CB)
+        else:
+            def _cb(done, total, user):
+                callback(int(done), int(total))
+            self._progress_ref = _nat.PROGRESS_CB(_cb)
+        _nat.get_lib().desireeia_set_progress_callback(self._ctx, self._progress_ref, None)
+
+    def reserve_context(self, positions: int) -> bool:
+        """Allocate the KV cache for `positions` at once (no growth by doubling)."""
+        self._check()
+        if positions < 0:
+            raise ValueError("positions must be >= 0")
+        with self._lock:
+            return _nat.get_lib().desireeia_reserve_context(self._ctx, int(positions)) == 0
+
+    def trim_cache(self) -> None:
+        """Give back the whole KV cache (chat closed, app idle); drops the session."""
+        self._check()
+        with self._lock:
+            _nat.get_lib().desireeia_trim_cache(self._ctx)
 
     def next_token(self) -> int:
         """Get the next token autoregressively."""
@@ -185,6 +232,56 @@ class LocalModel:
         """Drop the conversation session: the next prompt is prefilled in full."""
         self._check()
         _nat.get_lib().desireeia_session_reset(self._ctx)
+
+    def save_session(self, path, prefix_tokens: int = 0) -> bool:
+        """Save the KV cache of the current session (the first prefix_tokens
+        prefilled positions, 0 = all) with its tokens. A later process that
+        calls load_session() and sends a prompt starting with the same tokens
+        (a fixed system prompt) skips their prefill. False when this model's
+        cache cannot be saved or nothing has been prefilled yet."""
+        self._check()
+        if prefix_tokens < 0:
+            raise ValueError("prefix_tokens must be >= 0")
+        rc = _nat.get_lib().desireeia_session_save(self._ctx, _path_bytes(path), int(prefix_tokens))
+        return rc == 0
+
+    def load_session(self, path) -> int:
+        """Restore a session saved with save_session(). Returns the positions
+        restored; 0 when the file is missing or belongs to another model or
+        cache layout (the next prompt is then prefilled in full)."""
+        self._check()
+        p = os.fspath(path)
+        if not os.path.isfile(p):
+            return 0
+        n = ctypes.c_uint64(0)
+        rc = _nat.get_lib().desireeia_session_load(self._ctx, _path_bytes(p), ctypes.byref(n))
+        return int(n.value) if rc == 0 else 0
+
+    def save_session_bytes(self, prefix_tokens: int = 0) -> Optional[bytes]:
+        """The save_session() image as bytes (e.g. to encrypt it before it
+        reaches the disk). None when there is nothing that can be saved."""
+        self._check()
+        if prefix_tokens < 0:
+            raise ValueError("prefix_tokens must be >= 0")
+        lib = _nat.get_lib()
+        size = ctypes.c_uint64(0)
+        if lib.desireeia_session_save_mem(self._ctx, int(prefix_tokens), None, 0, ctypes.byref(size)) != 0 or size.value == 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        written = ctypes.c_uint64(0)
+        if lib.desireeia_session_save_mem(self._ctx, int(prefix_tokens), buf, size.value,
+                                          ctypes.byref(written)) != 0:
+            return None
+        return buf.raw[: written.value]
+
+    def load_session_bytes(self, image: bytes) -> int:
+        """Restore an image from save_session_bytes(); positions restored, 0 when refused."""
+        self._check()
+        if not image:
+            return 0
+        n = ctypes.c_uint64(0)
+        rc = _nat.get_lib().desireeia_session_load_mem(self._ctx, bytes(image), len(image), ctypes.byref(n))
+        return int(n.value) if rc == 0 else 0
 
     def last_reused_tokens(self) -> int:
         """Prompt tokens the last predict() took from the cache (0 = full prefill)."""

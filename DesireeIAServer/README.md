@@ -7,8 +7,8 @@ OpenAI-compatible API server and self-hosted chat web UI for the
 
 The external project this surface mirrors (and generalizes past) is referred
 to here only as **desireeialmn**; no code or documentation text is copied from
-it. Convention of this repository: the words "llama" and "colibri" are not
-used anywhere in code, docs or identifiers.
+it. Convention of this repository: external projects are never named in code,
+docs or identifiers.
 
 ## Quick start
 

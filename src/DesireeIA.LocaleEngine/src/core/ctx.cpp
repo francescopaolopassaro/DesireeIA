@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <deque>
 #include <filesystem>
+#include <atomic>
 #include <mutex>
 #include <set>
 #include <system_error>
@@ -46,6 +47,10 @@ struct EngineContext {
     int32_t last_token = -1;
     bool has_session = false;
     std::mutex mtx;
+    // desireeia_cancel: set from any thread, read by the forward engine at
+    // layer boundaries; cleared when a predict starts. hooks points at it.
+    std::atomic<bool> cancel{false};
+    StepHooks hooks;
 
     // Phase 0 (real inference engine): special token ids read from the
     // model's vocabulary, persisted here (VocabData is local to
@@ -79,6 +84,9 @@ struct EngineContext {
     // already checked/accepted but not yet returned to the caller
     // (desireeia_next_token returns them one at a time).
     std::vector<int32_t> history;
+    std::vector<float> decode_logits;   // engine_next_token's logits, reused across tokens
+    std::vector<int32_t> cand_ids;      // ... or only its largest ones (step_candidates)
+    std::vector<float> cand_vals;
     std::deque<int32_t> pending;
 
     // Conversation session (KV prefix reuse). `kv_tokens` is EXACTLY the
@@ -106,7 +114,41 @@ struct EngineContext {
     // decoded tokens (faster, not bit-identical).
     int session_mode = 1;
     size_t last_reused = 0;
+
+    // Pipelined decode (CUDA): while the caller holds the token returned
+    // last, the step that consumes it is already running and has drawn the
+    // next token on the device. `pipe` says such a step is in flight;
+    // its input is last_token, its draw landed in readback slot pipe_slot,
+    // and pipe_rng is the generator before that draw. drain_pipeline()
+    // undoes it (cache position, generator) before anything else runs.
+    bool pipe = false;
+    uint32_t pipe_slot = 0;
+    std::mt19937 pipe_rng;
 };
+
+#ifdef DESIREEIA_CUDA_ENABLED
+// Contexts alive in the process: the device state of the pipelined decode
+// (token, history, readback slots) is shared, so it is used only while a
+// single context exists.
+static std::atomic<int> g_live_contexts{0};
+#endif
+
+// Stops a pipelined decode: waits for the step in flight and rewinds what
+// it consumed (the cache position of last_token, the generator draw), so
+// the context is exactly where a non-pipelined decode would have left it.
+static void drain_pipeline(EngineContext* c) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (!c || !c->pipe) return;
+    int32_t discarded = -1;
+    cuda_sample_wait(c->pipe_slot, discarded);
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    if (df && df->cache_len() > 0) df->truncate_cache(df->cache_len() - 1);
+    c->sampler.set_rng_state(c->pipe_rng);
+    c->pipe = false;
+#else
+    (void) c;
+#endif
+}
 
 // Length of the prefix of `tokens` that can be kept from the cache. At least
 // one token is always left to prefill: the logits for the next token come
@@ -281,9 +323,13 @@ TierBudget plan_tier_budget(const desireeia_plan& plan, const ModelMeta& meta,
     uint32_t n_ctx = meta.n_ctx > 0 ? meta.n_ctx : 4096;
     if (n_ctx > 8192) n_ctx = 8192;
 
-    // K and V, one entry per layer per position, float32.
-    const uint64_t kv_bytes = 2ull * layers * n_ctx *
-                              static_cast<uint64_t>(n_head_kv) * head_dim * sizeof(float);
+    // K and V, one entry per layer per position: Q8_0 (34 bytes per 32
+    // values) when the plan compresses the cache - the default - float32
+    // otherwise. The float32 figure was used for both, reserving ~3.8x the
+    // real cache and pushing weights off RAM for memory never used.
+    const uint64_t kv_values = 2ull * layers * n_ctx * static_cast<uint64_t>(n_head_kv) * head_dim;
+    const uint64_t kv_bytes = plan.kv_compression_enabled ? (kv_values * 34 + 31) / 32
+                                                          : kv_values * sizeof(float);
 
     // Activations: a handful of live vectors of width n_embd, plus the logits
     // row over the vocabulary. Small next to the rest, but not nothing for a
@@ -578,6 +624,8 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         SsmForward* sf = new SsmForward;
         if (sf->open(*reader, meta, ctx->st.plan.ram_budget_mb)) {
             ctx->gf = sf;
+            ctx->hooks.cancel = &ctx->cancel;
+            ctx->gf->set_hooks(&ctx->hooks);
             if (log) {
                 log(5, sf->weight_cache_enabled()
                     ? "ssm forward ready (layer weight cache enabled)"
@@ -592,6 +640,8 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         if (df->open(*reader, meta, arch_kind, ctx->st.plan.ram_budget_mb, ctx->st.experts,
                      ctx->st.plan.kv_compression_enabled != 0, ctx->st.plan.backend)) {
             ctx->gf = df;
+            ctx->hooks.cancel = &ctx->cancel;
+            ctx->gf->set_hooks(&ctx->hooks);
             if (log) {
                 log(5, df->weight_cache_enabled()
                     ? "dense float forward ready (layer weight cache enabled)"
@@ -620,12 +670,22 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         }
     }
 
+#ifdef DESIREEIA_CUDA_ENABLED
+    g_live_contexts.fetch_add(1);
+#endif
     return reinterpret_cast<desireeia_ctx*>(ctx);
 }
 
 void engine_destroy(desireeia_ctx* ctx) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return;
+    {
+        std::lock_guard<std::mutex> lk(c->mtx);
+        drain_pipeline(c);
+    }
+#ifdef DESIREEIA_CUDA_ENABLED
+    g_live_contexts.fetch_sub(1);
+#endif
     if (c->st.experts) c->st.experts->save_usage();
     if (c->st.hybrid) c->st.hybrid->save_usage();
     delete c->gf;
@@ -653,7 +713,9 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (!c->gf || !c->st.reader || n_tokens == 0) return false;
+    c->cancel.store(false, std::memory_order_relaxed);
 
     c->st.tokens.assign(tokens, tokens + n_tokens);
 
@@ -667,8 +729,8 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
 
     std::vector<float> logits;
     if (!c->gf->step(*c->st.reader, tokens + reuse, n_tokens - reuse, logits)) {
-        c->st.last_error = "dense forward: prefill failed";
-        if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
+        c->st.last_error = c->gf->was_cancelled() ? "prefill cancelled" : "dense forward: prefill failed";
+        if (!c->gf->was_cancelled() && !c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
         if (c->st.log) c->st.log(3, c->st.last_error.c_str());
         c->gf->reset_cache();
         invalidate_session(c);
@@ -709,15 +771,123 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
 // The infrastructure below (step() with all_logits, DenseForward::
 // truncate_cache, find_ngram_continuation above) remains available and
 // tested regardless, for when the gate gets added.
+#ifdef DESIREEIA_CUDA_ENABLED
+// Pipelined decode: 1 token returned, 0 failure, -1 not applicable (nothing
+// done). Each call returns the token the step in flight drew, after
+// queueing the next step - which consumes that token straight from the
+// device and draws the one after - so the GPU never waits for the host.
+static int next_token_pipelined(EngineContext* c, int32_t& out_token) {
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    Sampler::DeviceParams dp{};
+    if (!c->pipe && (!df || g_live_contexts.load() != 1 || !df->pipeline_supported() ||
+                     !c->sampler.device_params(dp))) {
+        return -1;
+    }
+    if (c->pipe && !c->sampler.device_params(dp)) { drain_pipeline(c); return -1; }
+    auto args = [&](int append_input, uint32_t slot) {
+        CudaSampleArgs a{};
+        a.temperature = dp.temperature; a.top_k = dp.top_k; a.top_p = dp.top_p;
+        a.penalty_repeat = dp.penalty_repeat; a.penalty_freq = dp.penalty_freq;
+        a.penalty_present = dp.penalty_present; a.penalty_last_n = dp.penalty_last_n;
+        a.kk = dp.kk;
+        a.u = dp.temperature > 0.0f ? c->sampler.draw_uniform() : 0.0f;
+        a.append_input = append_input;
+        a.slot = slot;
+        return a;
+    };
+    auto fail = [&](const char* what) {
+        c->st.last_error = std::string("dense forward: ") + what;
+        if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
+        if (c->st.log) c->st.log(3, c->st.last_error.c_str());
+        c->pipe = false;
+        invalidate_session(c);
+        return 0;
+    };
+    uint32_t cur_slot;
+    const int32_t tk = c->last_token;
+    if (!c->pipe) {
+        // First pipelined token: the step consuming last_token (known on the
+        // host) draws on the device, then the pipeline starts.
+        c->history.push_back(tk);
+        if (cuda_sample_history(c->history.data(), c->history.size()) != DESIREEIA_OK) {
+            c->history.pop_back();
+            return -1;
+        }
+        const std::mt19937 before = c->sampler.rng_state();
+        const CudaSampleArgs a = args(0, 0);
+        const int r = df->decode_launch(*c->st.reader, tk, a, c->decode_logits);
+        if (r == 0) {                                // ran, but drew nothing: sample on the host
+            c->sampler.set_rng_state(before);
+            if (c->kv_valid) c->kv_tokens.push_back(tk);
+            out_token = c->sampler.sample(c->decode_logits, c->history);
+            c->last_token = out_token;
+            return 1;
+        }
+        if (r < 0) { c->history.pop_back(); return fail("decode failed"); }
+        if (c->kv_valid) c->kv_tokens.push_back(tk);
+        cur_slot = 0;
+    } else {
+        // The step in flight consumed last_token: it is part of the sequence now.
+        c->history.push_back(tk);
+        if (c->kv_valid) c->kv_tokens.push_back(tk);
+        cur_slot = c->pipe_slot;
+        c->pipe = false;
+    }
+    // Queue the next step: its input is the token being drawn in cur_slot.
+    const uint32_t next_slot = (cur_slot + 1) & 3;
+    const std::mt19937 before = c->sampler.rng_state();
+    const CudaSampleArgs a = args(1, next_slot);
+    std::vector<float> unused;
+    const int r = df->decode_launch(*c->st.reader, -1, a, unused);
+    if (r == 1) {
+        c->pipe = true;
+        c->pipe_slot = next_slot;
+        c->pipe_rng = before;
+    } else {
+        c->sampler.set_rng_state(before);            // no step in flight: the draw did not happen
+        if (r < 0) {
+            int32_t ignore = -1;
+            cuda_sample_wait(cur_slot, ignore);
+            return fail("decode failed");
+        }
+    }
+    int32_t tok = -1;
+    if (cuda_sample_wait(cur_slot, tok) != DESIREEIA_OK) return fail("reading the drawn token failed");
+    out_token = tok;
+    c->last_token = tok;
+    return 1;
+}
+#endif
+
 bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
     if (!c->gf || !c->st.reader || !c->has_session) return false;
 
+#ifdef DESIREEIA_CUDA_ENABLED
+    {
+        const int r = next_token_pipelined(c, out_token);
+        if (r >= 0) return r == 1;                  // -1: not applicable, the step-by-step path below
+    }
+#endif
     int32_t tk = c->last_token;
-    std::vector<float> logits;
-    if (!c->gf->step(*c->st.reader, &tk, 1, logits)) {
+    // Reused across tokens: a whole vocabulary (~1 MB) allocated and zeroed
+    // on every token was measurable next to the sampling itself.
+    std::vector<float>& logits = c->decode_logits;
+    // `tk` (the token just consumed) enters the history BEFORE sampling:
+    // it's exactly the immediate repetition that the penalties need to
+    // be able to see.
+    c->history.push_back(tk);
+    // When the sampler can work from the largest logits alone, the engine
+    // selects them on the device and only those come back (not the whole
+    // vocabulary); the token drawn is the same.
+    int got = 0;
+    const uint32_t kk = c->sampler.candidates_needed(c->history);
+    if (kk) got = c->gf->step_candidates(*c->st.reader, &tk, 1, kk, c->cand_ids, c->cand_vals, logits);
+    const bool ok = got == 0 ? c->gf->step(*c->st.reader, &tk, 1, logits) : got > 0;
+    if (!ok) {
+        c->history.pop_back();
         c->st.last_error = "dense forward: decode failed";
         if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
         if (c->st.log) c->st.log(3, c->st.last_error.c_str());
@@ -726,11 +896,8 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     }
     // The token just consumed is now in the cache too.
     if (c->kv_valid) c->kv_tokens.push_back(tk);
-    // `tk` (the token just consumed) enters the history BEFORE sampling:
-    // it's exactly the immediate repetition that the penalties need to
-    // be able to see.
-    c->history.push_back(tk);
-    out_token = c->sampler.sample(logits, c->history);
+    out_token = got == 1 ? c->sampler.sample_candidates(c->cand_ids, c->cand_vals, c->history)
+                         : c->sampler.sample(logits, c->history);
     c->last_token = out_token;
     return true;
 }
@@ -739,6 +906,7 @@ bool engine_set_sampling(desireeia_ctx* ctx, const desireeia_sampling& p) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     SamplerParams sp;
     sp.temperature     = p.temperature;
     sp.top_k           = p.top_k;
@@ -772,6 +940,7 @@ bool engine_load_lora(desireeia_ctx* ctx, const char* lora_gguf_path, float scal
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c || !lora_gguf_path) { err = "invalid argument"; return false; }
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (!c->gf) {
         err = "model has no generative forward engine (LoRA requires a dense/MLA model, not a BERT encoder)";
         return false;
@@ -789,6 +958,7 @@ bool engine_clear_lora(desireeia_ctx* ctx) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (c->gf) c->gf->clear_lora();
     invalidate_session(c);
     return true;
@@ -798,12 +968,226 @@ bool engine_session_reset(desireeia_ctx* ctx) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (c->gf) c->gf->reset_cache();
     invalidate_session(c);
     c->has_session = false;
     c->pending.clear();
     c->last_reused = 0;
     return true;
+}
+
+namespace {
+constexpr uint32_t kSessionMagic = 0x564B5344;   // "DSKV"
+constexpr uint32_t kSessionVersion = 1;
+
+// Paths cross the ABI as UTF-8; on Windows the narrow CRT functions read
+// them in the ANSI code page, so a user folder with an accent would fail.
+std::FILE* open_utf8(const std::string& path, const char* mode) {
+#ifdef _WIN32
+    wchar_t wmode[8] = {};
+    for (size_t i = 0; mode[i] && i < 7; ++i) wmode[i] = (wchar_t) mode[i];
+    return _wfopen(std::filesystem::u8path(path).c_str(), wmode);
+#else
+    return std::fopen(path.c_str(), mode);
+#endif
+}
+
+uint64_t fnv1a(uint64_t h, const void* data, size_t n) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Identity of the loaded model: file size, the first 64 KB (GGUF header and
+// metadata) and the shape the cache depends on. Cheap enough to compute on
+// every save/load, strict enough that a different model - or the same name
+// with other weights - never restores a cache it did not produce.
+uint64_t model_identity(const EngineContext* c, const DenseForward* df) {
+    uint64_t h = 1469598103934665603ULL;
+    std::FILE* f = open_utf8(c->st.meta.path, "rb");
+    if (f) {
+        std::fseek(f, 0, SEEK_END);
+        const long long size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        h = fnv1a(h, &size, sizeof(size));
+        std::vector<uint8_t> head(64 * 1024);
+        const size_t got = std::fread(head.data(), 1, head.size(), f);
+        h = fnv1a(h, head.data(), got);
+        std::fclose(f);
+    }
+    h = fnv1a(h, c->st.meta.arch.data(), c->st.meta.arch.size());
+    const uint64_t shape[4] = { c->st.meta.n_layers, c->st.meta.n_vocab,
+                                (uint64_t) df->kv_bytes_per_pos(), df->kv_quantized() ? 1u : 0u };
+    return fnv1a(h, shape, sizeof(shape));
+}
+} // namespace
+
+// Layout of a session image (little-endian, as every supported target):
+//   u32 magic "DSKV" | u32 version | u64 model identity | u64 bytes per
+//   position per layer | u64 n | i32 tokens[n] | K layer by layer | V same.
+constexpr size_t kSessionHeader = 4 + 4 + 8 + 8 + 8;
+
+size_t engine_session_image_size(desireeia_ctx* ctx, size_t n_prefix) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return 0;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
+    const DenseForward* df = dynamic_cast<const DenseForward*>(c->gf);
+    if (!df || df->kv_bytes_per_pos() == 0 || !c->kv_valid || c->kv_prefilled == 0) return 0;
+    size_t n = std::min(c->kv_prefilled, df->cache_len());
+    if (n_prefix > 0) n = std::min(n, n_prefix);
+    return kSessionHeader + n * sizeof(int32_t) + 2 * (size_t) c->st.meta.n_layers * n * df->kv_bytes_per_pos();
+}
+
+bool engine_session_serialize(desireeia_ctx* ctx, size_t n_prefix, std::vector<uint8_t>& out, std::string& err) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) { err = "invalid argument"; return false; }
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    if (!df || df->kv_bytes_per_pos() == 0) { err = "this model's cache cannot be saved"; return false; }
+    if (!c->kv_valid || c->kv_prefilled == 0) { err = "no prefilled session to save"; return false; }
+    size_t n = std::min(c->kv_prefilled, df->cache_len());
+    if (n_prefix > 0) n = std::min(n, n_prefix);
+
+    std::vector<uint8_t> k, v;
+    if (!df->export_kv(n, k, v)) { err = "cache export failed"; return false; }
+    const uint64_t id = model_identity(c, df);
+    const uint64_t bpp = df->kv_bytes_per_pos();
+    const uint64_t n64 = n;
+    out.resize(kSessionHeader + n * sizeof(int32_t) + k.size() + v.size());
+    uint8_t* p = out.data();
+    auto put = [&p](const void* src, size_t bytes) { std::memcpy(p, src, bytes); p += bytes; };
+    put(&kSessionMagic, 4);
+    put(&kSessionVersion, 4);
+    put(&id, 8);
+    put(&bpp, 8);
+    put(&n64, 8);
+    put(c->kv_tokens.data(), n * sizeof(int32_t));
+    put(k.data(), k.size());
+    put(v.data(), v.size());
+    return true;
+}
+
+bool engine_session_deserialize(desireeia_ctx* ctx, const uint8_t* data, size_t size, size_t& out_tokens,
+                                std::string& err) {
+    out_tokens = 0;
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || (!data && size > 0)) { err = "invalid argument"; return false; }
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    if (!df || df->kv_bytes_per_pos() == 0) { err = "this model's cache cannot be restored"; return false; }
+    if (size < kSessionHeader) { err = "truncated session data"; return false; }
+    uint32_t magic = 0, version = 0;
+    uint64_t id = 0, bpp = 0, n = 0;
+    const uint8_t* p = data;
+    auto get = [&p](void* dst, size_t bytes) { std::memcpy(dst, p, bytes); p += bytes; };
+    get(&magic, 4);
+    get(&version, 4);
+    get(&id, 8);
+    get(&bpp, 8);
+    get(&n, 8);
+    if (magic != kSessionMagic || version != kSessionVersion) { err = "not a session file of this engine version"; return false; }
+    if (id != model_identity(c, df)) { err = "session saved for a different model or cache layout"; return false; }
+    if (bpp != df->kv_bytes_per_pos() || n == 0 || n > (1ull << 24)) { err = "session cache layout mismatch"; return false; }
+    const size_t layer_bytes = (size_t) c->st.meta.n_layers * n * bpp;
+    if (size != kSessionHeader + n * sizeof(int32_t) + 2 * layer_bytes) { err = "truncated session data"; return false; }
+    std::vector<int32_t> tokens(n);
+    get(tokens.data(), n * sizeof(int32_t));
+    const uint8_t* k = p;
+    const uint8_t* v = p + layer_bytes;
+    if (!df->import_kv(n, k, v)) { err = "cache import failed (memory?)"; return false; }
+    c->kv_tokens = std::move(tokens);
+    c->kv_prefilled = n;
+    c->kv_valid = true;
+    c->has_session = false;   // nothing to continue from until the next predict
+    c->pending.clear();
+    c->last_reused = 0;
+    out_tokens = n;
+    return true;
+}
+
+bool engine_session_save(desireeia_ctx* ctx, const char* path, size_t n_prefix, std::string& err) {
+    if (!path) { err = "invalid argument"; return false; }
+    std::vector<uint8_t> image;
+    if (!engine_session_serialize(ctx, n_prefix, image, err)) return false;
+    const std::string tmp = std::string(path) + ".tmp";
+    std::FILE* f = open_utf8(tmp, "wb");
+    if (!f) { err = "cannot create " + tmp; return false; }
+    bool ok = std::fwrite(image.data(), 1, image.size(), f) == image.size();
+    ok = (std::fclose(f) == 0) && ok;
+    std::error_code ec;
+    const auto tmp_p = std::filesystem::u8path(tmp);
+    if (!ok) { std::filesystem::remove(tmp_p, ec); err = "write failed: " + tmp; return false; }
+    // rename replaces an existing file atomically on every platform
+    // (MoveFileEx with REPLACE_EXISTING on Windows).
+    std::filesystem::rename(tmp_p, std::filesystem::u8path(path), ec);
+    if (ec) { std::filesystem::remove(tmp_p, ec); err = "cannot rename to " + std::string(path); return false; }
+    return true;
+}
+
+bool engine_session_load(desireeia_ctx* ctx, const char* path, size_t& out_tokens, std::string& err) {
+    out_tokens = 0;
+    if (!path) { err = "invalid argument"; return false; }
+    std::FILE* f = open_utf8(path, "rb");
+    if (!f) { err = "cannot open " + std::string(path); return false; }
+    std::vector<uint8_t> image;
+    uint8_t buf[1 << 16];
+    size_t got;
+    while ((got = std::fread(buf, 1, sizeof(buf), f)) > 0) image.insert(image.end(), buf, buf + got);
+    std::fclose(f);
+    return engine_session_deserialize(ctx, image.data(), image.size(), out_tokens, err);
+}
+
+void engine_cancel(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (c) c->cancel.store(true, std::memory_order_relaxed);   // no lock: a predict holds it
+}
+
+bool engine_was_cancelled(const desireeia_ctx* ctx) {
+    const EngineContext* c = reinterpret_cast<const EngineContext*>(ctx);
+    return c && c->gf && c->gf->was_cancelled();
+}
+
+void engine_set_progress(desireeia_ctx* ctx, void (*cb)(uint64_t, uint64_t, void*), void* user) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    c->hooks.progress = cb;
+    c->hooks.user = user;
+}
+
+void engine_set_log(desireeia_ctx* ctx, LogFn log) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    c->st.log = std::move(log);
+}
+
+bool engine_reserve(desireeia_ctx* ctx, size_t n_positions) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
+    return c->gf && c->gf->reserve_positions(n_positions);
+}
+
+bool engine_trim(desireeia_ctx* ctx) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
+    if (!c->gf) return false;
+    c->gf->release_cache();
+    invalidate_session(c);
+    return true;
+}
+
+std::string engine_last_error(const desireeia_ctx* ctx) {
+    const EngineContext* c = reinterpret_cast<const EngineContext*>(ctx);
+    return c ? c->st.last_error : std::string();
 }
 
 bool engine_set_session_reuse(desireeia_ctx* ctx, int mode) {
@@ -824,6 +1208,7 @@ bool engine_load_prerouter(desireeia_ctx* ctx, const char* path, std::string& er
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c || !path) { err = "invalid argument"; return false; }
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (!c->gf) {
         err = "model has no generative forward engine (prerouter requires a dense/MLA MoE model)";
         return false;
@@ -839,6 +1224,7 @@ bool engine_clear_prerouter(desireeia_ctx* ctx) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (c->gf) c->gf->clear_prerouter();
     return true;
 }
@@ -847,6 +1233,7 @@ bool engine_set_prerouter_heuristic(desireeia_ctx* ctx, bool enabled) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (c->gf) c->gf->set_prerouter_heuristic(enabled);
     return true;
 }
@@ -869,6 +1256,7 @@ size_t engine_context_size(const desireeia_ctx* ctx) {
     EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
     if (!c) return 0;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     size_t n = 0;
     // c->st.kv is the legacy KvCache (never populated by the current
     // forward path); the real K/V cache lives inside DenseForward.
@@ -930,6 +1318,7 @@ bool engine_load_vision(desireeia_ctx* ctx) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c || !c->st.reader) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
 
     if (c->st.vision) return true;  // Already loaded.
 
@@ -987,6 +1376,7 @@ bool engine_encode_image(desireeia_ctx* ctx, const DesireeAIImage& image,
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c || !c->st.vision || !c->st.vision->initialized) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (!image.data || image.width == 0 || image.height == 0) return false;
 
     if (!vision::vision_encode_image(*c->st.vision, image, out_embd)) return false;
@@ -1005,6 +1395,7 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
     std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(const_cast<EngineContext*>(c));
     if (!c->gf || !c->st.reader || n_tokens == 0) return false;
     if (embd == nullptr || n_embd == 0) return false;
 

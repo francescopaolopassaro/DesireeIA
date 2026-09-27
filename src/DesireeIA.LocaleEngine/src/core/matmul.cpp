@@ -6,6 +6,7 @@
 // from the author.
 
 #include "engine.h"
+#include "i8gemm.h"
 #include "profile.h"
 #include "../quant/quant.h"
 #include <algorithm>
@@ -415,159 +416,401 @@ int matmul_q8_0(const uint8_t* q8_data, size_t rows, size_t cols, const float* x
     return DESIREEIA_OK;
 }
 
+// Prefill product Y[t][r] = sum_k W[r][k] * X[t][k] on the CPU, for every
+// weight format a prefill meets in practice (Q8_0, Q4_0, Q4_K, Q5_K, Q6_K).
+//
+// The kernels before this processed one token at a time (the K-quant batch
+// versions had been reverted to a per-token loop after a coarse-scale tile
+// corrupted output) and reduced every 32-wide dot to a scalar: 20 tok/s of
+// prefill on a 16-core laptop, minutes for an agent system prompt on any
+// machine without an NVIDIA GPU (every Mac).
+//
+// Every one of those formats is, per 16 weights, EXACTLY
+//     w[i] = a * q[i] - m        q[i] a small integer, a and m floats
+// Each thread unpacks its own slice of rows into that form (cost linear in
+// the weights, spread over every token), then one int8 micro-kernel serves
+// all formats:
+//   * Q4_K/Q5_K values are unsigned (0..31): the int8 product needs no sign
+//     fix-up. Signed formats (Q8_0, Q4_0, Q6_K) use the sign trick;
+//   * activations: quantized once, in parallel over tokens, one scale per
+//     32 (the fine granularity the reverted tile lacked), plus the exact
+//     float sum of every 16 for the offset term;
+//   * micro-tile 2 rows x 4 tokens, 8 vector accumulators kept in registers
+//     over the whole row; one horizontal sum per output at the end;
+//   * loop order: 4 tokens (held in L1) sweep every row of the thread's
+//     slice (held in L1/L2) - the other way round re-streamed the
+//     activations from L2 for every pair of rows and stopped scaling past
+//     the performance cores;
+//   * offset: y -= sum_h m[r][h] * sum16(x[t])[h], vectorized.
+// Integer products are exact; only the float summation order differs from
+// dequantize-then-dot.
+namespace {
+enum class I8Src { Q8_0, Q4_0, Q4_K, Q5_K, Q6_K };
+
+struct I8Acts {
+    std::vector<int8_t> q;     // [n_tok][cols]
+    std::vector<float> d;      // [n_tok][nb]
+    std::vector<float> s16;    // [n_tok][2*nb]  exact float sum of each 16 (offset formats)
+};
+
+struct I8Rows {
+    std::vector<int8_t> q;     // [n][cols]  (unsigned bytes for every format but Q8_0)
+    std::vector<float> a;      // [n][2*nb]  scale of each 16
+    std::vector<float> m;      // [n][2*nb]  offset of each 16 (empty for Q8_0)
+};
+
+// Signed formats keep their values centred (the sign trick handles them):
+// shifting Q4_0/Q6_K up to unsigned was measured to cost precision - the
+// activation's rounding error then multiplies q + shift instead of q.
+bool i8_signed(I8Src src) { return src == I8Src::Q8_0 || src == I8Src::Q4_0 || src == I8Src::Q6_K; }
+
+void quantize_acts(const float* x, size_t cols, size_t n_tok, bool want_sums, I8Acts& a) {
+    const size_t nb = cols / 32;
+    a.q.resize(n_tok * cols);
+    a.d.resize(n_tok * nb);
+    if (want_sums) a.s16.resize(n_tok * nb * 2);
+    parallel_units(n_tok, [&](size_t t0, size_t t1) {
+        std::vector<int8_t> q;
+        std::vector<float> d;
+        std::vector<uint8_t> unused;
+        for (size_t t = t0; t < t1; ++t) {
+            quantize_q8_0(x + t * cols, cols, q, d, unused);
+            std::memcpy(a.q.data() + t * cols, q.data(), cols);
+            std::memcpy(a.d.data() + t * nb, d.data(), nb * sizeof(float));
+            if (want_sums) {
+                const float* xt = x + t * cols;
+                for (size_t h = 0; h < 2 * nb; ++h) {
+                    float s = 0.0f;
+                    for (int j = 0; j < 16; ++j) s += xt[h * 16 + j];
+                    a.s16[t * nb * 2 + h] = s;
+                }
+            }
+        }
+    });
+}
+
+size_t i8_row_bytes(I8Src src, size_t cols) {
+    switch (src) {
+        case I8Src::Q8_0: return cols / 32 * sizeof(block_q8_0);
+        case I8Src::Q4_0: return cols / 32 * sizeof(block_q4_0);
+        case I8Src::Q4_K: return cols / QK_K * sizeof(block_q4_K);
+        case I8Src::Q5_K: return cols / QK_K * sizeof(block_q5_K);
+        case I8Src::Q6_K: return cols / QK_K * sizeof(block_q6_K);
+    }
+    return 0;
+}
+
+// One row into (q, a, m) - m is nullptr for the signed formats. Same bit layouts
+// dequantize_row_* read.
+void unpack_row(I8Src src, const uint8_t* row, size_t cols, int8_t* q, float* a, float* m) {
+    switch (src) {
+    case I8Src::Q8_0: {
+        const block_q8_0* x = reinterpret_cast<const block_q8_0*>(row);
+        for (size_t b = 0; b < cols / 32; ++b) {
+            std::memcpy(q + b * 32, x[b].qs, 32);
+            a[2 * b] = a[2 * b + 1] = desireeia_fp16_to_fp32(x[b].d);
+        }
+        break;
+    }
+    case I8Src::Q4_0: {
+        const block_q4_0* x = reinterpret_cast<const block_q4_0*>(row);
+        for (size_t b = 0; b < cols / 32; ++b) {
+            for (int j = 0; j < 16; ++j) {
+                q[b * 32 + j] = (int8_t) ((x[b].qs[j] & 0x0F) - 8);
+                q[b * 32 + j + 16] = (int8_t) ((x[b].qs[j] >> 4) - 8);
+            }
+            a[2 * b] = a[2 * b + 1] = desireeia_fp16_to_fp32(x[b].d);
+        }
+        break;
+    }
+    case I8Src::Q4_K:
+    case I8Src::Q5_K: {
+        const bool five = src == I8Src::Q5_K;
+        const size_t nsb = cols / QK_K;
+        for (size_t i = 0; i < nsb; ++i) {
+            const uint8_t* scales;
+            const uint8_t* ql;
+            const uint8_t* qh = nullptr;
+            float d, dmin;
+            if (five) {
+                const block_q5_K* x = reinterpret_cast<const block_q5_K*>(row) + i;
+                scales = x->scales; ql = x->qs; qh = x->qh;
+                d = desireeia_fp16_to_fp32(x->d); dmin = desireeia_fp16_to_fp32(x->dmin);
+            } else {
+                const block_q4_K* x = reinterpret_cast<const block_q4_K*>(row) + i;
+                scales = x->scales; ql = x->qs;
+                d = desireeia_fp16_to_fp32(x->d); dmin = desireeia_fp16_to_fp32(x->dmin);
+            }
+            uint8_t u1 = 1, u2 = 2;
+            for (int j = 0; j < 4; ++j) {            // 64 weights = two 32-blocks
+                const size_t b0 = i * 8 + 2 * j, b1 = b0 + 1;
+                uint8_t sc, mn;
+                get_scale_min_k4(2 * j, scales, &sc, &mn);
+                a[2 * b0] = a[2 * b0 + 1] = d * sc;
+                m[2 * b0] = m[2 * b0 + 1] = dmin * mn;
+                get_scale_min_k4(2 * j + 1, scales, &sc, &mn);
+                a[2 * b1] = a[2 * b1 + 1] = d * sc;
+                m[2 * b1] = m[2 * b1 + 1] = dmin * mn;
+                for (int l = 0; l < 32; ++l) {
+                    int lo = ql[l] & 0x0F, hi = ql[l] >> 4;
+                    if (five) {
+                        lo += (qh[l] & u1) ? 16 : 0;
+                        hi += (qh[l] & u2) ? 16 : 0;
+                    }
+                    q[b0 * 32 + l] = (int8_t) lo;
+                    q[b1 * 32 + l] = (int8_t) hi;
+                }
+                ql += 32;
+                u1 <<= 2; u2 <<= 2;
+            }
+        }
+        break;
+    }
+    case I8Src::Q6_K: {
+        const size_t nsb = cols / QK_K;
+        for (size_t i = 0; i < nsb; ++i) {
+            const block_q6_K* x = reinterpret_cast<const block_q6_K*>(row) + i;
+            const float d = desireeia_fp16_to_fp32(x->d);
+            const uint8_t* ql = x->ql;
+            const uint8_t* qh = x->qh;
+            const int8_t* sc = x->scales;
+            for (int n = 0; n < 2; ++n) {            // 128 weights = four 32-blocks
+                const size_t b = i * 8 + n * 4;
+                for (int l = 0; l < 32; ++l) {
+                    q[(b + 0) * 32 + l] = (int8_t) (((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
+                    q[(b + 1) * 32 + l] = (int8_t) (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+                    q[(b + 2) * 32 + l] = (int8_t) (((ql[l +  0] >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32);
+                    q[(b + 3) * 32 + l] = (int8_t) (((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32);
+                }
+                for (int k = 0; k < 8; ++k) a[2 * b + k] = d * sc[k];
+                ql += 64; qh += 32; sc += 8;
+            }
+        }
+        break;
+    }
+    }
+}
+
+// Offset term of one output: sum over the 16-wide groups of m * sum16(x).
+inline float i8_offset(const float* m, const float* s, size_t n) {
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    size_t h = 0;
+    for (; h + 8 <= n; h += 8) acc = _mm256_fmadd_ps(_mm256_loadu_ps(m + h), _mm256_loadu_ps(s + h), acc);
+    float r = hsum_ps_avx2(acc);
+    for (; h < n; ++h) r += m[h] * s[h];
+    return r;
+#elif defined(__ARM_NEON)
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    size_t h = 0;
+    for (; h + 4 <= n; h += 4) acc = vfmaq_f32(acc, vld1q_f32(m + h), vld1q_f32(s + h));
+    float r = vaddvq_f32(acc);
+    for (; h < n; ++h) r += m[h] * s[h];
+    return r;
+#else
+    float r = 0.0f;
+    for (size_t h = 0; h < n; ++h) r += m[h] * s[h];
+    return r;
+#endif
+}
+
+#if defined(__AVX2__)
+using I8Acc = __m256;
+inline I8Acc i8_zero() { return _mm256_setzero_ps(); }
+inline float i8_sum(I8Acc v) { return hsum_ps_avx2(v); }
+// Weights of one 32-block: the unsigned operand of maddubs (|w| for signed
+// Q8_0, w itself otherwise), the raw w for the sign fix-up, the scales.
+template <bool Signed>
+struct I8W {
+    __m256i u, w;
+    __m256 s;                                          // [a_lo x4, a_hi x4]
+    I8W(const int8_t* p, const float* a) {
+        w = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+        u = Signed ? _mm256_sign_epi8(w, w) : w;
+        s = a[0] == a[1] ? _mm256_broadcast_ss(a)
+                         : _mm256_setr_m128(_mm_broadcast_ss(a), _mm_broadcast_ss(a + 1));
+    }
+};
+// acc += dot(w, x) per 16-wide half, times a_half * dx. Lanes 0-3 of the
+// widened int32 sums cover bytes 0-15, lanes 4-7 bytes 16-31.
+template <bool Signed>
+inline I8Acc i8_fma(I8Acc acc, const I8W<Signed>& w, const int8_t* x, float dx) {
+    __m256i vx = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x));
+    if (Signed) vx = _mm256_sign_epi8(vx, w.w);
+    const __m256i p16 = _mm256_maddubs_epi16(w.u, vx);
+    const __m256i p32 = _mm256_madd_epi16(p16, _mm256_set1_epi16(1));
+    return _mm256_fmadd_ps(_mm256_cvtepi32_ps(p32), _mm256_mul_ps(w.s, _mm256_set1_ps(dx)), acc);
+}
+#elif defined(__ARM_NEON)
+using I8Acc = float32x4_t;
+inline I8Acc i8_zero() { return vdupq_n_f32(0.0f); }
+inline float i8_sum(I8Acc v) { return vaddvq_f32(v); }
+template <bool Signed>
+struct I8W {
+    int8x16_t lo, hi;
+    float alo, ahi;
+    I8W(const int8_t* p, const float* a) : lo(vld1q_s8(p)), hi(vld1q_s8(p + 16)), alo(a[0]), ahi(a[1]) {}
+};
+// Unsigned values here are at most 63: as int8 they are the same numbers,
+// so one signed dot serves both cases.
+template <bool Signed>
+inline I8Acc i8_fma(I8Acc acc, const I8W<Signed>& w, const int8_t* x, float dx) {
+    const int32x4_t sl = dot_i8x16_neon(vdupq_n_s32(0), w.lo, vld1q_s8(x));
+    const int32x4_t sh = dot_i8x16_neon(vdupq_n_s32(0), w.hi, vld1q_s8(x + 16));
+    acc = vfmaq_n_f32(acc, vcvtq_f32_s32(sl), w.alo * dx);
+    return vfmaq_n_f32(acc, vcvtq_f32_s32(sh), w.ahi * dx);
+}
+#else
+struct I8Acc { float v = 0.0f; };
+inline I8Acc i8_zero() { return I8Acc{}; }
+inline float i8_sum(I8Acc v) { return v.v; }
+template <bool Signed>
+struct I8W {
+    const int8_t* p; float alo, ahi;
+    I8W(const int8_t* q, const float* a) : p(q), alo(a[0]), ahi(a[1]) {}
+};
+template <bool Signed>
+inline I8Acc i8_fma(I8Acc acc, const I8W<Signed>& w, const int8_t* x, float dx) {
+    int32_t sl = 0, sh = 0;
+    for (int j = 0; j < 16; ++j) { sl += w.p[j] * x[j]; sh += w.p[16 + j] * x[16 + j]; }
+    acc.v += ((float) sl * w.alo + (float) sh * w.ahi) * dx;
+    return acc;
+}
+#endif
+
+template <bool Signed>
+void i8_gemm_slice(const I8Rows& w, size_t nrows, size_t r_base, size_t rows, size_t cols,
+                   const I8Acts& a, size_t n_tok, float* y) {
+    const size_t nb = cols / 32;
+    const bool off = !w.m.empty();
+    auto offset = [&](size_t i, size_t t) {
+        return off ? i8_offset(w.m.data() + i * nb * 2, a.s16.data() + t * nb * 2, nb * 2) : 0.0f;
+    };
+    size_t t = 0;
+    for (; t + 4 <= n_tok; t += 4) {
+        const int8_t* x0 = a.q.data() + t * cols;
+        const int8_t* x1 = x0 + cols;
+        const int8_t* x2 = x1 + cols;
+        const int8_t* x3 = x2 + cols;
+        const float* d0 = a.d.data() + t * nb;
+        const float* d1 = d0 + nb;
+        const float* d2 = d1 + nb;
+        const float* d3 = d2 + nb;
+        size_t i = 0;
+        for (; i + 1 < nrows; i += 2) {
+            const int8_t* q0 = w.q.data() + i * cols;
+            const int8_t* q1 = q0 + cols;
+            const float* s0 = w.a.data() + i * nb * 2;
+            const float* s1 = s0 + nb * 2;
+            I8Acc a00 = i8_zero(), a01 = i8_zero(), a02 = i8_zero(), a03 = i8_zero();
+            I8Acc a10 = i8_zero(), a11 = i8_zero(), a12 = i8_zero(), a13 = i8_zero();
+            for (size_t b = 0; b < nb; ++b) {
+                const I8W<Signed> W0(q0 + b * 32, s0 + 2 * b), W1(q1 + b * 32, s1 + 2 * b);
+                const size_t o = b * 32;
+                a00 = i8_fma(a00, W0, x0 + o, d0[b]); a10 = i8_fma(a10, W1, x0 + o, d0[b]);
+                a01 = i8_fma(a01, W0, x1 + o, d1[b]); a11 = i8_fma(a11, W1, x1 + o, d1[b]);
+                a02 = i8_fma(a02, W0, x2 + o, d2[b]); a12 = i8_fma(a12, W1, x2 + o, d2[b]);
+                a03 = i8_fma(a03, W0, x3 + o, d3[b]); a13 = i8_fma(a13, W1, x3 + o, d3[b]);
+            }
+            const size_t r = r_base + i;
+            y[(t + 0) * rows + r] = i8_sum(a00) - offset(i, t + 0);
+            y[(t + 1) * rows + r] = i8_sum(a01) - offset(i, t + 1);
+            y[(t + 2) * rows + r] = i8_sum(a02) - offset(i, t + 2);
+            y[(t + 3) * rows + r] = i8_sum(a03) - offset(i, t + 3);
+            y[(t + 0) * rows + r + 1] = i8_sum(a10) - offset(i + 1, t + 0);
+            y[(t + 1) * rows + r + 1] = i8_sum(a11) - offset(i + 1, t + 1);
+            y[(t + 2) * rows + r + 1] = i8_sum(a12) - offset(i + 1, t + 2);
+            y[(t + 3) * rows + r + 1] = i8_sum(a13) - offset(i + 1, t + 3);
+        }
+        for (; i < nrows; ++i) {
+            const int8_t* q0 = w.q.data() + i * cols;
+            const float* s0 = w.a.data() + i * nb * 2;
+            I8Acc c0 = i8_zero(), c1 = i8_zero(), c2 = i8_zero(), c3 = i8_zero();
+            for (size_t b = 0; b < nb; ++b) {
+                const I8W<Signed> W0(q0 + b * 32, s0 + 2 * b);
+                const size_t o = b * 32;
+                c0 = i8_fma(c0, W0, x0 + o, d0[b]); c1 = i8_fma(c1, W0, x1 + o, d1[b]);
+                c2 = i8_fma(c2, W0, x2 + o, d2[b]); c3 = i8_fma(c3, W0, x3 + o, d3[b]);
+            }
+            const size_t r = r_base + i;
+            y[(t + 0) * rows + r] = i8_sum(c0) - offset(i, t + 0);
+            y[(t + 1) * rows + r] = i8_sum(c1) - offset(i, t + 1);
+            y[(t + 2) * rows + r] = i8_sum(c2) - offset(i, t + 2);
+            y[(t + 3) * rows + r] = i8_sum(c3) - offset(i, t + 3);
+        }
+    }
+    for (; t < n_tok; ++t) {
+        const int8_t* x = a.q.data() + t * cols;
+        const float* d = a.d.data() + t * nb;
+        for (size_t i = 0; i < nrows; ++i) {
+            const int8_t* q0 = w.q.data() + i * cols;
+            const float* s0 = w.a.data() + i * nb * 2;
+            I8Acc c0 = i8_zero();
+            for (size_t b = 0; b < nb; ++b) {
+                const I8W<Signed> W0(q0 + b * 32, s0 + 2 * b);
+                c0 = i8_fma(c0, W0, x + b * 32, d[b]);
+            }
+            y[t * rows + r_base + i] = i8_sum(c0) - offset(i, t);
+        }
+    }
+}
+
+// The whole product. Each slice of rows is unpacked by the thread that
+// computes it, into that thread's own buffer.
+int i8_gemm(I8Src src, const uint8_t* data, size_t rows, size_t cols,
+            const float* x, size_t n_tok, float* y) {
+    const size_t nb = cols / 32;
+    const size_t row_bytes = i8_row_bytes(src, cols);
+    const bool sgn = i8_signed(src);
+
+    // Interleaved kernels (AVX2 / AVX-VNNI / AVX512-VNNI / NEON sdot) when the
+    // CPU has one; the row-pair kernel below stays as the portable path.
+    I8GemmJob job;
+    job.data = data; job.row_bytes = row_bytes; job.rows = rows; job.cols = cols;
+    job.unpack = [](int s, const uint8_t* row, size_t c, int8_t* q, float* a, float* m) {
+        unpack_row(static_cast<I8Src>(s), row, c, q, a, m);
+    };
+    job.src = static_cast<int>(src);
+    job.has_m = !sgn;
+    job.split = src == I8Src::Q6_K;
+    job.wide = src == I8Src::Q8_0;
+    job.x = x; job.n_tok = n_tok; job.y = y;
+    if (i8_gemm_interleaved(job)) return DESIREEIA_OK;
+
+    I8Acts acts;
+    {
+        ScopedTimer t(profile_counters().ns_quantize_act);
+        quantize_acts(x, cols, n_tok, !sgn, acts);
+    }
+    parallel_rows(rows, [&](size_t r0, size_t r1) {
+        thread_local I8Rows w;
+        const size_t n = r1 - r0;
+        w.q.resize(n * cols);
+        w.a.resize(n * nb * 2);
+        if (sgn) w.m.clear(); else w.m.resize(n * nb * 2);
+        for (size_t i = 0; i < n; ++i) {
+            unpack_row(src, data + (r0 + i) * row_bytes, cols, w.q.data() + i * cols,
+                       w.a.data() + i * nb * 2, sgn ? nullptr : w.m.data() + i * nb * 2);
+        }
+        if (sgn) i8_gemm_slice<true>(w, n, r0, rows, cols, acts, n_tok, y);
+        else     i8_gemm_slice<false>(w, n, r0, rows, cols, acts, n_tok, y);
+    });
+    return DESIREEIA_OK;
+}
+
+// Below this many tokens the per-token kernels win: unpacking costs about
+// one pass over the weights, which a handful of tokens can't amortize.
+constexpr size_t kI8MinTokens = 4;
+} // namespace
+
 int matmul_q8_0_batch(const uint8_t* q8_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
     if (n_tok == 0) return DESIREEIA_OK;
     if (n_tok == 1) return matmul_q8_0(q8_data, rows, cols, x, y);
     if (cols == 0 || cols % 32 != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
-    const size_t nb = cols / 32;
-    const size_t row_bytes = nb * sizeof(block_q8_0);
-
-    std::vector<std::vector<int8_t>> xq(n_tok);
-    std::vector<std::vector<float>> xscale(n_tok);
-    {
-        ScopedTimer t(profile_counters().ns_quantize_act);
-        std::vector<uint8_t> unused_signs;
-        for (size_t tk = 0; tk < n_tok; ++tk) {
-            quantize_q8_0(x + tk * cols, cols, xq[tk], xscale[tk], unused_signs);
-        }
-    }
-
-    {
     ScopedTimer t(profile_counters().ns_q80_compute);
-    parallel_rows(rows, [&](size_t r0, size_t r1) {
-        // 2x4-tile GEMM (RM=2 rows, RN=4 tokens). Unlike the earlier
-        // version (outer loop over b, inner loop over tokens, with
-        // std::vector accumulators that had to survive across b
-        // iterations and so lived in memory/cache, never in registers),
-        // here the loop over the TOKEN BLOCK is outer and the loop over
-        // b (super-blocks) is inner: the 8 tile accumulators are named
-        // local variables (not an indexed array), so the compiler can
-        // keep them in registers for the whole reduction over b, the way
-        // a real GEMM microkernel does.
-        // Cost: the weight bytes get re-read once per block of 4 tokens
-        // instead of just once for the whole row (weight-read traffic
-        // divided by RN=4 instead of by n_tok) — but they almost certainly
-        // stay in L1/L2 between one token block and the next (small rows,
-        // a few dozen bytes), so the real cost is low compared to the gain
-        // from having accumulators that truly live in registers. Measured
-        // before keeping it (development rule): see
-        // docs/engine_gap_analysis.md.
-        size_t r = r0;
-        for (; r + 1 < r1; r += 2) {
-            const uint8_t* row_ptr0 = q8_data + (r + 0) * row_bytes;
-            const uint8_t* row_ptr1 = q8_data + (r + 1) * row_bytes;
-            size_t tk = 0;
-            for (; tk + 4 <= n_tok; tk += 4) {
-                const int8_t* xq0 = xq[tk + 0].data();
-                const int8_t* xq1 = xq[tk + 1].data();
-                const int8_t* xq2 = xq[tk + 2].data();
-                const int8_t* xq3 = xq[tk + 3].data();
-                const float* xs0 = xscale[tk + 0].data();
-                const float* xs1 = xscale[tk + 1].data();
-                const float* xs2 = xscale[tk + 2].data();
-                const float* xs3 = xscale[tk + 3].data();
-                float a00 = 0, a01 = 0, a02 = 0, a03 = 0;
-                float a10 = 0, a11 = 0, a12 = 0, a13 = 0;
-                for (size_t b = 0; b < nb; ++b) {
-                    const block_q8_0* blk0 = reinterpret_cast<const block_q8_0*>(row_ptr0 + b * sizeof(block_q8_0));
-                    const block_q8_0* blk1 = reinterpret_cast<const block_q8_0*>(row_ptr1 + b * sizeof(block_q8_0));
-                    const float wd0 = desireeia_fp16_to_fp32(blk0->d);
-                    const float wd1 = desireeia_fp16_to_fp32(blk1->d);
-                    const int8_t* x0 = xq0 + b * 32;
-                    const int8_t* x1 = xq1 + b * 32;
-                    const int8_t* x2 = xq2 + b * 32;
-                    const int8_t* x3 = xq3 + b * 32;
-#if defined(__AVX2__)
-                    a00 += wd0 * xs0[b] * dot8_avx2(blk0->qs, x0, 32);
-                    a01 += wd0 * xs1[b] * dot8_avx2(blk0->qs, x1, 32);
-                    a02 += wd0 * xs2[b] * dot8_avx2(blk0->qs, x2, 32);
-                    a03 += wd0 * xs3[b] * dot8_avx2(blk0->qs, x3, 32);
-                    a10 += wd1 * xs0[b] * dot8_avx2(blk1->qs, x0, 32);
-                    a11 += wd1 * xs1[b] * dot8_avx2(blk1->qs, x1, 32);
-                    a12 += wd1 * xs2[b] * dot8_avx2(blk1->qs, x2, 32);
-                    a13 += wd1 * xs3[b] * dot8_avx2(blk1->qs, x3, 32);
-#elif defined(__ARM_NEON)
-                    a00 += wd0 * xs0[b] * dot8_neon(blk0->qs, x0, 32);
-                    a01 += wd0 * xs1[b] * dot8_neon(blk0->qs, x1, 32);
-                    a02 += wd0 * xs2[b] * dot8_neon(blk0->qs, x2, 32);
-                    a03 += wd0 * xs3[b] * dot8_neon(blk0->qs, x3, 32);
-                    a10 += wd1 * xs0[b] * dot8_neon(blk1->qs, x0, 32);
-                    a11 += wd1 * xs1[b] * dot8_neon(blk1->qs, x1, 32);
-                    a12 += wd1 * xs2[b] * dot8_neon(blk1->qs, x2, 32);
-                    a13 += wd1 * xs3[b] * dot8_neon(blk1->qs, x3, 32);
-#else
-                    auto sdot = [](const int8_t* a, const int8_t* c) {
-                        int32_t s = 0;
-                        for (int j = 0; j < 32; ++j) s += (int32_t) a[j] * (int32_t) c[j];
-                        return (float) s;
-                    };
-                    a00 += wd0 * xs0[b] * sdot(blk0->qs, x0);
-                    a01 += wd0 * xs1[b] * sdot(blk0->qs, x1);
-                    a02 += wd0 * xs2[b] * sdot(blk0->qs, x2);
-                    a03 += wd0 * xs3[b] * sdot(blk0->qs, x3);
-                    a10 += wd1 * xs0[b] * sdot(blk1->qs, x0);
-                    a11 += wd1 * xs1[b] * sdot(blk1->qs, x1);
-                    a12 += wd1 * xs2[b] * sdot(blk1->qs, x2);
-                    a13 += wd1 * xs3[b] * sdot(blk1->qs, x3);
-#endif
-                }
-                y[(tk + 0) * rows + r] = a00; y[(tk + 1) * rows + r] = a01;
-                y[(tk + 2) * rows + r] = a02; y[(tk + 3) * rows + r] = a03;
-                y[(tk + 0) * rows + r + 1] = a10; y[(tk + 1) * rows + r + 1] = a11;
-                y[(tk + 2) * rows + r + 1] = a12; y[(tk + 3) * rows + r + 1] = a13;
-            }
-            for (; tk < n_tok; ++tk) {
-                float acc0 = 0.0f, acc1 = 0.0f;
-                const int8_t* xqt = xq[tk].data();
-                const float* xst = xscale[tk].data();
-                for (size_t b = 0; b < nb; ++b) {
-                    const block_q8_0* blk0 = reinterpret_cast<const block_q8_0*>(row_ptr0 + b * sizeof(block_q8_0));
-                    const block_q8_0* blk1 = reinterpret_cast<const block_q8_0*>(row_ptr1 + b * sizeof(block_q8_0));
-                    const int8_t* xt = xqt + b * 32;
-#if defined(__AVX2__)
-                    acc0 += desireeia_fp16_to_fp32(blk0->d) * xst[b] * dot8_avx2(blk0->qs, xt, 32);
-                    acc1 += desireeia_fp16_to_fp32(blk1->d) * xst[b] * dot8_avx2(blk1->qs, xt, 32);
-#elif defined(__ARM_NEON)
-                    acc0 += desireeia_fp16_to_fp32(blk0->d) * xst[b] * dot8_neon(blk0->qs, xt, 32);
-                    acc1 += desireeia_fp16_to_fp32(blk1->d) * xst[b] * dot8_neon(blk1->qs, xt, 32);
-#else
-                    int32_t i0 = 0, i1 = 0;
-                    for (int j = 0; j < 32; ++j) { i0 += (int32_t) blk0->qs[j] * (int32_t) xt[j]; i1 += (int32_t) blk1->qs[j] * (int32_t) xt[j]; }
-                    acc0 += desireeia_fp16_to_fp32(blk0->d) * xst[b] * (float) i0;
-                    acc1 += desireeia_fp16_to_fp32(blk1->d) * xst[b] * (float) i1;
-#endif
-                }
-                y[tk * rows + r] = acc0;
-                y[tk * rows + r + 1] = acc1;
-            }
-        }
-        for (; r < r1; ++r) {
-            const uint8_t* row_ptr = q8_data + r * row_bytes;
-            for (size_t tk = 0; tk < n_tok; ++tk) {
-                float acc = 0.0f;
-                const int8_t* xqt = xq[tk].data();
-                const float* xst = xscale[tk].data();
-                for (size_t b = 0; b < nb; ++b) {
-                    const block_q8_0* blk = reinterpret_cast<const block_q8_0*>(row_ptr + b * sizeof(block_q8_0));
-                    const int8_t* xt = xqt + b * 32;
-#if defined(__AVX2__)
-                    acc += desireeia_fp16_to_fp32(blk->d) * xst[b] * dot8_avx2(blk->qs, xt, 32);
-#elif defined(__ARM_NEON)
-                    acc += desireeia_fp16_to_fp32(blk->d) * xst[b] * dot8_neon(blk->qs, xt, 32);
-#else
-                    int32_t idot = 0;
-                    for (int j = 0; j < 32; ++j) idot += (int32_t) blk->qs[j] * (int32_t) xt[j];
-                    acc += desireeia_fp16_to_fp32(blk->d) * xst[b] * (float) idot;
-#endif
-                }
-                y[tk * rows + r] = acc;
-            }
-        }
-    });
-    }
     profile_counters().calls_q80.fetch_add(1, std::memory_order_relaxed);
-    return DESIREEIA_OK;
+    return i8_gemm(I8Src::Q8_0, q8_data, rows, cols, x, n_tok, y);
 }
 
 int matmul_q4_1(const uint8_t* data, size_t rows, size_t cols, const float* x, float* y) {
@@ -1739,6 +1982,10 @@ int matmul_q4_k_pq(const uint8_t* q4k_data, size_t rows, size_t cols,
 
 int matmul_q4_0_batch(const uint8_t* q4_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
+    if (n_tok >= kI8MinTokens && cols > 0 && cols % 32 == 0) {
+        ScopedTimer t(profile_counters().ns_q80_compute);
+        return i8_gemm(I8Src::Q4_0, q4_data, rows, cols, x, n_tok, y);
+    }
     if (n_tok == 0) return DESIREEIA_OK;
     if (n_tok == 1) return matmul_q4_0(q4_data, rows, cols, x, y);
     if (cols == 0 || cols % 32 != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
@@ -1796,6 +2043,10 @@ int matmul_q4_0_batch(const uint8_t* q4_data, size_t rows, size_t cols,
 
 int matmul_q4_k_batch(const uint8_t* q4k_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
+    if (n_tok >= kI8MinTokens && cols > 0 && cols % QK_K == 0) {
+        ScopedTimer t(profile_counters().ns_q80_compute);
+        return i8_gemm(I8Src::Q4_K, q4k_data, rows, cols, x, n_tok, y);
+    }
     // CORRECTNESS REVERT (2026-09-07): the 2x4 tile with Q8_K quantization
     // (see the note in matmul_q4_k_core) produced corrupted output on a
     // real model. Until the tile is rewritten with fine-grained
@@ -1813,6 +2064,10 @@ int matmul_q4_k_batch(const uint8_t* q4k_data, size_t rows, size_t cols,
 
 int matmul_q6_k_batch(const uint8_t* q6k_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
+    if (n_tok >= kI8MinTokens && cols > 0 && cols % QK_K == 0) {
+        ScopedTimer t(profile_counters().ns_q80_compute);
+        return i8_gemm(I8Src::Q6_K, q6k_data, rows, cols, x, n_tok, y);
+    }
     // Same revert as matmul_q4_k_batch above, same reasoning.
     if (n_tok == 0) return DESIREEIA_OK;
     if (cols == 0 || cols % QK_K != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
@@ -1938,6 +2193,10 @@ int matmul_q5_k(const uint8_t* q5k_data, size_t rows, size_t cols, const float* 
 
 int matmul_q5_k_batch(const uint8_t* q5k_data, size_t rows, size_t cols,
                        const float* x, size_t n_tok, float* y) {
+    if (n_tok >= kI8MinTokens && cols > 0 && cols % QK_K == 0) {
+        ScopedTimer t(profile_counters().ns_q80_compute);
+        return i8_gemm(I8Src::Q5_K, q5k_data, rows, cols, x, n_tok, y);
+    }
     // Same revert as matmul_q4_k_batch, same reasoning: falls back to the
     // already-correct single-column version.
     if (n_tok == 0) return DESIREEIA_OK;

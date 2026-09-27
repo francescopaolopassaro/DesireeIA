@@ -144,6 +144,22 @@ def get_lib() -> ctypes.CDLL:
 # ---------------------------------------------------------------------------
 
 LOG_CB = CFUNCTYPE(None, c_int32, c_char_p, c_void_p)
+PROGRESS_CB = CFUNCTYPE(None, c_uint64, c_uint64, c_void_p)
+
+# Interface version this wrapper is written for (DESIREEIA_ABI_VERSION).
+ABI_VERSION = 2
+
+
+class GpuInfoNative(Structure):
+    _fields_ = [
+        ("name", ctypes.c_char * 256),
+        ("total_bytes", c_uint64),
+        ("free_bytes", c_uint64),
+        ("cc_major", c_int32),
+        ("cc_minor", c_int32),
+        ("multiprocessors", c_int32),
+        ("reserved", c_int32),
+    ]
 
 # ---------------------------------------------------------------------------
 # C structs (sequential layout, matching abi.h exactly)
@@ -270,6 +286,31 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.desireeia_set_session_reuse.restype = c_int32
     lib.desireeia_last_reused_tokens.argtypes = [c_void_p]
     lib.desireeia_last_reused_tokens.restype = c_uint64
+    lib.desireeia_session_save.argtypes = [c_void_p, c_char_p, c_uint64]
+    lib.desireeia_session_save.restype = c_int32
+    lib.desireeia_session_load.argtypes = [c_void_p, c_char_p, POINTER(c_uint64)]
+    lib.desireeia_session_load.restype = c_int32
+    if hasattr(lib, "desireeia_abi_version"):
+        lib.desireeia_abi_version.argtypes = []
+        lib.desireeia_abi_version.restype = c_int32
+        lib.desireeia_last_error.argtypes = [c_void_p, c_void_p, c_uint64]
+        lib.desireeia_last_error.restype = c_uint64
+        lib.desireeia_cancel.argtypes = [c_void_p]
+        lib.desireeia_cancel.restype = c_int32
+        lib.desireeia_set_progress_callback.argtypes = [c_void_p, PROGRESS_CB, c_void_p]
+        lib.desireeia_set_progress_callback.restype = c_int32
+        lib.desireeia_gpu_count.argtypes = []
+        lib.desireeia_gpu_count.restype = c_int32
+        lib.desireeia_probe_gpu.argtypes = [c_int32, POINTER(GpuInfoNative)]
+        lib.desireeia_probe_gpu.restype = c_int32
+        lib.desireeia_reserve_context.argtypes = [c_void_p, c_uint64]
+        lib.desireeia_reserve_context.restype = c_int32
+        lib.desireeia_trim_cache.argtypes = [c_void_p]
+        lib.desireeia_trim_cache.restype = c_int32
+    lib.desireeia_session_save_mem.argtypes = [c_void_p, c_uint64, c_void_p, c_uint64, POINTER(c_uint64)]
+    lib.desireeia_session_save_mem.restype = c_int32
+    lib.desireeia_session_load_mem.argtypes = [c_void_p, c_char_p, c_uint64, POINTER(c_uint64)]
+    lib.desireeia_session_load_mem.restype = c_int32
 
     # tokenize
     lib.desireeia_tokenize.argtypes = [

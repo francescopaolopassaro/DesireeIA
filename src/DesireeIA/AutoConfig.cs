@@ -27,12 +27,23 @@ public sealed record ModelTraits(
     float? RecommendedTopP)
 {
     /// <summary>
-    /// Estimated KV-cache bytes per context token (keys + values, 16-bit, every
-    /// layer). An upper bound: sliding-window layers and latent/compressed
-    /// attention (DeepSeek MLA) need less, so budgets computed from it err on
-    /// the safe side.
+    /// KV-cache bytes per context token with the float32 cache (keys + values,
+    /// every layer), as the engine stores it when KV compression is off. An
+    /// upper bound: sliding-window layers and latent attention (DeepSeek MLA)
+    /// need less, so budgets computed from it err on the safe side.
     /// </summary>
-    public ulong KvBytesPerToken => 2UL * LayerCount * HeadCountKv * (KeyLength + ValueLength);
+    public ulong KvBytesPerToken => KvBytesPerTokenFor(quantized: false);
+
+    /// <summary>
+    /// KV-cache bytes per context token as the engine actually stores it:
+    /// float32 (4 bytes per value), or Q8_0 when
+    /// <see cref="ExecutionPlan.KvCompression"/> is on (34 bytes per 32 values).
+    /// </summary>
+    public ulong KvBytesPerTokenFor(bool quantized)
+    {
+        ulong values = (ulong)LayerCount * HeadCountKv * (KeyLength + ValueLength);
+        return quantized ? (values * 34 + 31) / 32 : values * 4;
+    }
 
     /// <summary>Reads the traits of a GGUF model file.</summary>
     public static ModelTraits Read(string modelPath)
@@ -173,7 +184,7 @@ public static class AutoConfigurator
 
         ulong budgetMb = plan.RamBudgetMb > 0 ? plan.RamBudgetMb : hw.RamFreeMb;
         ulong modelMb = (ulong)Math.Max(0, model.FileSizeBytes) / (1024 * 1024);
-        ulong kvPerToken = model.KvBytesPerToken;
+        ulong kvPerToken = model.KvBytesPerTokenFor(plan.KvCompression);
         if (budgetMb > 0 && kvPerToken > 0)
         {
             // Weights may sit in VRAM on GPU backends, but VRAM size isn't
@@ -184,7 +195,8 @@ public static class AutoConfigurator
             if (byMemory < (ulong)context)
             {
                 context = (int)Math.Max((ulong)MinContextSize, byMemory);
-                notes.Add($"context limited by memory: ~{kvPerToken / 1024} KB of KV cache per token, " +
+                notes.Add($"context limited by memory: ~{kvPerToken / 1024} KB of KV cache per token " +
+                          $"({(plan.KvCompression ? "Q8_0" : "float32")}), " +
                           $"{freeForKvMb} MB available after the model");
             }
         }

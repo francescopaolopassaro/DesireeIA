@@ -22,12 +22,12 @@ struct ChatMessage {
 };
 
 // Recognized chat prompt formats. Earlier, only the gemma format existed,
-// hardcoded in the CLI: a Qwen/Llama/Mistral/... model in chat mode would
+// hardcoded in the CLI: a Qwen/Mistral/... model in chat mode would
 // receive the user's raw prompt with no turn markers at all, and produce
 // degraded responses.
 //
 // Coverage: the families most commonly used for local inference as of
-// late 2026 (Qwen and most fine-tunes -> ChatML, Llama 2/3/3.1/3.2/3.3/4,
+// late 2026 (Qwen and most fine-tunes -> ChatML, the [INST] and header-id formats of the dense GQA family (all versions),
 // every historical Mistral/Mixtral variant, Gemma 2/3, Phi 3/4, DeepSeek
 // V2/V3/R1, Command-R, ChatGLM3/4, MiniCPM, Zephyr, Falcon3, Exaone3).
 // Many smaller, lab-specific formats with marginal adoption for local use
@@ -38,12 +38,12 @@ struct ChatMessage {
 enum class ChatTemplateKind {
     Unknown,
     ChatMl,
-    Llama2,
-    Llama2Sys,
-    Llama2SysBos,
-    Llama2SysStrip,
-    Llama3,
-    Llama4,
+    Inst,
+    InstSys,
+    InstSysBos,
+    InstSysStrip,
+    HeaderId,
+    HeaderIdV4,
     MistralV1,
     MistralV3,
     MistralV3Tekken,
@@ -80,8 +80,8 @@ DESIREEIA_INTERNAL ChatTemplateKind detect_chat_template(const std::string& tmpl
 // When the model carries no chat_template in its metadata (older GGUF
 // files, or conversions that didn't copy it over), falls back to a
 // per-architecture default: not as reliable as an explicit template (the
-// same architecture can have several historical variants, e.g. llama2 vs
-// llama3), but always better than the raw prompt with no turn markers.
+// same architecture can have several historical variants, e.g. the [INST] vs
+// header-id formats), but always better than the raw prompt with no turn markers.
 DESIREEIA_INTERNAL ChatTemplateKind chat_template_for_arch(ArchKind arch);
 
 // Applies the format to the messages, producing the prompt to tokenize.

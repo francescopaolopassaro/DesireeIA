@@ -117,7 +117,8 @@ typedef enum desireeia_error {
     DESIREEIA_ERR_IO            = -3,
     DESIREEIA_ERR_PARSE         = -4,
     DESIREEIA_ERR_NO_MEM        = -5,
-    DESIREEIA_ERR_UNDEFINED     = -6
+    DESIREEIA_ERR_UNDEFINED     = -6,
+    DESIREEIA_ERR_CANCELLED     = -7   /* desireeia_cancel stopped the call */
 } desireeia_error;
 
 typedef struct desireeia_ctx desireeia_ctx;
@@ -174,6 +175,28 @@ DESIREEIA_API uint32_t desireeia_context_length_trained(const desireeia_ctx* ctx
 DESIREEIA_API desireeia_error desireeia_session_reset(desireeia_ctx* ctx);
 DESIREEIA_API desireeia_error desireeia_set_session_reuse(desireeia_ctx* ctx, int32_t mode);
 DESIREEIA_API size_t desireeia_last_reused_tokens(const desireeia_ctx* ctx);
+
+/* Session persistence (engine 0.1.2). A fixed system prompt costs a full
+ * prefill every time a process starts; saved once, it costs a file read.
+ *   desireeia_session_save  writes the first n_prefix prefilled positions of
+ *                           the KV cache (0 = all) with their tokens to path
+ *                           (written to path.tmp, then renamed)
+ *   desireeia_session_load  restores them; the next predict whose prompt
+ *                           starts with the same tokens reuses them. The file
+ *                           is refused (DESIREEIA_ERR_PARSE) when it was saved
+ *                           for another model or cache layout.
+ * DESIREEIA_ERR_NOT_SUPPORTED for caches that cannot be saved (latent MLA,
+ * recurrent models). */
+DESIREEIA_API desireeia_error desireeia_session_save(desireeia_ctx* ctx, const char* path, size_t n_prefix);
+DESIREEIA_API desireeia_error desireeia_session_load(desireeia_ctx* ctx, const char* path, size_t* out_tokens);
+/* The same image in memory, so the host can encrypt it before it touches the
+ * disk. save_mem with out == NULL only reports the size in *out_size (0 when
+ * there is nothing to save); with a buffer of at least that size it fills it
+ * (DESIREEIA_ERR_INVALID_ARG when capacity is too small). */
+DESIREEIA_API desireeia_error desireeia_session_save_mem(desireeia_ctx* ctx, size_t n_prefix,
+                                                        uint8_t* out, size_t capacity, size_t* out_size);
+DESIREEIA_API desireeia_error desireeia_session_load_mem(desireeia_ctx* ctx, const uint8_t* data, size_t size,
+                                                        size_t* out_tokens);
 
 /* Tokenizer (SentencePiece Unigram or byte-level BPE, auto-detected from
  * the model's metadata). Query-size convention: call with out_ids=NULL
@@ -469,6 +492,56 @@ DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
                                                       size_t n_embd,
                                                       int32_t image_token,
                                                       int32_t* out_token);
+
+/* ── Engine 0.1.2 additions ─────────────────────────────────────────────── */
+
+/* Version of this interface. Wrappers compare it with the one they were
+ * written for and refuse an older engine with a clear message instead of a
+ * missing-symbol crash. 2 = engine 0.1.2 (the functions below). */
+#define DESIREEIA_ABI_VERSION 2
+DESIREEIA_API int32_t desireeia_abi_version(void);
+
+/* Text of the last error: the context's own (a failed predict, a refused
+ * session file...) when ctx is given and has one, otherwise the last error
+ * raised on the calling thread. Copies at most buf_size-1 bytes plus the
+ * terminator and returns the full length (0 = no error recorded). */
+DESIREEIA_API size_t desireeia_last_error(const desireeia_ctx* ctx, char* buf, size_t buf_size);
+
+/* Logger of ONE context: its messages stop going to the process-wide logger
+ * (with two models loaded their logs no longer mix). NULL cb restores the
+ * process-wide one. */
+DESIREEIA_API desireeia_error desireeia_set_ctx_logger(desireeia_ctx* ctx, desireeia_log_cb cb, void* user);
+
+/* Stops a predict in progress on ctx from another thread, at the next layer
+ * boundary: that predict returns DESIREEIA_ERR_CANCELLED and the session is
+ * dropped (the next prompt is prefilled in full). Safe to call at any time;
+ * a cancel that arrives when nothing runs has no effect on the next call. */
+DESIREEIA_API desireeia_error desireeia_cancel(desireeia_ctx* ctx);
+
+/* Prefill progress: called on the predicting thread after each layer of a
+ * multi-token prefill with (layers done, total layers). NULL cb removes it. */
+typedef void (*desireeia_progress_cb)(uint64_t done, uint64_t total, void* user);
+DESIREEIA_API desireeia_error desireeia_set_progress_callback(desireeia_ctx* ctx, desireeia_progress_cb cb, void* user);
+
+/* GPUs the engine can use (0 without CUDA), and one GPU's description. */
+typedef struct desireeia_gpu_info {
+    char     name[256];
+    uint64_t total_bytes;
+    uint64_t free_bytes;
+    int32_t  cc_major;
+    int32_t  cc_minor;
+    int32_t  multiprocessors;
+    int32_t  reserved;
+} desireeia_gpu_info;
+DESIREEIA_API int32_t desireeia_gpu_count(void);
+DESIREEIA_API desireeia_error desireeia_probe_gpu(int32_t index, desireeia_gpu_info* out);
+
+/* KV cache sizing. reserve_context allocates room for n_positions at once
+ * (the cache otherwise grows by doubling, holding old and new copies at the
+ * peak - the moment a long prompt runs out of memory); trim_cache gives the
+ * whole cache back (chat closed, app idle) and drops the session. */
+DESIREEIA_API desireeia_error desireeia_reserve_context(desireeia_ctx* ctx, size_t n_positions);
+DESIREEIA_API desireeia_error desireeia_trim_cache(desireeia_ctx* ctx);
 
 #ifdef __cplusplus
 }

@@ -21,6 +21,7 @@
 #include "../src/DesireeIA.LocaleEngine/src/core/engine.h"
 #include "../src/DesireeIA.LocaleEngine/src/quant/quant.h"
 #include "../src/DesireeIA.LocaleEngine/src/core/thread_pool.h"
+#include "../src/DesireeIA.LocaleEngine/src/core/i8gemm.h"
 
 #include <algorithm>
 #include <functional>
@@ -62,6 +63,47 @@ int main(int argc, char** argv) {
     const int threads = argc > 2 ? atoi(argv[2]) : 0;
     if (threads > 0) ThreadPool::set_thread_override((size_t) threads);
     printf("threads=%s\n", threads > 0 ? argv[2] : "default");
+
+    // argv[3] == "gemm": prefill products (many tokens at once), in GMAC/s.
+    // Weights are random bytes with the block scales forced to a sane fp16
+    // (raw random halves include inf/NaN).
+    if (argc > 3 && std::strcmp(argv[3], "gemm") == 0) {
+        printf("int8 gemm: %s\n", i8_gemm_isa());
+        std::mt19937 grng(7);
+        std::uniform_int_distribution<int> gb(0, 255);
+        std::uniform_real_distribution<float> gf(-1.0f, 1.0f);
+        const size_t rows = 2560, cols = 2560, n_tok = argc > 4 ? (size_t) atoi(argv[4]) : 256;
+        std::vector<float> x(n_tok * cols), y(n_tok * rows);
+        for (auto& v : x) v = gf(grng);
+        auto run = [&](const char* name, size_t row_bytes, auto fix_row, auto fn) {
+            std::vector<uint8_t> w(rows * row_bytes);
+            for (auto& b : w) b = (uint8_t) gb(grng);
+            for (size_t r = 0; r < rows; ++r) fix_row(w.data() + r * row_bytes);
+            fn(w.data());                                   // warm-up (thread pool, buffers)
+            double best = 1e30;
+            for (int i = 0; i < reps; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                fn(w.data());
+                best = std::min(best, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            }
+            printf("gemm %-5s %zux%zu n_tok=%zu: %8.2f ms  %7.1f GMAC/s\n", name, rows, cols, n_tok,
+                   best * 1e3, (double) rows * cols * n_tok / best / 1e9);
+        };
+        const desireeia_half h = desireeia_fp32_to_fp16(0.01f);
+        run("q4_k", cols / QK_K * sizeof(block_q4_K), [&](uint8_t* row) {
+            auto* b = reinterpret_cast<block_q4_K*>(row);
+            for (size_t i = 0; i < cols / QK_K; ++i) { b[i].d = h; b[i].dmin = h; }
+        }, [&](const uint8_t* w) { matmul_q4_k_batch(w, rows, cols, x.data(), n_tok, y.data()); });
+        run("q6_k", cols / QK_K * sizeof(block_q6_K), [&](uint8_t* row) {
+            auto* b = reinterpret_cast<block_q6_K*>(row);
+            for (size_t i = 0; i < cols / QK_K; ++i) b[i].d = h;
+        }, [&](const uint8_t* w) { matmul_q6_k_batch(w, rows, cols, x.data(), n_tok, y.data()); });
+        run("q8_0", cols / 32 * sizeof(block_q8_0), [&](uint8_t* row) {
+            auto* b = reinterpret_cast<block_q8_0*>(row);
+            for (size_t i = 0; i < cols / 32; ++i) b[i].d = h;
+        }, [&](const uint8_t* w) { matmul_q8_0_batch(w, rows, cols, x.data(), n_tok, y.data()); });
+        return 0;
+    }
 
     std::mt19937 rng(1234);
     std::uniform_int_distribution<int> byte_dist(0, 255);

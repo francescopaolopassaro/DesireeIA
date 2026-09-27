@@ -120,7 +120,7 @@ static void load_image_normalization(ModelReader& reader, VisionGGUFContext& ctx
 // Detect and load multimodal projector weights.
 // Tries multiple naming conventions used by different GGUF converters.
 // Dimension conventions (all row-major, rows are the output dimension):
-//   LLaVA 1.5 (llama.cpp convert_image_encoder_to_gguf.py):
+//   LLaVA 1.5 (desireeialmn's image-encoder converter):
 //     mlp2x_gelu: mm.0.weight [H, D_img], mm.2.weight [D_txt, H], mm.1/mm.3 bias
 //                 (H = projector intermediate, D_txt = text embedding dim)
 //     linear:     mm.0.weight [D_txt, D_img], optional mm.1 bias

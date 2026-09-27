@@ -18,7 +18,7 @@ public class AutoConfigTests
             Metal: false, Vulkan: false);
 
     private static ExecutionPlan Plan(ulong ramMb = 11_000) =>
-        new() { Backend = InferenceBackend.Cuda, ThreadCount = 16, RamBudgetMb = ramMb };
+        new() { Backend = InferenceBackend.Cuda, ThreadCount = 16, RamBudgetMb = ramMb, KvCompression = false };
 
     // Numbers from a real Spark-X2.5-4B-Q4_K_M.gguf header.
     private static ModelTraits Spark(uint trained = 1_048_576, long bytes = 2_600_224_352) =>
@@ -39,7 +39,10 @@ public class AutoConfigTests
     [Fact]
     public void ComfortableMachine_GetsTargetContextAndFullReplies()
     {
-        var c = AutoConfigurator.Compute(Hw(), Plan(), Spark());
+        // Q8_0 KV cache, the engine default since 0.1.2.
+        var c = AutoConfigurator.Compute(Hw(),
+            new ExecutionPlan { Backend = InferenceBackend.Cuda, ThreadCount = 16, RamBudgetMb = 11_000, KvCompression = true },
+            Spark());
         Assert.Equal(AutoConfigurator.TargetContextSize, c.ContextSize);
         Assert.Equal(AutoConfigurator.DefaultMaxTokens, c.MaxTokens);
     }
@@ -78,10 +81,22 @@ public class AutoConfigTests
     }
 
     [Fact]
-    public void KvBytesPerToken_MatchesHeaderArithmetic()
+    public void KvBytesPerToken_MatchesEngineStorage()
     {
-        // 2 bytes * 36 layers * 4 kv heads * (256 + 256)
-        Assert.Equal(147_456UL, Spark().KvBytesPerToken);
+        // 36 layers * 4 kv heads * (256 + 256) = 73,728 values per token.
+        Assert.Equal(294_912UL, Spark().KvBytesPerToken);                    // float32: 4 bytes each
+        Assert.Equal(294_912UL, Spark().KvBytesPerTokenFor(quantized: false));
+        Assert.Equal(78_336UL, Spark().KvBytesPerTokenFor(quantized: true));  // Q8_0: 34 bytes / 32 values
+    }
+
+    [Fact]
+    public void QuantizedCache_AllowsMoreContextOnTheSameMemory()
+    {
+        var f32 = AutoConfigurator.Compute(Hw(6_000), Plan(6_000), Spark());
+        var q8 = AutoConfigurator.Compute(Hw(6_000),
+            new ExecutionPlan { Backend = InferenceBackend.Cuda, ThreadCount = 16, RamBudgetMb = 6_000, KvCompression = true },
+            Spark());
+        Assert.True(q8.ContextSize > f32.ContextSize);
     }
 
     [Fact]

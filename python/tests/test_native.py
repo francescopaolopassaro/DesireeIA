@@ -100,3 +100,99 @@ def test_session_reuses_prefix_and_matches_full_prefill():
             model.set_session_reuse(3)
     finally:
         model.close()
+
+
+@pytest.mark.skipif(not _MODEL or not os.path.exists(_MODEL), reason="DESIREEIA_TEST_MODEL_PATH not set")
+def test_session_file_restores_prefix_in_a_fresh_instance(tmp_path):
+    """A prefix saved by one instance is reused by a fresh one, with the
+    answer a full prefill gives; a corrupted or missing file is refused."""
+    file = tmp_path / "session.dskv"
+
+    def greedy(model, prompt, n=8):
+        ids = [model.predict(prompt)]
+        ids += [model.next_token() for _ in range(n - 1)]
+        return ids
+
+    model = desireeia.LocalModel.load(_MODEL, desireeia.build_plan(_MODEL))
+    try:
+        system = model.tokenize("You are a helpful assistant. Answer briefly and precisely.")
+        turn = system + model.tokenize(" What is two plus two?", add_bos=False)
+        expected = greedy(model, turn)
+        model.reset_session()
+        model.predict(system)
+        assert model.save_session(file)
+    finally:
+        model.close()
+
+    model = desireeia.LocalModel.load(_MODEL, desireeia.build_plan(_MODEL))
+    try:
+        assert model.load_session(file) == len(system)
+        assert greedy(model, turn) == expected
+        assert model.last_reused_tokens() == len(system)
+        image = model.save_session_bytes(len(system))
+        assert image
+        model.reset_session()
+        assert model.load_session_bytes(image) == len(system)
+        assert greedy(model, turn) == expected
+        assert model.load_session_bytes(image[:-1]) == 0
+        file.write_bytes(bytes([1, 2, 3]))
+        assert model.load_session(file) == 0
+        assert model.load_session(tmp_path / "missing.dskv") == 0
+    finally:
+        model.close()
+
+
+def test_abi_version_and_gpus():
+    assert desireeia.abi_version() >= 2
+    for g in desireeia.gpus():
+        assert g["name"] and g["total_bytes"] > 0
+
+
+@pytest.mark.skipif(not _MODEL or not os.path.exists(_MODEL), reason="DESIREEIA_TEST_MODEL_PATH not set")
+def test_cancel_progress_trim(tmp_path):
+    """Progress is reported, a cancel from another thread stops a long
+    prefill, and after trimming the cache the model answers as before."""
+    import threading
+    model = desireeia.LocalModel.load(_MODEL, desireeia.build_plan(_MODEL))
+    try:
+        short = model.tokenize("The capital of France is")
+
+        def greedy(prompt, n=6):
+            ids = [model.predict(prompt)]
+            ids += [model.next_token() for _ in range(n - 1)]
+            return ids
+
+        expected = greedy(short)
+        seen = []
+        model.set_prefill_progress(lambda d, t: seen.append((d, t)))
+        filler = model.tokenize(" the quick brown fox jumps over the lazy dog", add_bos=False)
+        long_prompt = list(short)
+        while len(long_prompt) < 3000:
+            long_prompt += filler
+        model.reset_session()
+        model.predict(long_prompt[:200])
+        assert seen and seen[-1][1] > 0
+
+        model.reset_session()
+        errors = []
+
+        def run():
+            try:
+                model.predict(long_prompt)
+            except InterruptedError:
+                errors.append("cancelled")
+
+        th = threading.Thread(target=run)
+        th.start()
+        import time
+        time.sleep(0.03)
+        model.cancel()
+        th.join()
+        model.set_prefill_progress(None)
+
+        assert model.reserve_context(1024)
+        model.trim_cache()
+        model.reset_session()
+        assert greedy(short) == expected
+    finally:
+        model.close()

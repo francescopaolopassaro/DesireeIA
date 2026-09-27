@@ -99,7 +99,68 @@ internal static class NativeMethods
         Io = -3,
         Parse = -4,
         NoMem = -5,
-        Undefined = -6
+        Undefined = -6,
+        Cancelled = -7
+    }
+
+    /// <summary>Interface version this wrapper is written for (DESIREEIA_ABI_VERSION).</summary>
+    internal const int AbiVersion = 2;
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal delegate void ProgressCallback(ulong done, ulong total, IntPtr user);
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct GpuInfoNative
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 256)]
+        public byte[] Name;
+        public ulong TotalBytes;
+        public ulong FreeBytes;
+        public int CcMajor;
+        public int CcMinor;
+        public int Multiprocessors;
+        public int Reserved;
+    }
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int desireeia_abi_version();
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern nuint desireeia_last_error(IntPtr ctx, byte[]? buf, nuint bufSize);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_cancel(IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_progress_callback(IntPtr ctx, ProgressCallback? cb, IntPtr user);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern int desireeia_gpu_count();
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_probe_gpu(int index, out GpuInfoNative info);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_reserve_context(IntPtr ctx, nuint nPositions);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_trim_cache(IntPtr ctx);
+
+    /// <summary>Text of the last native error (the context's, else the calling thread's).</summary>
+    internal static string LastError(IntPtr ctx)
+    {
+        try
+        {
+            var n = desireeia_last_error(ctx, null, 0);
+            if (n == 0) return "";
+            var buf = new byte[(int)n + 1];
+            desireeia_last_error(ctx, buf, (nuint)buf.Length);
+            return System.Text.Encoding.UTF8.GetString(buf, 0, (int)n);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            return "";
+        }
     }
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
@@ -150,6 +211,24 @@ internal static class NativeMethods
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern nuint desireeia_last_reused_tokens(IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_session_save(IntPtr ctx,
+                                                     [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+                                                     nuint nPrefix);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_session_load(IntPtr ctx,
+                                                     [MarshalAs(UnmanagedType.LPUTF8Str)] string path,
+                                                     out nuint outTokens);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_session_save_mem(IntPtr ctx, nuint nPrefix, byte[]? output,
+                                                         nuint capacity, out nuint outSize);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_session_load_mem(IntPtr ctx, byte[] data, nuint size,
+                                                         out nuint outTokens);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_tokenize(IntPtr ctx,

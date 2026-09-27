@@ -98,7 +98,23 @@ desireeia_plan build_plan(const desireeia_hw_info& hw, const std::string& model_
     p.expert_cache_count = static_cast<int32_t>(cache);
 
     p.expert_prefetch_enabled = 1;
-    // OFF by default. Until 2026-09-09 this flag reached the engine but the
+    // ON by default since engine 0.1.2 (2026-09-25), after the end-to-end
+    // validation the note below was waiting for. Greedy generation, same
+    // prompts, float32 KV vs Q8_0 KV, on real models:
+    //   Spark-X2.5-4B Q4_K_M: 3 prompts, 1 identical, 2 diverging at char
+    //     477 and 17 - both continuations fluent and correct (a near-tie
+    //     flipped, not a corruption); 60 s -> 18 s for the three.
+    //   gemma-3-4b-it Q4_K_M: 1 identical, 2 diverging at char 376 and 162,
+    //     same quality; 54 s -> 17 s.
+    //   (Qwen2.5-Coder-3B Q8_0 produced broken text with float32 KV too: a
+    //   separate issue, not this flag.)
+    // Prefill of an 8200-token prompt on Spark/CUDA: 850 s -> 150 s, KV
+    // cache 2.4 GB -> 0.64 GB. The speedup is structural: the device
+    // attention for large prefill batches (cuda_attention_batch) only
+    // exists for the quantized cache, so with float32 KV attention always
+    // ran on the CPU, O(n^2). DESIREEIA_KV_QUANT=0 restores float32 KV.
+    //
+    // History: until 2026-09-09 this flag reached the engine but the
     // KvCache class it configured never actually quantized anything — a
     // "compression" that did nothing, defaulting to on because on cost
     // nothing. That changed: the flag now drives a real Q8_0 quantized
@@ -108,8 +124,8 @@ desireeia_plan build_plan(const desireeia_hw_info& hw, const std::string& model_
     // same reasoning as every other opt-in added this session (weight
     // requantization, MoE expert stacking): proven correct in isolation
     // (selftest), not yet proven on a real end-to-end model run, so it stays
-    // off until it is. DESIREEIA_KV_QUANT=1 to opt in for testing.
-    p.kv_compression_enabled = 0;
+    // off until it is (done 2026-09-25, see above).
+    p.kv_compression_enabled = 1;
     p.expert_pin_enabled = 1;
     p.expert_prefetch_depth = 1;
     p.batch_union_enabled = 1;
@@ -142,7 +158,7 @@ desireeia_plan build_plan(const desireeia_hw_info& hw, const std::string& model_
     env_ssd_tier_override(p.ssd_tier_mode);
 
     if (const char* kvq = std::getenv("DESIREEIA_KV_QUANT")) {
-        if (kvq[0] != '\0' && kvq[0] != '0') p.kv_compression_enabled = 1;
+        if (kvq[0] != '\0') p.kv_compression_enabled = kvq[0] != '0' ? 1 : 0;
     }
 
     return p;

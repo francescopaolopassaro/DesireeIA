@@ -150,6 +150,15 @@ TokenizerKind detect_tokenizer(const std::string& tag) {
     return TokenizerKind::Unknown;
 }
 
+bool arch_rope_adjacent_pairs(const std::string& tag) {
+    // Checked against the reference convention, architecture by
+    // architecture. Absent from the list = split halves.
+    return tag == legacy_dense_tag() || tag == legacy_dense_tag_v2() ||
+           tag == "internlm2" || tag == "baichuan" || tag == "xverse"  ||
+           tag == "smollm3"   || tag == "nanbeige" || tag == "mistral" ||
+           tag == "arcee"     || tag == "cohere2";
+}
+
 DenseQuirks quirks_for(ArchKind kind) {
     DenseQuirks q;
     switch (kind) {

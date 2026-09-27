@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 from typing import Optional
 
 from . import _native as _nat
@@ -70,6 +71,56 @@ def profile_dump() -> str:
     _nat.get_lib().desireeia_profile_dump(buf, 2048)
     raw = buf.value
     return raw.decode("utf-8", errors="replace")
+
+
+def abi_version() -> int:
+    """Interface version of the loaded native engine (0 when it predates the query)."""
+    lib = _nat.get_lib()
+    return int(lib.desireeia_abi_version()) if hasattr(lib, "desireeia_abi_version") else 0
+
+
+def ensure_abi() -> None:
+    """Raise a clear error when the native engine is older than this wrapper."""
+    v = abi_version()
+    if v < _nat.ABI_VERSION:
+        raise RuntimeError(
+            f"DesireeIA native engine interface {v} is older than this wrapper "
+            f"({_nat.ABI_VERSION}): update the native library that ships with the package."
+        )
+
+
+def last_error(ctx=None) -> str:
+    """Text of the last native error (the context's, else the calling thread's)."""
+    lib = _nat.get_lib()
+    if not hasattr(lib, "desireeia_last_error"):
+        return ""
+    n = int(lib.desireeia_last_error(ctx, None, 0))
+    if n == 0:
+        return ""
+    buf = ctypes.create_string_buffer(n + 1)
+    lib.desireeia_last_error(ctx, buf, n + 1)
+    return buf.value.decode("utf-8", errors="replace")
+
+
+def gpus() -> list:
+    """GPUs the engine can use, as dicts (empty without CUDA)."""
+    lib = _nat.get_lib()
+    if not hasattr(lib, "desireeia_gpu_count"):
+        return []
+    out = []
+    for i in range(int(lib.desireeia_gpu_count())):
+        info = _nat.GpuInfoNative()
+        if lib.desireeia_probe_gpu(i, ctypes.byref(info)) != 0:
+            continue
+        out.append({
+            "index": i,
+            "name": info.name.decode("utf-8", errors="replace"),
+            "total_bytes": int(info.total_bytes),
+            "free_bytes": int(info.free_bytes),
+            "compute_capability": (int(info.cc_major), int(info.cc_minor)),
+            "multiprocessors": int(info.multiprocessors),
+        })
+    return out
 
 
 def profile_reset() -> None:

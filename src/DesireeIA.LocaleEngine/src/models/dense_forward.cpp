@@ -5,6 +5,7 @@
 // integration, no AI training/ingestion without explicit written consent
 // from the author.
 
+#include <atomic>
 #include "dense_forward.h"
 #include "moe_route.h"
 #include "../core/profile.h"
@@ -295,6 +296,18 @@ static bool cuda_layer_ready(const MatVec& m) {
 #endif
 // Dispatcher: uses the direct quantized kernel if the tensor is Q4_0 on
 // disk, otherwise falls back to the classic float matmul on dequantized data.
+// Host bytes of a matrix for a CPU kernel: restores them from the model file
+// when they were released after the upload to VRAM (only a fallback path
+// gets here with a GPU-resident matrix).
+static std::mutex g_host_reload_mtx;
+static const uint8_t* host_raw(const MatVec& m) {
+    if (m.raw.empty() && m.reload) {
+        std::lock_guard<std::mutex> lk(g_host_reload_mtx);
+        if (m.raw.empty()) (*m.reload)(m.raw);
+    }
+    return m.raw.data();
+}
+
 static void matvec(const MatVec& m, size_t r, size_t c, const float* x, float* y) {
 #ifdef DESIREEIA_CUDA_ENABLED
     // Phase 1 (docs/CUDAPiano.md): only Q8_0 has a device kernel, and only
@@ -323,7 +336,7 @@ static void matvec(const MatVec& m, size_t r, size_t c, const float* x, float* y
         // the CPU kernels below.
         const int rc = (m.cuda_qs && m.cuda_scale)
             ? matmul_q8_0_cuda_resident(m.cuda_qs.get(), m.cuda_scale.get(), r, c, x, y)
-            : matmul_q8_0_cuda(m.raw.data(), r, c, x, y);
+            : matmul_q8_0_cuda(host_raw(m), r, c, x, y);
         if (rc == DESIREEIA_OK) {
             apply_lora(m, r, c, x, y);
             return;
@@ -331,17 +344,17 @@ static void matvec(const MatVec& m, size_t r, size_t c, const float* x, float* y
     }
 #endif
     switch (m.format) {
-        case MatVecFormat::Q4_0: matmul_q4_0(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q4_1: matmul_q4_1(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q5_0: matmul_q5_0(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q5_1: matmul_q5_1(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q2_K: matmul_q2_k(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q3_K: matmul_q3_k(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q4_K: matmul_q4_k(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q5_K: matmul_q5_k(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q6_K: matmul_q6_k(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q8_0: matmul_q8_0(m.raw.data(), r, c, x, y); break;
-        case MatVecFormat::Q8_K: matmul_q8_k(m.raw.data(), r, c, x, y); break;
+        case MatVecFormat::Q4_0: matmul_q4_0(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q4_1: matmul_q4_1(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q5_0: matmul_q5_0(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q5_1: matmul_q5_1(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q2_K: matmul_q2_k(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q3_K: matmul_q3_k(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q4_K: matmul_q4_k(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q5_K: matmul_q5_k(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q6_K: matmul_q6_k(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q8_0: matmul_q8_0(host_raw(m), r, c, x, y); break;
+        case MatVecFormat::Q8_K: matmul_q8_k(host_raw(m), r, c, x, y); break;
         default:                 matmul_f32(m.f.data(), r, c, x, y);   break;
     }
     apply_lora(m, r, c, x, y);
@@ -430,17 +443,17 @@ static void matvec_batch(const MatVec& m, size_t r, size_t c, const float* x, si
     }
 #endif
     switch (m.format) {
-        case MatVecFormat::Q4_0: matmul_q4_0_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q4_1: matmul_q4_1_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q5_0: matmul_q5_0_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q5_1: matmul_q5_1_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q2_K: matmul_q2_k_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q3_K: matmul_q3_k_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q4_K: matmul_q4_k_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q5_K: matmul_q5_k_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q6_K: matmul_q6_k_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q8_0: matmul_q8_0_batch(m.raw.data(), r, c, x, n_tok, y); break;
-        case MatVecFormat::Q8_K: matmul_q8_k_batch(m.raw.data(), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q4_0: matmul_q4_0_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q4_1: matmul_q4_1_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q5_0: matmul_q5_0_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q5_1: matmul_q5_1_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q2_K: matmul_q2_k_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q3_K: matmul_q3_k_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q4_K: matmul_q4_k_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q5_K: matmul_q5_k_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q6_K: matmul_q6_k_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q8_0: matmul_q8_0_batch(host_raw(m), r, c, x, n_tok, y); break;
+        case MatVecFormat::Q8_K: matmul_q8_k_batch(host_raw(m), r, c, x, n_tok, y); break;
         default:
             for (size_t tk = 0; tk < n_tok; ++tk) {
                 matmul_f32(m.f.data(), r, c, x + tk * c, y + tk * r);
@@ -502,7 +515,7 @@ static bool fused_job_for(const SharedMatvec& it,
     if (it.m->format == MatVecFormat::Q4_K)      job.format = FusedPqFormat::Q4_K;
     else if (it.m->format == MatVecFormat::Q6_K) job.format = FusedPqFormat::Q6_K;
     else return false;
-    job.data   = it.m->raw.data();
+    job.data   = host_raw(*it.m);
     job.rows   = it.r;
     job.cols   = it.c;
     job.xq     = xq.data();
@@ -623,6 +636,19 @@ static void rope_cache_init(std::vector<float>& cache, size_t n_rot, uint32_t po
         theta_extrap *= theta_scale;
     }
 }
+
+} // namespace
+
+// rope_cache_init with the model's YaRN parameters for layer il (a no-op
+// difference for models without YaRN: ext_factor 0, attn_factor 1).
+void DenseForward::rope_fill(std::vector<float>& cache, uint32_t il, size_t n_rot, uint32_t pos,
+                             float theta, float scale) const {
+    float lo = 0.0f, hi = 0.0f;
+    cfg_.layer_rope_corr_dims(il, lo, hi);
+    rope_cache_init(cache, n_rot, pos, theta, scale, cfg_.rope_ext_factor, cfg_.rope_attn_factor, lo, hi);
+}
+
+namespace {
 
 static void rope_neox_cached(float* v, size_t n_rot, const float* cache) {
     const size_t half = n_rot / 2;
@@ -791,6 +817,7 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
     const std::string arch_tag = meta.arch.empty() ? "gemma" : meta.arch;
     const std::string kp = arch_tag + ".";
     quirks_ = quirks_for(arch);
+    rope_adjacent_ = !quirks_.mla && !quirks_.no_rope && arch_rope_adjacent_pairs(arch_tag);
     experts_ = experts;
     cfg_.backend = backend;
 #ifdef DESIREEIA_CUDA_ENABLED
@@ -940,7 +967,13 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
         if (rd.meta_u32(kp + "expert_shared_count", v32)) cfg_.n_expert_shared = v32;
         if (rd.meta_u32(kp + "expert_gating_func", v32)) cfg_.moe_sigmoid_gate = (v32 == 2);
 
-        // YaRN. rope_ext_factor==0 (default) fully disables the YaRN
+    }
+    {
+        // YaRN, for EVERY architecture that declares it (it used to be read
+        // only inside the MLA block: Qwen2.5 and the other non-MLA models
+        // with rope.scaling.type=yarn kept just the linear 1/factor scale on
+        // every frequency, which bends all positions - on topic but broken
+        // text). rope_ext_factor==0 (default) fully disables the YaRN
         // branch in rope_cache_init: if the model doesn't declare
         // rope.scaling.type=="yarn" the RoPE stays the classic one.
         std::string rope_scaling_type;
@@ -979,7 +1012,12 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
                 ? get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dims)
                 : get_mscale(factor, 1.0f);
             attn_f *= 1.0f / (1.0f + 0.1f * logf(factor));
-            cfg_.rope_attn_factor = attn_f * rope_attn_factor_meta;
+            // The metadata attn_factor multiplies in only for MLA, the case
+            // this code was written and verified on. Elsewhere it restates
+            // the YaRN magnitude correction the cache formula already
+            // applies (Qwen2.5 writes 1 + 0.1 ln(factor) there): applying it
+            // twice would scale every attention logit by its square.
+            cfg_.rope_attn_factor = attn_f * (quirks_.mla ? rope_attn_factor_meta : 1.0f);
         }
     }
 
@@ -1132,6 +1170,90 @@ DenseForward::~DenseForward() {
 
 void DenseForward::reset_cache() {
     cache_cols_ = 0;
+}
+
+bool DenseForward::prefill_interrupted(uint32_t layers_done) {
+    if (!hooks_) return false;
+    if (hooks_->progress) hooks_->progress(layers_done, cfg_.n_layers, hooks_->user);
+    if (hooks_->cancel && hooks_->cancel->load(std::memory_order_relaxed)) {
+        cancelled_ = true;
+        return true;
+    }
+    return false;
+}
+
+bool DenseForward::reserve_positions(size_t n) {
+    if (n <= cache_capacity_) return true;
+    grow_cache(n);
+    return cache_capacity_ >= n;
+}
+
+void DenseForward::release_cache() {
+    cache_cols_ = 0;
+    cache_capacity_ = 0;
+    std::vector<uint8_t>().swap(k_cache_q_);
+    std::vector<uint8_t>().swap(v_cache_q_);
+    std::vector<float>().swap(k_cache_);
+    std::vector<float>().swap(v_cache_);
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (cuda_kv_ready_) cuda_kv_cache_release();
+    cuda_kv_ready_ = false;
+#endif
+}
+
+size_t DenseForward::kv_bytes_per_pos() const {
+    if (quirks_.mla) return 0;
+    if (kv_quantized_) return (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
+    return (size_t) cfg_.n_head_kv * cfg_.head_dim * sizeof(float);
+}
+
+bool DenseForward::export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v) {
+    const size_t bpp = kv_bytes_per_pos();
+    if (bpp == 0 || n > cache_cols_) return false;
+#ifdef DESIREEIA_CUDA_ENABLED
+    // Decode on the fused path writes the device cache only: bring the host
+    // copy up to date before reading it.
+    if (kv_quantized_ && cuda_kv_ready_ && cache_capacity_ > 0 && g_active_backend == DESIREEIA_BACKEND_CUDA) {
+        cuda_kv_cache_download(k_cache_q_.data(), v_cache_q_.data(), k_cache_q_.size());
+    }
+#endif
+    const uint8_t* kb = kv_quantized_ ? k_cache_q_.data() : reinterpret_cast<const uint8_t*>(k_cache_.data());
+    const uint8_t* vb = kv_quantized_ ? v_cache_q_.data() : reinterpret_cast<const uint8_t*>(v_cache_.data());
+    k.resize((size_t) cfg_.n_layers * n * bpp);
+    v.resize(k.size());
+    for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
+        const size_t src = (size_t) l * cache_capacity_ * bpp;
+        const size_t dst = (size_t) l * n * bpp;
+        std::memcpy(k.data() + dst, kb + src, n * bpp);
+        std::memcpy(v.data() + dst, vb + src, n * bpp);
+    }
+    return true;
+}
+
+bool DenseForward::import_kv(size_t n, const uint8_t* k, const uint8_t* v) {
+    const size_t bpp = kv_bytes_per_pos();
+    if (bpp == 0) return false;
+    if (n > cache_capacity_) grow_cache(n);
+    if (n > cache_capacity_) return false;
+    uint8_t* kb = kv_quantized_ ? k_cache_q_.data() : reinterpret_cast<uint8_t*>(k_cache_.data());
+    uint8_t* vb = kv_quantized_ ? v_cache_q_.data() : reinterpret_cast<uint8_t*>(v_cache_.data());
+    for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
+        const size_t dst = (size_t) l * cache_capacity_ * bpp;
+        const size_t src = (size_t) l * n * bpp;
+        std::memcpy(kb + dst, k + src, n * bpp);
+        std::memcpy(vb + dst, v + src, n * bpp);
+    }
+#ifdef DESIREEIA_CUDA_ENABLED
+    // The device cache is what attention reads on CUDA: bring it in line
+    // with the host copy just filled (whole allocation, same as a growth).
+    if (cuda_kv_ready_ && g_active_backend == DESIREEIA_BACKEND_CUDA) {
+        const size_t bytes = kv_quantized_ ? k_cache_q_.size() : k_cache_.size() * sizeof(float);
+        cuda_kv_ready_ = cuda_kv_cache_upload(kb, vb, bytes);
+    }
+    kv_host_stale_ = false;                       // host and device now hold the same rows
+#endif
+    cache_cols_ = n;
+    return true;
 }
 
 bool DenseForward::load_embd(ModelReader& rd) {
@@ -1406,7 +1528,30 @@ static void cuda_make_resident(MatVec& out, uint32_t rows, uint32_t cols, bool p
 }
 #endif
 
-bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out) {
+// Row reorder of the adjacent-pair RoPE models (see DenseForward::rope_adjacent_).
+// data: rows x row_elems elements of T; heads of head_dim rows each.
+template <typename T>
+static void permute_rope_rows(T* data, size_t rows, size_t row_elems, uint32_t head_dim, uint32_t n_rot) {
+    if (head_dim == 0 || n_rot < 2 || n_rot > head_dim || rows % head_dim != 0) return;
+    const size_t half = n_rot / 2;
+    std::vector<T> tmp((size_t) n_rot * row_elems);
+    for (size_t h0 = 0; h0 < rows; h0 += head_dim) {
+        T* head = data + h0 * row_elems;
+        std::memcpy(tmp.data(), head, tmp.size() * sizeof(T));
+        for (size_t j = 0; j < half; ++j) {
+            std::memcpy(head + j * row_elems, tmp.data() + (2 * j) * row_elems, row_elems * sizeof(T));
+            std::memcpy(head + (half + j) * row_elems, tmp.data() + (2 * j + 1) * row_elems, row_elems * sizeof(T));
+        }
+    }
+}
+
+bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out,
+                               uint32_t rope_head_dim, uint32_t rope_rot) {
+    struct PermScope {
+        DenseForward* self;
+        PermScope(DenseForward* s, uint32_t hd, uint32_t rot) : self(s) { s->perm_head_dim_ = hd; s->perm_rot_ = rot; }
+        ~PermScope() { self->perm_head_dim_ = 0; self->perm_rot_ = 0; }
+    } perm_scope{this, rope_adjacent_ ? rope_head_dim : 0u, rope_adjacent_ ? rope_rot : 0u};
     out.raw.clear();
     out.f.clear();
     out.format = MatVecFormat::Float;
@@ -1424,6 +1569,10 @@ bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_
             }
             out.raw = std::move(raw);
             out.format = fmt;
+            if (perm_head_dim_ > 0) {
+                // Rows are independent byte ranges in every block format.
+                permute_rope_rows(out.raw.data(), rows, out.raw.size() / rows, perm_head_dim_, perm_rot_);
+            }
 #ifdef DESIREEIA_CUDA_ENABLED
             // Upload to device ONCE, only for tensors that enter the
             // persistent weight cache (otherwise they'd be reloaded from
@@ -1432,6 +1581,29 @@ bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_
             // same variable matvec/matvec_batch read for dispatch, set by
             // DenseForward::open() from plan.backend.
             cuda_make_resident(out, rows, cols, loading_persistent_);
+            // The weights now live in VRAM; the host copy only serves CPU
+            // fallbacks. Release it (a whole second copy of the model in
+            // RAM) and keep how to read it back. Not for the embedding table
+            // (read on the CPU for every token) nor MoE experts.
+            static const bool keep_host = std::getenv("DESIREEIA_KEEP_HOST_WEIGHTS") != nullptr;
+            if (!keep_host && out.cuda_qs && loading_persistent_ && cfg_.n_expert == 0 &&
+                name != "token_embd.weight") {
+                ModelReader* src = &rd;
+                const uint32_t hd = perm_head_dim_, rot = perm_rot_;
+                const bool requant = fmt != (MatVecFormat) 0 && quant_type == DESIREEIA_QTYPE_Q6_K &&
+                                     fmt == MatVecFormat::Q4_K;
+                const std::string tensor = name;
+                out.reload = std::make_shared<std::function<bool(std::vector<uint8_t>&)>>(
+                    [src, tensor, rows, cols, hd, rot, requant](std::vector<uint8_t>& dst) {
+                        int qt = 0;
+                        uint64_t ne0 = 0, nr = 0;
+                        if (!src->read_tensor_raw(tensor, dst, qt, ne0, nr)) return false;
+                        if (requant) requantize_q6k_to_q4k(dst, rows, cols);
+                        if (hd > 0) permute_rope_rows(dst.data(), rows, dst.size() / rows, hd, rot);
+                        return true;
+                    });
+                std::vector<uint8_t>().swap(out.raw);
+            }
 #endif
             attach_lora_deltas(name, rows, cols, out);
             return true;
@@ -1460,6 +1632,7 @@ bool DenseForward::load_matrix(ModelReader& rd, const std::string& name, uint32_
     }
 
     if (!rd.read_tensor(name, out.f) || out.f.size() != (size_t) rows * cols) return false;
+    if (perm_head_dim_ > 0) permute_rope_rows(out.f.data(), rows, cols, perm_head_dim_, perm_rot_);
     attach_lora_deltas(name, rows, cols, out);
     return true;
 }
@@ -1477,6 +1650,7 @@ void DenseForward::attach_lora_deltas(const std::string& name, uint32_t rows, ui
         LoraWeight lw;
         lw.a = std::move(a);
         lw.b = std::move(b);
+        if (perm_head_dim_ > 0) permute_rope_rows(lw.b.data(), rows, rank, perm_head_dim_, perm_rot_);
         lw.rank = rank;
         // Classic PEFT alpha/rank scaling times the caller-supplied scale.
         lw.scale = ad.alpha > 0.0f ? ad.user_scale * ad.alpha / (float) rank : ad.user_scale;
@@ -1870,8 +2044,9 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
             }
         }
     } else {
-        if (!load_matrix(rd, p + "attn_q.weight", q_dim, cfg_.n_embd, w.wq)) return false;
-        if (!load_matrix(rd, p + "attn_k.weight", kv_dim, cfg_.n_embd, w.wk)) return false;
+        const uint32_t rot_l = cfg_.layer_n_rot(il);
+        if (!load_matrix(rd, p + "attn_q.weight", q_dim, cfg_.n_embd, w.wq, cfg_.head_dim, rot_l)) return false;
+        if (!load_matrix(rd, p + "attn_k.weight", kv_dim, cfg_.n_embd, w.wk, cfg_.head_dim, rot_l)) return false;
         if (!load_matrix(rd, p + "attn_v.weight", kv_dim, cfg_.n_embd, w.wv)) return false;
         if (!load_matrix(rd, p + "attn_output.weight", cfg_.n_embd, q_dim, w.wo)) return false;
         w.bo.clear();
@@ -1886,6 +2061,10 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
             if (w.bq.size() != q_dim) w.bq.assign(q_dim, 0.0f);
             if (w.bk.size() != kv_dim) w.bk.assign(kv_dim, 0.0f);
             if (w.bv.size() != kv_dim) w.bv.assign(kv_dim, 0.0f);
+            if (rope_adjacent_) {
+                permute_rope_rows(w.bq.data(), q_dim, 1, cfg_.head_dim, rot_l);
+                permute_rope_rows(w.bk.data(), kv_dim, 1, cfg_.head_dim, rot_l);
+            }
         } else {
             w.bq.clear(); w.bk.clear(); w.bv.clear();
         }
@@ -1978,6 +2157,11 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
         const uint32_t k_norm_dim = quirks_.qk_norm_full_width ? kv_dim : cfg_.head_dim;
         if (!rd.read_tensor(p + "attn_q_norm.weight", w.q_norm) || w.q_norm.size() != q_norm_dim) return false;
         if (!rd.read_tensor(p + "attn_k_norm.weight", w.k_norm) || w.k_norm.size() != k_norm_dim) return false;
+        if (rope_adjacent_ && !quirks_.qk_norm_full_width) {
+            // Per-head norm weights follow the reordered head dimensions.
+            permute_rope_rows(w.q_norm.data(), cfg_.head_dim, 1, cfg_.head_dim, cfg_.layer_n_rot(il));
+            permute_rope_rows(w.k_norm.data(), cfg_.head_dim, 1, cfg_.head_dim, cfg_.layer_n_rot(il));
+        }
     } else {
         w.q_norm.clear(); w.k_norm.clear();
     }
@@ -2237,8 +2421,200 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
     trace_vec("proj_out", l, pos, proj_out, n_embd);
 }
 
+#ifdef DESIREEIA_CUDA_ENABLED
+// Prefill on device, LAYER BY LAYER: every chunk of kChunk tokens goes
+// through layer l on the GPU (cuda_layer_forward_batch) before layer l+1.
+// The whole prompt's activations stay in VRAM (8k tokens x 2560 = 85 MB)
+// and each layer's matrices are expanded for the tensor cores once per
+// prompt instead of once per chunk; the intermediates stay per chunk (an
+// 8k prompt through a 10240-wide FFN would be 336 MB per buffer). Causality
+// holds: chunk c of layer l attends to chunks 0..c of layer l, already in
+// the KV cache. Returns false - with x restored - when a layer has a shape
+// the device layer does not cover or a device call fails, so the caller
+// runs its host path instead.
+void DenseForward::sync_host_kv() {
+    if (!kv_host_stale_) return;
+    if (cuda_kv_ready_ && cache_capacity_ > 0) {
+        cuda_kv_cache_download(k_cache_q_.data(), v_cache_q_.data(), k_cache_q_.size());
+    }
+    kv_host_stale_ = false;
+}
+
+bool DenseForward::prefill_cuda_layers(ModelReader& rd, std::vector<float>& x,
+                                       uint32_t col0, size_t n_tokens, bool all_rows) {
+    if (g_active_backend != DESIREEIA_BACKEND_CUDA || !cuda_kv_ready_ || !kv_quantized_) return false;
+    // DESIREEIA_CUDA_KV_MIRROR=1: copy the new rows to the host cache as well.
+    static const bool kv_mirror = std::getenv("DESIREEIA_CUDA_KV_MIRROR") != nullptr;
+    // Same model-level shape as the single-token device layer.
+    if (!quirks_.ffn_gated || cfg_.n_expert != 0 || quirks_.alibi || quirks_.mla ||
+        (quirks_.qk_norm && quirks_.qk_norm_full_width) || quirks_.no_pre_norm ||
+        quirks_.layer_norm || quirks_.parallel_residual || cfg_.clamp_kqv > 0.0f) {
+        return false;
+    }
+    const uint32_t n_layers = cfg_.n_layers;
+    // Every layer is checked BEFORE any runs: a model is either fully on
+    // this path or not at all, never half.
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        const LayerWeights* lw = get_layer(rd, l);
+        if (!lw) return false;
+        if (!(lw->attn_norm2.empty() && lw->attn_norm_b.empty() && lw->ffn_norm_b.empty() &&
+              lw->bo.empty() && lw->ffn_down_b.empty() &&
+              (!quirks_.attn_gate || cuda_layer_ready(lw->attn_gate)) &&
+              cuda_layer_ready(lw->wq) && cuda_layer_ready(lw->wk) && cuda_layer_ready(lw->wv) &&
+              cuda_layer_ready(lw->wo) && cuda_layer_ready(lw->wff_gate) &&
+              cuda_layer_ready(lw->wff_up) && cuda_layer_ready(lw->wff_down) &&
+              lw->wq.lora.empty() && lw->wk.lora.empty() && lw->wv.lora.empty() &&
+              lw->wo.lora.empty() && lw->wff_gate.lora.empty() && lw->wff_up.lora.empty() &&
+              lw->wff_down.lora.empty())) {
+            return false;
+        }
+    }
+
+    const uint32_t n_embd = cfg_.n_embd;
+    const uint32_t q_dim = cfg_.n_head * cfg_.head_dim;
+    const uint32_t kv_dim = cfg_.n_head_kv * cfg_.head_dim;
+    const float rms_eps = quirks_.layer_norm ? cfg_.norm_eps : cfg_.rms_eps;
+    const size_t pos_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
+
+    // The input embeddings are kept until the whole prompt succeeds: a
+    // failure on a later chunk falls back to the host path, which must
+    // start again from the embeddings, not from chunks already run.
+    // x on the host is written only by the final download, and only from
+    // row x_row0 on: those rows are what a failure has to restore (the last
+    // one unless every row's logits are wanted - 10 KB instead of the whole
+    // prompt's activations).
+    const uint32_t x_row0 = all_rows ? 0u : (uint32_t) (n_tokens - 1);
+    const std::vector<float> x_in(x.begin() + (size_t) x_row0 * cfg_.n_embd, x.end());
+    auto restore_x = [&] { std::copy(x_in.begin(), x_in.end(), x.begin() + (size_t) x_row0 * cfg_.n_embd); };
+
+    // Chunk size from the GPU's SM count (cuda_prefill_chunk_tokens);
+    // DESIREEIA_CUDA_PREFILL_CHUNK overrides it.
+    static const size_t kChunk = [] {
+        const char* e = std::getenv("DESIREEIA_CUDA_PREFILL_CHUNK");
+        const long v = e ? std::atol(e) : 0;
+        return v >= 128 ? (size_t) v : (size_t) cuda_prefill_chunk_tokens();
+    }();
+    const size_t n_chunks = (n_tokens + kChunk - 1) / kChunk;
+    // RoPE table for EVERY prompt position, rebuilt only when the layer's
+    // RoPE parameters differ from the previous layer's (sliding-window
+    // models alternate two sets; the rest use one for the whole model).
+    std::vector<float> rope_one, rope_tab;
+    float last_theta = -1.0f, last_scale = -1.0f;
+    uint32_t last_rot = 0;
+    // Distinct RoPE tables of this prompt, one device slot each (up to 4):
+    // built and sent on first use only. A fifth distinct table (no model
+    // has one) goes through slot 3, rebuilt whenever it changes.
+    struct RopeKey { float theta, scale; uint32_t rot; };
+    std::vector<RopeKey> rope_keys;
+    int rope_slot = 0;
+    for (uint32_t l = 0; l < n_layers; ++l) {
+        if (prefill_interrupted(l)) { restore_x(); return false; }
+        const LayerWeights* lw = get_layer(rd, l);
+        if (!lw) { restore_x(); return false; }
+
+        const bool do_rope = !quirks_.no_rope && (!quirks_.rope_only_swa || cfg_.layer_is_swa(l));
+        const uint32_t n_rot = cfg_.layer_n_rot(l);
+        const float theta = cfg_.layer_rope_theta(l), rscale = cfg_.layer_rope_scale(l);
+        bool upload_rope = false;
+        if (do_rope && (theta != last_theta || rscale != last_scale || n_rot != last_rot)) {
+            int found = -1;
+            for (size_t i = 0; i < rope_keys.size(); ++i) {
+                if (rope_keys[i].theta == theta && rope_keys[i].scale == rscale && rope_keys[i].rot == n_rot) {
+                    found = (int) i;
+                }
+            }
+            if (found >= 0) {
+                rope_slot = found;                     // already on the device
+            } else {
+                rope_tab.resize(n_tokens * n_rot);
+                for (size_t t = 0; t < n_tokens; ++t) {
+                    rope_fill(rope_one, l, n_rot, col0 + (uint32_t) t, theta, rscale);
+                    std::memcpy(rope_tab.data() + t * n_rot, rope_one.data(), n_rot * sizeof(float));
+                }
+                if (rope_keys.size() < 4) {
+                    rope_slot = (int) rope_keys.size();
+                    rope_keys.push_back({ theta, rscale, n_rot });
+                } else {
+                    rope_slot = 3;
+                    rope_keys[3] = { theta, rscale, n_rot };
+                }
+                upload_rope = true;
+            }
+            last_theta = theta; last_scale = rscale; last_rot = n_rot;
+        }
+
+        for (size_t ci = 0; ci < n_chunks; ++ci) {
+            const size_t c0 = ci * kChunk;
+            const uint32_t m = (uint32_t) std::min(kChunk, n_tokens - c0);
+
+            CudaLayerBatchArgs a{};
+            a.wq_qs = lw->wq.cuda_qs.get();          a.wq_scale = lw->wq.cuda_scale.get();
+            a.wk_qs = lw->wk.cuda_qs.get();          a.wk_scale = lw->wk.cuda_scale.get();
+            a.wv_qs = lw->wv.cuda_qs.get();          a.wv_scale = lw->wv.cuda_scale.get();
+            a.wo_qs = lw->wo.cuda_qs.get();          a.wo_scale = lw->wo.cuda_scale.get();
+            a.wgate_qs = lw->wff_gate.cuda_qs.get(); a.wgate_scale = lw->wff_gate.cuda_scale.get();
+            a.wup_qs = lw->wff_up.cuda_qs.get();     a.wup_scale = lw->wff_up.cuda_scale.get();
+            a.wdown_qs = lw->wff_down.cuda_qs.get(); a.wdown_scale = lw->wff_down.cuda_scale.get();
+            if (quirks_.attn_gate) {
+                a.wag_qs = lw->attn_gate.cuda_qs.get();
+                a.wag_scale = lw->attn_gate.cuda_scale.get();
+                a.fmt_ag = cuda_fmt_of(lw->attn_gate.format);
+            }
+            a.bq = (quirks_.qkv_bias && !lw->bq.empty()) ? lw->bq.data() : nullptr;
+            a.bk = (quirks_.qkv_bias && !lw->bk.empty()) ? lw->bk.data() : nullptr;
+            a.bv = (quirks_.qkv_bias && !lw->bv.empty()) ? lw->bv.data() : nullptr;
+            a.attn_norm_w = lw->attn_norm.data();
+            a.ffn_norm_w = lw->ffn_norm.data();
+            a.q_norm_w = (quirks_.qk_norm && !lw->q_norm.empty()) ? lw->q_norm.data() : nullptr;
+            a.k_norm_w = (quirks_.qk_norm && !lw->k_norm.empty()) ? lw->k_norm.data() : nullptr;
+            a.post_attn_norm_w = (quirks_.sandwich_norm && !lw->post_attn_norm.empty())
+                ? lw->post_attn_norm.data() : nullptr;
+            a.post_ffn_norm_w = (quirks_.sandwich_norm && !lw->post_ffn_norm.empty())
+                ? lw->post_ffn_norm.data() : nullptr;
+            a.x = x.data();
+            a.x_out = x.data();
+            a.x_out_row0 = x_row0;
+            a.rope_caches = do_rope ? rope_tab.data() : nullptr;
+            a.upload_rope = (upload_rope && ci == 0) ? 1 : 0;
+            a.rope_slot = rope_slot;
+            a.host_kcache = kv_mirror ? k_cache_q_.data() : nullptr;
+            a.host_vcache = kv_mirror ? v_cache_q_.data() : nullptr;
+            a.n_embd = n_embd; a.q_dim = q_dim; a.kv_dim = kv_dim; a.n_ff = cfg_.n_ff;
+            a.n_head = cfg_.n_head; a.n_head_kv = cfg_.n_head_kv;
+            a.heads_per_kv = cfg_.n_head / cfg_.n_head_kv;
+            a.head_dim = cfg_.head_dim; a.n_rot = n_rot;
+            a.kv_layer_off = (size_t) l * cache_capacity_ * pos_bytes;
+            a.pos0 = col0 + (uint32_t) c0;
+            a.n_tok = m;
+            a.x_row0 = (uint32_t) c0;
+            a.n_total = (uint32_t) n_tokens;
+            a.n_swa = (cfg_.n_swa > 0 && cfg_.layer_is_swa(l)) ? cfg_.n_swa : 0u;
+            a.rms_eps = rms_eps;
+            a.act_gelu = quirks_.gelu_tanh ? 1 : 0;
+            a.fmt_q = cuda_fmt_of(lw->wq.format);
+            a.fmt_k = cuda_fmt_of(lw->wk.format);
+            a.fmt_v = cuda_fmt_of(lw->wv.format);
+            a.fmt_o = cuda_fmt_of(lw->wo.format);
+            a.fmt_gate = cuda_fmt_of(lw->wff_gate.format);
+            a.fmt_up = cuda_fmt_of(lw->wff_up.format);
+            a.fmt_down = cuda_fmt_of(lw->wff_down.format);
+            a.upload_x = (l == 0 && ci == 0) ? 1 : 0;
+            a.download_x = (l + 1 == n_layers && ci + 1 == n_chunks) ? 1 : 0;
+            a.prepare_weights = (ci == 0) ? 1 : 0;
+            if (!kv_mirror) kv_host_stale_ = true;    // the device rows are ahead from here on
+            if (cuda_layer_forward_batch(a) != DESIREEIA_OK) {
+                restore_x();
+                return false;
+            }
+        }
+    }
+    return true;
+}
+#endif
+
 bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         std::vector<float>& last_logits, std::vector<float>* all_logits) {
+    cancelled_ = false;
     last_fail_.clear();
     if (n_tokens == 0 || tokens == nullptr) { last_fail_ = "bad args to step"; return false; }
     if (tok_embd_.empty()) { last_fail_ = "tok_embd_ empty"; return false; }
@@ -2259,7 +2635,53 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
     }
 
     std::vector<float> x((size_t) n_tokens * n_embd);
-    for (size_t p = 0; p < n_tokens; ++p) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    // One decoded token with every layer on device: the output norm and head
+    // run there too, right behind the last layer (cuda_head_forward), and x
+    // never comes back to the host.
+    static const bool head_dev_on = std::getenv("DESIREEIA_CUDA_NO_HEAD_DEVICE") == nullptr;
+    const MatVec& head_m = out_head_.empty() ? tok_embd_ : out_head_;
+    const bool head_dev = head_dev_on && n_tokens == 1 && !all_logits &&
+        g_active_backend == DESIREEIA_BACKEND_CUDA && !quirks_.layer_norm && out_norm_b_.empty() &&
+        head_m.cuda_qs && head_m.lora.empty() &&
+        (head_m.format == MatVecFormat::Q8_0 ? (bool) head_m.cuda_scale : cuda_fmt_of(head_m.format) != 0);
+    uint32_t layers_on_dev = 0;
+    bool last_layer_on_dev = false;
+#endif
+    // Long prompts without substituted embeddings: rows dequantized on the
+    // worker threads (one thread took ~45 ms for 8k tokens while the GPU
+    // waited). Same per-row arithmetic, so the same bits.
+    const bool embed_par = embd_override_.empty() && n_tokens >= 256;
+    if (embed_par) {
+        for (size_t p = 0; p < n_tokens; ++p) {
+            const int32_t t = tokens[p];
+            if (t < 0 || (uint32_t) t >= cfg_.n_vocab) { last_fail_ = "token out of range t=" + std::to_string(t) + " n_vocab=" + std::to_string(cfg_.n_vocab); return false; }
+        }
+        constexpr size_t kSlices = 64;
+        std::atomic<bool> embed_ok{true};
+        parallel_units(kSlices, [&](size_t s0, size_t s1) {
+            for (size_t sl = s0; sl < s1; ++sl) {
+                const size_t b = n_tokens * sl / kSlices, e = n_tokens * (sl + 1) / kSlices;
+                for (size_t p = b; p < e; ++p) {
+                    float* xp = x.data() + p * n_embd;
+                    if (!embed_row((uint32_t) tokens[p], xp)) { embed_ok = false; return; }
+                    if (quirks_.embd_scale_sqrt) {
+                        const float sc = sqrtf((float) n_embd);
+                        for (uint32_t i = 0; i < n_embd; ++i) xp[i] *= sc;
+                    }
+                    if (!pos_embd_.empty()) {
+                        const uint32_t pos = col0 + (uint32_t) p;
+                        if (pos < n_ctx_train_) {
+                            const float* pe = pos_embd_.data() + (size_t) pos * n_embd;
+                            for (uint32_t i = 0; i < n_embd; ++i) xp[i] += pe[i];
+                        }
+                    }
+                }
+            }
+        });
+        if (!embed_ok) { last_fail_ = "embed_row failed"; return false; }
+    }
+    for (size_t p = 0; p < n_tokens && !embed_par; ++p) {
         const int32_t t = tokens[p];
         if (t < 0 || (uint32_t) t >= cfg_.n_vocab) { last_fail_ = "token out of range t=" + std::to_string(t) + " n_vocab=" + std::to_string(cfg_.n_vocab); return false; }
         bool overridden = false;
@@ -2301,7 +2723,9 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
         }
     }
 
-    std::vector<float> xn((size_t) n_tokens * n_embd);
+    // Normalized input of the host layer path (not needed when the whole
+    // prefill runs on the device: sized below once that is known).
+    std::vector<float> xn;
     // Only if lw->attn_norm2 is present (falcon-40B, see the note on
     // LayerWeights::attn_norm2): Q/K/V input separate from the FFN's.
     std::vector<float> xn_attn;
@@ -2394,7 +2818,18 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         ffn_all, ffn_gate_all, fout_all;
     std::vector<float> gate_all;      // DenseQuirks::attn_gate, n_head per token
     std::vector<float> rope_cache_b;  // cos/sin for the batch path
-    if (n_tokens > 1) {
+
+    // Whole prefill on device, chunk by chunk, when every layer has the
+    // shape the device layer covers (see prefill_cuda_layers). On success
+    // the layer loop below is skipped, and so are its whole-prompt host
+    // buffers: for an 8k-token prompt on a 4B model those were ~1.2 GB of
+    // RAM allocated just to be filled one matrix at a time.
+#ifdef DESIREEIA_CUDA_ENABLED
+    const bool prefill_done = n_tokens > 1 && prefill_cuda_layers(rd, x, col0, n_tokens, all_logits != nullptr);
+#else
+    const bool prefill_done = false;
+#endif
+    if (n_tokens > 1 && !prefill_done) {
         q_all.resize((size_t) n_tokens * q_dim);
         k_all.resize((size_t) n_tokens * kv_dim);
         v_all.resize((size_t) n_tokens * kv_dim);
@@ -2408,7 +2843,13 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
         }
     }
 
-    for (uint32_t l = 0; l < n_layers; ++l) {
+    if (!prefill_done) xn.resize((size_t) n_tokens * n_embd);
+    if (cancelled_) return false;                 // stopped inside the device prefill
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (n_tokens > 1 && !prefill_done) sync_host_kv();   // the host path reads the host cache
+#endif
+    for (uint32_t l = 0; l < n_layers && !prefill_done; ++l) {
+        if (n_tokens > 1 && prefill_interrupted(l)) return false;
         const LayerWeights* lw = get_layer(rd, l);
         if (!lw) { if (last_fail_.empty()) last_fail_ = "get_layer null l=" + std::to_string(l); return false; }
 
@@ -2508,8 +2949,15 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             continue;
         }
 
+        // Per-token work between the big products (norms, bias, RoPE, KV
+        // writes, activations, residuals): independent across tokens, spread
+        // over the pool. On one thread it was ~20% of a CPU prefill.
+        auto for_tokens = [&](bool par, auto&& body) {
+            if (par && n_tokens > 1) parallel_units(n_tokens, body);
+            else body(0, n_tokens);
+        };
         if (n_tokens > 1) {
-            for (size_t p = 0; p < n_tokens; ++p) {
+            for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                 if (quirks_.no_pre_norm) {
                     std::memcpy(xn.data() + p * n_embd, x.data() + p * n_embd, n_embd * sizeof(float));
                 } else {
@@ -2517,15 +2965,15 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                             lw->attn_norm_b.empty() ? nullptr : lw->attn_norm_b.data(),
                             xn.data() + p * n_embd, n_embd, rms_eps);
                 }
-            }
+            } });
             const float* attn_in_all = xn.data();
             if (!lw->attn_norm2.empty()) {
                 xn_attn.resize((size_t) n_tokens * n_embd);
-                for (size_t p = 0; p < n_tokens; ++p) {
+                for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                     norm_vec(quirks_.layer_norm, x.data() + p * n_embd, lw->attn_norm2.data(),
                             lw->attn_norm2_b.empty() ? nullptr : lw->attn_norm2_b.data(),
                             xn_attn.data() + p * n_embd, n_embd, rms_eps);
-                }
+                } });
                 attn_in_all = xn_attn.data();
             }
             matvec_batch(lw->wq, q_dim, n_embd, attn_in_all, n_tokens, q_all.data());
@@ -2547,7 +2995,15 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 ~MirrorGuard() { flag = false; }
             } mirror_guard{kv_mirror_deferred_};
 #endif
-            for (size_t p = 0; p < n_tokens; ++p) {
+#ifdef DESIREEIA_CUDA_ENABLED
+            // The float cache on CUDA mirrors every position to the device from
+            // write_kv_cache: that must stay on one thread.
+            const bool parallel_kv = kv_quantized_ || !cuda_kv_ready_;
+#else
+            const bool parallel_kv = true;
+#endif
+            for_tokens(parallel_kv, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
+                thread_local std::vector<float> rope_local;
                 const uint32_t pos = col0 + (uint32_t) p;
                 float* qp = q_all.data() + p * q_dim;
                 float* kp = k_all.data() + p * kv_dim;
@@ -2584,17 +3040,17 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 // call — Qcur/Kcur stay unchanged.
                 if (!quirks_.no_rope && (!quirks_.rope_only_swa || cfg_.layer_is_swa(l))) {
                     const uint32_t n_rot_l = cfg_.layer_n_rot(l);
-                    rope_cache_init(rope_cache_b, n_rot_l, pos, rope_th, rope_sc);
+                    rope_fill(rope_local, l, n_rot_l, pos, rope_th, rope_sc);
                     for (uint32_t h = 0; h < n_head; ++h) {
-                        rope_neox_cached(qp + (size_t) h * cfg_.head_dim, n_rot_l, rope_cache_b.data());
+                        rope_neox_cached(qp + (size_t) h * cfg_.head_dim, n_rot_l, rope_local.data());
                     }
                     for (uint32_t h = 0; h < cfg_.n_head_kv; ++h) {
-                        rope_neox_cached(kp + (size_t) h * cfg_.head_dim, n_rot_l, rope_cache_b.data());
+                        rope_neox_cached(kp + (size_t) h * cfg_.head_dim, n_rot_l, rope_local.data());
                     }
                 }
 
                 write_kv_cache(l, pos, kp, vp);
-            }
+            } });
 
             // Attention for the whole batch in ONE dispatch over every
             // (token, head) pair.
@@ -2671,7 +3127,22 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             }
             if (!cuda_attn_batch_done) {
 #endif
-            const size_t attn_units = n_tokens * (size_t) n_head;
+            // Tiled attention (core/attn_cpu.cpp): each K/V tile dequantized
+            // once for every query head that shares it. The per-token loop
+            // below stays for ALiBi and the float cache.
+            static const bool tiled_cpu_attn = std::getenv("DESIREEIA_NO_TILED_CPU_ATTN") == nullptr;
+            bool cpu_tiled_done = false;
+            if (tiled_cpu_attn && kv_quantized_ && !quirks_.alibi) {
+                const size_t row_bytes = kv_q_row_bytes_;
+                const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
+                const size_t layer_off = (size_t) l * cache_capacity_ * pos_bytes;
+                const bool is_swa_layer = cfg_.n_swa > 0 && cfg_.layer_is_swa(l);
+                cpu_tiled_done = attention_prefill_cpu_q8(
+                    q_all.data(), attn_out_all.data(), (uint32_t) n_tokens, n_head, heads_per_kv,
+                    cfg_.head_dim, q_dim, k_cache_q_.data() + layer_off, v_cache_q_.data() + layer_off,
+                    row_bytes, pos_bytes, col0, is_swa_layer ? cfg_.n_swa : 0u, inv_d) == DESIREEIA_OK;
+            }
+            const size_t attn_units = cpu_tiled_done ? 0 : n_tokens * (size_t) n_head;
             parallel_units(attn_units, [&](size_t u_begin, size_t u_end) {
                 // One scratch buffer per worker range, not per unit.
                 std::vector<float> scores_buf((size_t) col0 + n_tokens, 0.0f);
@@ -2745,7 +3216,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 gate_all.resize((size_t) n_tokens * n_head);
                 matvec_batch(lw->attn_gate, n_head, n_embd, attn_in_all, n_tokens,
                              gate_all.data());
-                for (size_t p = 0; p < n_tokens; ++p) {
+                for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                     float* aout = attn_out_all.data() + p * q_dim;
                     const float* gp = gate_all.data() + p * n_head;
                     for (uint32_t h = 0; h < n_head; ++h) {
@@ -2753,11 +3224,11 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         float* oh = aout + (size_t) h * cfg_.head_dim;
                         for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] *= g;
                     }
-                }
+                } });
             }
 
             matvec_batch(lw->wo, n_embd, q_dim, attn_out_all.data(), n_tokens, proj_all.data());
-            for (size_t p = 0; p < n_tokens; ++p) {
+            for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                 float* projp = proj_all.data() + p * n_embd;
                 const float* xp = x.data() + p * n_embd;
                 if (!lw->bo.empty()) {
@@ -2783,7 +3254,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                                 ffn_xn_all.data() + p * n_embd, n_embd, rms_eps);
                     }
                 }
-            }
+            } });
 
             if (cfg_.n_expert > 0) {
                 // MoE branch: per-token gating (depends on the router for
@@ -2819,7 +3290,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             } else if (quirks_.ffn_gated) {
                 matvec_batch(lw->wff_up, cfg_.n_ff, n_embd, ffn_xn_all.data(), n_tokens, ffn_all.data());
                 matvec_batch(lw->wff_gate, cfg_.n_ff, n_embd, ffn_xn_all.data(), n_tokens, ffn_gate_all.data());
-                for (size_t p = 0; p < n_tokens; ++p) {
+                for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                     float* ffnp = ffn_all.data() + p * cfg_.n_ff;
                     float* ffngp = ffn_gate_all.data() + p * cfg_.n_ff;
                     if (quirks_.gelu_tanh) {
@@ -2827,9 +3298,9 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     } else {
                         for (uint32_t i = 0; i < cfg_.n_ff; ++i) ffnp[i] = silu(ffngp[i]) * ffnp[i];
                     }
-                }
+                } });
                 matvec_batch(lw->wff_down, n_embd, cfg_.n_ff, ffn_all.data(), n_tokens, fout_all.data());
-                for (size_t p = 0; p < n_tokens; ++p) {
+                for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                     float* foutp = fout_all.data() + p * n_embd;
                     const float* projp = proj_all.data() + p * n_embd;
                     if (quirks_.sandwich_norm) {
@@ -2845,13 +3316,13 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     } else {
                         for (uint32_t i = 0; i < n_embd; ++i) xn2[i] = foutp[i] + projp[i];
                     }
-                }
+                } });
             } else {
                 // Non-gated FFN: a single up projection [+bias] -> activation
                 // -> down [+bias]. No ffn_gate, no gate*up product.
                 matvec_batch(lw->wff_up, cfg_.n_ff, n_embd, ffn_xn_all.data(), n_tokens, ffn_all.data());
                 const bool has_up_b = !lw->ffn_up_b.empty();
-                for (size_t p = 0; p < n_tokens; ++p) {
+                for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                     float* ffnp = ffn_all.data() + p * cfg_.n_ff;
                     if (has_up_b) for (uint32_t i = 0; i < cfg_.n_ff; ++i) ffnp[i] += lw->ffn_up_b[i];
                     if (quirks_.ffn_act == DenseQuirks::PlainFfnAct::ReluSqr) {
@@ -2859,10 +3330,10 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     } else {
                         for (uint32_t i = 0; i < cfg_.n_ff; ++i) ffnp[i] = gelu_tanh(ffnp[i]);
                     }
-                }
+                } });
                 matvec_batch(lw->wff_down, n_embd, cfg_.n_ff, ffn_all.data(), n_tokens, fout_all.data());
                 const bool has_down_b = !lw->ffn_down_b.empty();
-                for (size_t p = 0; p < n_tokens; ++p) {
+                for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                     float* foutp = fout_all.data() + p * n_embd;
                     if (has_down_b) for (uint32_t i = 0; i < n_embd; ++i) foutp[i] += lw->ffn_down_b[i];
                     const float* projp = proj_all.data() + p * n_embd;
@@ -2871,7 +3342,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     }
                     float* xn2 = x.data() + p * n_embd;
                     for (uint32_t i = 0; i < n_embd; ++i) xn2[i] = foutp[i] + projp[i];
-                }
+                } });
             }
             continue;
         }
@@ -2917,7 +3388,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 const bool uniform_layers = cfg_.swa_pattern == 0 && cfg_.swa_mask.empty();
                 const bool send_dyn = (l == 0) || !uniform_layers;
                 if (do_rope && send_dyn) {
-                    rope_cache_init(rope_cache, cfg_.layer_n_rot(l), pos, rope_th, rope_sc);
+                    rope_fill(rope_cache, l, cfg_.layer_n_rot(l), pos, rope_th, rope_sc);
                 }
                 const size_t pos_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
                 const bool swa_here = cfg_.n_swa > 0 && cfg_.layer_is_swa(l);
@@ -2969,10 +3440,52 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 // x crosses the whole stack on device: uploaded once before
                 // the first layer, read back once after the last.
                 la.upload_x = (l == 0) ? 1 : 0;
-                la.download_x = (l + 1 == cfg_.n_layers) ? 1 : 0;
+                if (dev_token_in_) {
+                    la.x_from_token = 1;
+                    la.embd_qs = tok_embd_.cuda_qs.get();
+                    la.embd_scale = tok_embd_.cuda_scale.get();
+                    la.embd_mul = quirks_.embd_scale_sqrt ? sqrtf((float) n_embd) : 0.0f;
+                }
+                la.download_x = (l + 1 == cfg_.n_layers && !head_dev) ? 1 : 0;
                 la.upload_dyn = send_dyn ? 1 : 0;
-                if (cuda_layer_forward(la) == DESIREEIA_OK) continue;
+                if (!uniform_layers) {
+                    // Every layer's pos/window and RoPE table, built with the
+                    // first layer and sent with it in one copy each.
+                    uint32_t stride = 0;
+                    for (uint32_t l2 = 0; l2 < cfg_.n_layers; ++l2) stride = std::max(stride, cfg_.layer_n_rot(l2));
+                    if (l == 0) {
+                        dev_dyn_all_.assign((size_t) 2 * cfg_.n_layers, 0u);
+                        dev_rope_all_.assign((size_t) cfg_.n_layers * stride, 0.0f);
+                        std::vector<float> one;
+                        for (uint32_t l2 = 0; l2 < cfg_.n_layers; ++l2) {
+                            const bool swa2 = cfg_.n_swa > 0 && cfg_.layer_is_swa(l2);
+                            dev_dyn_all_[2 * l2 + 0] = pos;
+                            dev_dyn_all_[2 * l2 + 1] = swa2 ? ((pos + 1 > cfg_.n_swa) ? (pos + 1 - cfg_.n_swa) : 0) : 0;
+                            if (!quirks_.rope_only_swa || cfg_.layer_is_swa(l2)) {
+                                rope_fill(one, l2, cfg_.layer_n_rot(l2), pos, cfg_.layer_rope_theta(l2),
+                                          cfg_.layer_rope_scale(l2));
+                                std::memcpy(dev_rope_all_.data() + (size_t) l2 * stride, one.data(),
+                                            std::min(one.size(), (size_t) stride) * sizeof(float));
+                            }
+                        }
+                    }
+                    la.dyn_all = dev_dyn_all_.data();
+                    la.rope_all = dev_rope_all_.data();
+                    la.n_slots = cfg_.n_layers;
+                    la.rope_stride = stride;
+                    la.layer_slot = l;
+                }
+                if (cuda_layer_forward(la) == DESIREEIA_OK) {
+                    ++layers_on_dev;
+                    last_layer_on_dev = l + 1 == cfg_.n_layers;
+                    continue;
+                }
             }
+            if (dev_token_in_) {                  // its input exists only on the device
+                last_fail_ = "pipelined decode: layer " + std::to_string(l) + " left the device path";
+                return false;
+            }
+            sync_host_kv();                       // this layer runs on the host path
 #endif
             { ScopedTimer t(profile_counters().ns_ser_norm);
               if (quirks_.no_pre_norm) {
@@ -3020,7 +3533,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 const bool uniform_layers = cfg_.swa_pattern == 0 && cfg_.swa_mask.empty();
                 const bool send_dyn = (l == 0) || !uniform_layers;
                 if (do_rope && send_dyn) {
-                    rope_cache_init(rope_cache, cfg_.layer_n_rot(l), pos, rope_th, rope_sc);
+                    rope_fill(rope_cache, l, cfg_.layer_n_rot(l), pos, rope_th, rope_sc);
                 }
 
                 const size_t pos_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
@@ -3110,7 +3623,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             // global layers, no rope call.
             if (!quirks_.rope_only_swa || cfg_.layer_is_swa(l)) {
                 const uint32_t n_rot_l = cfg_.layer_n_rot(l);
-                rope_cache_init(rope_cache, n_rot_l, pos, rope_th, rope_sc);
+                rope_fill(rope_cache, l, n_rot_l, pos, rope_th, rope_sc);
                 for (uint32_t h = 0; h < n_head; ++h) {
                     rope_neox_cached(q.data() + (size_t) h * cfg_.head_dim, n_rot_l, rope_cache.data());
                 }
@@ -3411,6 +3924,51 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
 
     cache_cols_ = col0 + n_tokens;
 
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (head_dev && last_layer_on_dev) {
+        if (layers_on_dev == n_layers) {
+            const int hf = head_m.format == MatVecFormat::Q8_0 ? 0 : cuda_fmt_of(head_m.format);
+            // Only the largest logits (step_candidates): a positive scale keeps
+            // their order, so it is applied to them afterwards.
+            if (sample_args_ && cfg_.logit_scale >= 0.0f) {
+                CudaSampleArgs sa = *sample_args_;
+                sa.logit_scale = cfg_.logit_scale;
+                const int rs = cuda_head_forward_sample(hf, head_m.cuda_qs.get(), head_m.cuda_scale.get(),
+                                                        out_norm_.data(), n_embd, rms_eps, cfg_.n_vocab, sa);
+                if (rs == DESIREEIA_OK) { sample_launched_ = true; return true; }
+                if (rs != DESIREEIA_ERR_NOT_SUPPORTED || dev_token_in_) {
+                    last_fail_ = "output head sampling on device failed";
+                    return false;
+                }
+            }
+            if (topk_req_ > 0 && cfg_.logit_scale >= 0.0f) {
+                topk_ids_.resize(topk_req_);
+                topk_vals_.resize(topk_req_);
+                const int rk = cuda_head_forward_topk(hf, head_m.cuda_qs.get(), head_m.cuda_scale.get(),
+                                                      out_norm_.data(), n_embd, rms_eps, cfg_.n_vocab, topk_req_,
+                                                      topk_ids_.data(), topk_vals_.data());
+                if (rk == DESIREEIA_OK) {
+                    if (cfg_.logit_scale != 0.0f) for (float& v : topk_vals_) v *= cfg_.logit_scale;
+                    topk_done_ = true;
+                    return true;
+                }
+                if (rk != DESIREEIA_ERR_NOT_SUPPORTED) { last_fail_ = "output head on device failed"; return false; }
+            }
+            last_logits.resize(cfg_.n_vocab);
+            const int rc = cuda_head_forward(hf, head_m.cuda_qs.get(), head_m.cuda_scale.get(), out_norm_.data(),
+                                             n_embd, rms_eps, cfg_.n_vocab, last_logits.data());
+            if (rc == DESIREEIA_OK) {
+                if (cfg_.logit_scale != 0.0f) for (float& v : last_logits) v *= cfg_.logit_scale;
+                return true;
+            }
+            // Anything but "not supported" failed after touching x on device.
+            if (rc != DESIREEIA_ERR_NOT_SUPPORTED) { last_fail_ = "output head on device failed"; return false; }
+        }
+        // The last layer left x on device only: bring it back for the host path.
+        if (cuda_fetch_x(x.data(), n_embd) != DESIREEIA_OK) { last_fail_ = "cannot read x back from device"; return false; }
+    }
+#endif
+
     const float* xlast = x.data() + (size_t) (n_tokens - 1) * n_embd;
     norm_vec(quirks_.layer_norm, xlast, out_norm_.data(),
             out_norm_b_.empty() ? nullptr : out_norm_b_.data(),
@@ -3450,6 +4008,59 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
     }
     return true;
 }
+
+int DenseForward::step_candidates(ModelReader& rd, const int32_t* tokens, size_t n_tokens, uint32_t kk,
+                                  std::vector<int32_t>& ids, std::vector<float>& vals, std::vector<float>& logits) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    static const bool on = std::getenv("DESIREEIA_CUDA_NO_GPU_TOPK") == nullptr;
+    if (!on || n_tokens != 1 || kk == 0 || kk > 256 || g_active_backend != DESIREEIA_BACKEND_CUDA) return 0;
+    topk_req_ = kk;
+    topk_done_ = false;
+    const bool ok = step(rd, tokens, n_tokens, logits, nullptr);
+    topk_req_ = 0;
+    if (!ok) return -1;
+    if (!topk_done_) return 2;
+    ids.swap(topk_ids_);
+    vals.swap(topk_vals_);
+    return 1;
+#else
+    (void) rd; (void) tokens; (void) n_tokens; (void) kk; (void) ids; (void) vals; (void) logits;
+    return 0;
+#endif
+}
+
+#ifdef DESIREEIA_CUDA_ENABLED
+bool DenseForward::pipeline_supported() const {
+    static const bool on = std::getenv("DESIREEIA_NO_PIPELINE") == nullptr;
+    if (!on || g_active_backend != DESIREEIA_BACKEND_CUDA || !cuda_kv_ready_ || !kv_quantized_) return false;
+    if (std::getenv("DESIREEIA_CUDA_NO_HEAD_DEVICE") || std::getenv("DESIREEIA_CUDA_NO_LAYER")) return false;
+    const MatVec& head_m = out_head_.empty() ? tok_embd_ : out_head_;
+    const bool head_ok = !quirks_.layer_norm && out_norm_b_.empty() && head_m.cuda_qs && head_m.lora.empty() &&
+        (head_m.format == MatVecFormat::Q8_0 ? (bool) head_m.cuda_scale : cuda_fmt_of(head_m.format) != 0) &&
+        cfg_.logit_scale >= 0.0f;
+    const bool embd_ok = tok_embd_.format == MatVecFormat::Q8_0 && tok_embd_.cuda_qs && tok_embd_.cuda_scale &&
+        tok_embd_.lora.empty() && pos_embd_.empty() && !quirks_.embd_norm && embd_override_.empty() &&
+        cfg_.n_embd % 32 == 0;
+    // The model-level shape of the fused device layer (per-layer checks
+    // are made at every step; a layer that falls off fails the step).
+    const bool layer_ok = quirks_.ffn_gated && cfg_.n_expert == 0 && !quirks_.alibi && !quirks_.mla &&
+        !(quirks_.qk_norm && quirks_.qk_norm_full_width) && !quirks_.no_pre_norm && !quirks_.layer_norm &&
+        !quirks_.parallel_residual && cfg_.clamp_kqv <= 0.0f;
+    return head_ok && embd_ok && layer_ok;
+}
+
+int DenseForward::decode_launch(ModelReader& rd, int32_t token, const CudaSampleArgs& s, std::vector<float>& logits) {
+    const int32_t t = token < 0 ? 0 : token;       // a valid id for the host-side bookkeeping
+    dev_token_in_ = token < 0;
+    sample_args_ = &s;
+    sample_launched_ = false;
+    const bool ok = step(rd, &t, 1, logits, nullptr);
+    dev_token_in_ = false;
+    sample_args_ = nullptr;
+    if (!ok) return -1;
+    return sample_launched_ ? 1 : 0;
+}
+#endif
 
 int32_t DenseForward::argmax(const std::vector<float>& v) {
     int32_t best = 0;

@@ -22,8 +22,9 @@ def _hw(free_mb=11_000):
     return HardwareProfile(16, True, True, False, False, 1, 32_000, free_mb, 0, 0, False, False)
 
 
-def _plan(ram_mb=11_000):
-    return ExecutionPlan(backend=InferenceBackend.CUDA, thread_count=16, ram_budget_mb=ram_mb)
+def _plan(ram_mb=11_000, kv=False):
+    return ExecutionPlan(backend=InferenceBackend.CUDA, thread_count=16, ram_budget_mb=ram_mb,
+                         kv_compression=kv)
 
 
 def _spark(trained=1_048_576, size=2_600_224_352):
@@ -40,7 +41,8 @@ def test_sampling_is_never_greedy():
 
 
 def test_comfortable_machine_gets_target_context_and_full_replies():
-    c = compute_configuration(_hw(), _plan(), _spark())
+    # Q8_0 KV cache, the engine default since 0.1.2.
+    c = compute_configuration(_hw(), _plan(kv=True), _spark())
     assert c.context_size == TARGET_CONTEXT_SIZE
     assert c.max_tokens == DEFAULT_MAX_TOKENS
 
@@ -63,8 +65,16 @@ def test_moderate_memory_context_is_bounded_and_aligned():
     assert c.context_size % 1024 == 0
 
 
-def test_kv_bytes_per_token_matches_header_arithmetic():
-    assert _spark().kv_bytes_per_token == 147_456
+def test_kv_bytes_per_token_matches_engine_storage():
+    # 36 layers * 4 kv heads * (256 + 256) = 73,728 values per token
+    assert _spark().kv_bytes_per_token == 294_912               # float32
+    assert _spark().kv_bytes_per_token_for(True) == 78_336      # Q8_0: 34 bytes / 32 values
+
+
+def test_quantized_cache_allows_more_context_on_the_same_memory():
+    f32 = compute_configuration(_hw(6_000), _plan(6_000, kv=False), _spark())
+    q8 = compute_configuration(_hw(6_000), _plan(6_000, kv=True), _spark())
+    assert q8.context_size > f32.context_size
 
 
 def test_model_traits_read_real_model_when_available():

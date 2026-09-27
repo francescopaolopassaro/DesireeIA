@@ -37,6 +37,7 @@ class Error(IntEnum):
     PARSE = -4
     NO_MEM = -5
     UNDEFINED = -6
+    CANCELLED = -7
 
 
 class SsdTierMode(IntEnum):

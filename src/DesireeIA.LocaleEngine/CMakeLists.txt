@@ -16,10 +16,19 @@ option(DESIREEIA_BUILD_TESTS "Build native self tests" OFF)
 # ma la compilazione/misura del kernel CUDA resta da fare su una macchina
 # col toolkit disponibile.
 option(DESIREEIA_ENABLE_CUDA "Build the CUDA backend" OFF)
+# GPU generations the DISTRIBUTED library carries kernels for. It used to be
+# "native", i.e. only the GPU of the machine that ran the build: the packaged
+# DLL then worked on that one card and failed with "no kernel image is
+# available" on every other NVIDIA generation. The list covers what CUDA 13
+# supports - Turing (75), Ampere (80, 86), Ada (89), Hopper (90) - and the
+# plain "90" also embeds PTX, which newer GPUs compile at load time.
+# -DDESIREEIA_CUDA_ARCH=native keeps the fast single-GPU build for local work.
+set(DESIREEIA_CUDA_ARCH "75-real;80-real;86-real;89-real;90" CACHE STRING
+    "CUDA architectures to build (release: every supported generation; dev: native)")
 if(DESIREEIA_ENABLE_CUDA)
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    set(CMAKE_CUDA_ARCHITECTURES native)
+    set(CMAKE_CUDA_ARCHITECTURES ${DESIREEIA_CUDA_ARCH})
 endif()
 
 add_library(DesireeIALocaleEngine SHARED
@@ -28,6 +37,10 @@ add_library(DesireeIALocaleEngine SHARED
     src/core/plan.cpp
     src/core/mem_lock.cpp
     src/core/matmul.cpp
+    src/core/i8gemm_base.cpp
+    src/core/i8gemm_vnni.cpp
+    src/core/i8gemm_vnni512.cpp
+    src/core/attn_cpu.cpp
     src/core/thread_pool.cpp
     src/core/quant.cpp
     src/core/ctx.cpp
@@ -84,7 +97,24 @@ if(MSVC)
     # linkare con LNK2019 su ogni simbolo interno usato dai test.
     set_target_properties(DesireeIALocaleEngine PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 else()
-    target_compile_options(DesireeIALocaleEngine PRIVATE -O3 -march=native)
+    # Explicit instruction set, never -march=native: a shipped binary runs on
+    # the users' CPUs, not on the build machine's (native on a newer build
+    # host = "illegal instruction" crash elsewhere). Same x86 baseline as the
+    # Windows build (/arch:AVX2); every Apple Silicon has dotprod (the int8
+    # kernels use it); other ARM stays on the armv8 baseline, where the
+    # kernels fall back to widening multiplies.
+    set(DESIREEIA_CPU_FLAGS "" CACHE STRING "CPU code-generation flags (empty = portable default for the target)")
+    if(DESIREEIA_CPU_FLAGS)
+        separate_arguments(_desireeia_cpu_flags NATIVE_COMMAND "${DESIREEIA_CPU_FLAGS}")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+        set(_desireeia_cpu_flags -mavx2 -mfma -mf16c)
+    elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64)$")
+        set(_desireeia_cpu_flags -mcpu=apple-m1)
+    else()
+        set(_desireeia_cpu_flags "")
+    endif()
+    target_compile_options(DesireeIALocaleEngine PRIVATE
+        $<$<COMPILE_LANGUAGE:CXX>:-O3 ${_desireeia_cpu_flags}>)
     set_target_properties(DesireeIALocaleEngine PROPERTIES OUTPUT_NAME "DesireeIALocaleEngine" PREFIX "")
 
     if(MINGW)

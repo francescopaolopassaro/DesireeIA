@@ -72,6 +72,7 @@ public sealed class LocalModel : IDisposable
 
     public static LocalModel Load(string modelPath, ExecutionPlan plan, Action<string>? logger = null)
     {
+        DesireeIAEngine.EnsureAbi();
         NativeMethods.LogCallback? cb = null;
         if (logger is not null)
         {
@@ -88,7 +89,7 @@ public sealed class LocalModel : IDisposable
         var err = NativeMethods.desireeia_create(modelPath, plan.ToNative(), cb, IntPtr.Zero, out var ctx);
         if (err != NativeMethods.Error.Ok)
         {
-            throw new InvalidOperationException($"Model load failed: {err}");
+            throw new InvalidOperationException(Describe("Model load failed", err, IntPtr.Zero));
         }
 
         return new LocalModel(ctx, modelPath, plan, cb);
@@ -113,11 +114,66 @@ public sealed class LocalModel : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var err = NativeMethods.desireeia_predict(_context, tokens, (nuint)tokens.Length, out var token);
+        if (err == NativeMethods.Error.Cancelled)
+            throw new OperationCanceledException("Prefill cancelled");
         if (err != NativeMethods.Error.Ok)
         {
-            throw new InvalidOperationException($"Predict failed: {err}");
+            throw new InvalidOperationException(Describe("Predict failed", err, _context));
         }
         return token;
+    }
+
+    private static string Describe(string what, NativeMethods.Error err, IntPtr ctx)
+    {
+        var detail = NativeMethods.LastError(ctx);
+        return string.IsNullOrEmpty(detail) ? $"{what}: {err}" : $"{what}: {err} - {detail}";
+    }
+
+    /// <summary>
+    /// Stops a <see cref="Predict"/> running on another thread at the next layer: that call
+    /// throws <see cref="OperationCanceledException"/> and the session is dropped. The
+    /// streaming methods do this by themselves when their token is cancelled.
+    /// </summary>
+    public void Cancel()
+    {
+        if (_disposed || _context == IntPtr.Zero) return;
+        NativeMethods.desireeia_cancel(_context);
+    }
+
+    /// <summary>
+    /// Progress of a multi-token prefill: called on the predicting thread after each layer
+    /// with (layers done, total layers). Null removes it.
+    /// </summary>
+    public Action<long, long>? PrefillProgress
+    {
+        get => _prefillProgress;
+        set
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            _prefillProgress = value;
+            _progressCallback = value is null ? null : (done, total, _) => value((long)done, (long)total);
+            NativeMethods.desireeia_set_progress_callback(_context, _progressCallback, IntPtr.Zero);
+        }
+    }
+    private Action<long, long>? _prefillProgress;
+    private NativeMethods.ProgressCallback? _progressCallback;   // kept alive while registered
+
+    /// <summary>
+    /// Allocates the KV cache for <paramref name="positions"/> positions at once, instead of
+    /// letting it grow by doubling (which briefly holds two copies). False when it does not fit.
+    /// </summary>
+    public bool ReserveContext(int positions)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentOutOfRangeException.ThrowIfNegative(positions);
+        return NativeMethods.desireeia_reserve_context(_context, (nuint)positions) == NativeMethods.Error.Ok;
+    }
+
+    /// <summary>Gives back the whole KV cache (chat closed, app idle) and drops the session.</summary>
+    public void TrimCache()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.desireeia_trim_cache(_context);
     }
 
     public int NextToken()
@@ -180,6 +236,67 @@ public sealed class LocalModel : IDisposable
         var err = NativeMethods.desireeia_session_reset(_context);
         if (err != NativeMethods.Error.Ok)
             throw new InvalidOperationException($"Session reset failed: {err}");
+    }
+
+    /// <summary>
+    /// Saves the KV cache of the current session to <paramref name="path"/>: the first
+    /// <paramref name="prefixTokens"/> prefilled positions (0 = all of them) with their tokens.
+    /// Load it in a later process with <see cref="LoadSession"/> and a prompt that starts
+    /// with the same tokens (a fixed system prompt) skips their prefill.
+    /// Returns false when the model's cache cannot be saved (latent-attention and
+    /// recurrent models) or there is no prefilled session yet.
+    /// </summary>
+    public bool SaveSession(string path, int prefixTokens = 0)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        ArgumentOutOfRangeException.ThrowIfNegative(prefixTokens);
+        return NativeMethods.desireeia_session_save(_context, path, (nuint)prefixTokens) == NativeMethods.Error.Ok;
+    }
+
+    /// <summary>
+    /// Restores a session saved with <see cref="SaveSession"/>. Returns the number of
+    /// positions restored, 0 when the file is missing, was saved for another model or
+    /// cache layout, or cannot be used with this model (the next prompt is then
+    /// simply prefilled in full).
+    /// </summary>
+    public int LoadSession(string path)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        if (!File.Exists(path)) return 0;
+        var err = NativeMethods.desireeia_session_load(_context, path, out var n);
+        return err == NativeMethods.Error.Ok ? (int)n : 0;
+    }
+
+    /// <summary>
+    /// The session image of <see cref="SaveSession"/> as bytes instead of a file, so the
+    /// caller can encrypt it before it reaches the disk. Null when there is nothing that
+    /// can be saved.
+    /// </summary>
+    public byte[]? SaveSessionBytes(int prefixTokens = 0)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentOutOfRangeException.ThrowIfNegative(prefixTokens);
+        if (NativeMethods.desireeia_session_save_mem(_context, (nuint)prefixTokens, null, 0, out var size)
+                != NativeMethods.Error.Ok || size == 0 || size > (nuint)Array.MaxLength)
+            return null;
+        var image = new byte[(int)size];
+        if (NativeMethods.desireeia_session_save_mem(_context, (nuint)prefixTokens, image, size, out var written)
+                != NativeMethods.Error.Ok)
+            return null;
+        return written == size ? image : image[..(int)written];
+    }
+
+    /// <summary>Restores an image from <see cref="SaveSessionBytes"/>; same contract as
+    /// <see cref="LoadSession"/> (positions restored, 0 when refused).</summary>
+    public int LoadSessionBytes(byte[] image)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(image);
+        if (image.Length == 0) return 0;
+        var err = NativeMethods.desireeia_session_load_mem(_context, image, (nuint)image.Length, out var n);
+        return err == NativeMethods.Error.Ok ? (int)n : 0;
     }
 
     /// <summary>How many prompt tokens the last <see cref="Predict"/> took from the cache
@@ -300,8 +417,8 @@ public sealed class LocalModel : IDisposable
     /// Applies the chat format detected for the model (from the GGUF's
     /// tokenizer.chat_template, or a per-architecture default) to a sequence
     /// of messages (role, content), producing the prompt to tokenize. Covers
-    /// the most widespread model families (ChatML/Qwen, Llama
-    /// 2/3/3.1/3.2/3.3/4, Mistral in all its historical variants, Gemma 2/3,
+    /// the most widespread model families (ChatML/Qwen, the
+    /// [INST] and header-id formats in all versions, Mistral in all its historical variants, Gemma 2/3,
     /// Phi 3/4, DeepSeek V2/V3/R1, Command-R, ChatGLM3/4, MiniCPM, Zephyr,
     /// Falcon3, Exaone3) — no longer just gemma hardcoded here in the CLI.
     /// Unrecognized formats fall back to ChatML.
@@ -497,7 +614,7 @@ public sealed class LocalModel : IDisposable
     /// EOS/end-of-turn, at the <see cref="GenerateOptions.MaxTokens"/> limit,
     /// or on the first occurrence of one of the
     /// <see cref="GenerateOptions.StopSequences"/> (which is not included in
-    /// the output, as in Ollama/OpenAI-style APIs). Calls into the native
+    /// the output, as in OpenAI-style APIs). Calls into the native
     /// engine are synchronous (a per-ctx mutex serializes them anyway): the
     /// await Task.Yield() between one token and the next is there to leave
     /// the caller free to interleave other async work and observe
@@ -510,7 +627,9 @@ public sealed class LocalModel : IDisposable
         options ??= new GenerateOptions();
         var scanner = new StopSequenceScanner(options.StopSequences);
 
-        var token = Predict(promptTokens);
+        int token;
+        using (ct.Register(Cancel))              // Stop interrupts the prefill too
+            token = Predict(promptTokens);
         for (int i = 0; i < options.MaxTokens; i++)
         {
             ct.ThrowIfCancellationRequested();

@@ -18,6 +18,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <functional>
 #include <vector>
 
 namespace desireeia {
@@ -202,7 +203,13 @@ struct LoraWeight {
 
 struct MatVec {
     std::vector<float> f;
-    std::vector<uint8_t> raw;
+    // Host copy of the quantized weights. Mutable because a GPU-resident
+    // matrix may have released it (see `reload`) and a CPU path that needs it
+    // again restores it on first use, through a const reference.
+    mutable std::vector<uint8_t> raw;
+    // Set when raw was released after the upload to VRAM: re-reads the tensor
+    // from the model file with the same transformations applied at load.
+    std::shared_ptr<std::function<bool(std::vector<uint8_t>&)>> reload;
     MatVecFormat format = MatVecFormat::Float;
     // One entry per currently-loaded LoRA adapter that targets this tensor.
     // Empty (the common case: no adapter loaded, or this adapter doesn't
@@ -223,7 +230,7 @@ struct MatVec {
     std::shared_ptr<void> cuda_qs;
     std::shared_ptr<void> cuda_scale;
 #endif
-    bool empty() const { return f.empty() && raw.empty(); }
+    bool empty() const { return f.empty() && raw.empty() && !reload; }
 };
 
 // A single layer's weights. Used both as a scratch buffer (weight cache
@@ -323,6 +330,25 @@ public:
     bool open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, uint64_t ram_budget_mb,
               ExpertStore* experts, bool kv_quantized = false, int32_t backend = 0);
     void reset_cache() override;
+    int step_candidates(ModelReader& rd, const int32_t* tokens, size_t n_tokens, uint32_t kk,
+                        std::vector<int32_t>& ids, std::vector<float>& vals, std::vector<float>& logits) override;
+#ifdef DESIREEIA_CUDA_ENABLED
+    // Pipelined decode (engine_next_token): true when every decode step of
+    // this model can run on the device from a token drawn there - all
+    // layers on the fused device path, head on the device, Q8_0 embedding
+    // rows resident on the device (tied embedding).
+    bool pipeline_supported() const;
+    // One decode step whose input is `token`, or with token < 0 the token
+    // the previous step drew on the device, and whose next token is drawn
+    // on the device (s). Queued, not waited for. 1 = launched; 0 = the
+    // step ran but the head stayed on the host (logits filled, nothing
+    // drawn); -1 = failure.
+    int decode_launch(ModelReader& rd, int32_t token, const CudaSampleArgs& s, std::vector<float>& logits);
+#endif
+    void set_hooks(const StepHooks* hooks) override { hooks_ = hooks; }
+    bool was_cancelled() const override { return cancelled_; }
+    bool reserve_positions(size_t n) override;
+    void release_cache() override;
     // If all_logits != nullptr, it's filled with n_tokens*n_vocab logits
     // (one per batch position, not just the last): used by speculative
     // decoding / prompt-lookup verification, which needs to compare the
@@ -340,6 +366,18 @@ public:
     // new_cols stay in the buffer but get overwritten by the next step()
     // calls, no explicit erasure needed.
     void truncate_cache(size_t new_cols) { if (new_cols <= cache_cols_) cache_cols_ = new_cols; }
+    // Session persistence (desireeia_session_save/load): bytes one position
+    // occupies in ONE layer of the cache (0 when this cache layout cannot be
+    // saved - MLA's latent cache), the first n positions of every layer
+    // concatenated layer by layer, and the reverse, which also refreshes the
+    // device mirror. Positions are read from the host copy, which holds every
+    // prefilled position (the device-only writes are decode's).
+    void rope_fill(std::vector<float>& cache, uint32_t il, size_t n_rot, uint32_t pos,
+                   float theta, float scale) const;
+    size_t kv_bytes_per_pos() const;
+    bool kv_quantized() const { return kv_quantized_; }
+    bool export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v);
+    bool import_kv(size_t n, const uint8_t* k, const uint8_t* v);
     size_t cache_len() const { return cache_cols_; }
 
     // Vision/multimodal support: overrides the embedding lookup for one
@@ -418,7 +456,24 @@ private:
     bool load_embd(ModelReader& rd);
     bool load_norms(ModelReader& rd);
     bool load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w);
-    bool load_matrix(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out);
+    // rope_head_dim/rope_rot > 0: Q or K projection of an adjacent-pair RoPE
+    // model, whose rows are reordered per head (see rope_adjacent_).
+    bool load_matrix(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out,
+                     uint32_t rope_head_dim = 0, uint32_t rope_rot = 0);
+    // Adjacent-pair RoPE model (arch_rope_adjacent_pairs): within the first
+    // n_rot dimensions of every Q and K head, row 2j moves to j and row 2j+1
+    // to n_rot/2 + j. Rotating the reordered halves is exactly rotating the
+    // original adjacent pairs, and q.k is unchanged because Q and K get the
+    // same order - so every RoPE path (CPU, CUDA decode, CUDA prefill) stays
+    // the split-half one. Applied to the Q/K weights, their biases, per-head
+    // norms and LoRA deltas.
+    bool rope_adjacent_ = false;
+    const StepHooks* hooks_ = nullptr;
+    bool cancelled_ = false;
+    // Reports prefill progress (layers done) and answers whether a cancel
+    // was asked; sets cancelled_ when it was.
+    bool prefill_interrupted(uint32_t layers_done);
+    uint32_t perm_head_dim_ = 0, perm_rot_ = 0;   // set while load_matrix handles a Q/K matrix
     // Looks up `name` in every loaded LoRA adapter and, if found (and
     // shape-compatible), appends a LoraWeight to out.lora. Called from
     // load_matrix() right after the base tensor is loaded, since that's
@@ -475,6 +530,14 @@ private:
     // force get_layer() to load that layer early — defeating the point.
     void maybe_prefetch_predicted(uint32_t layer, const std::vector<uint32_t>& idxs);
     void grow_cache(size_t needed);
+#ifdef DESIREEIA_CUDA_ENABLED
+    // Whole prefill on device in chunks; false (nothing touched) when a layer
+    // has a shape the device layer does not cover. See dense_forward.cpp.
+    // all_rows: the caller needs every row of x back (all logits), not
+    // only the last one.
+    bool prefill_cuda_layers(ModelReader& rd, std::vector<float>& x, uint32_t col0, size_t n_tokens,
+                             bool all_rows);
+#endif
 
     // Stores one position's freshly computed K and V (kv_dim floats each,
     // n_head_kv heads back to back) into whichever cache is active — float
@@ -516,6 +579,21 @@ private:
 
     std::vector<float> out_norm_;
     std::vector<float> out_norm_b_; // DenseQuirks::layer_norm, optional
+    // Decode on device, layers that differ: pos/cc_start and RoPE table of
+    // every layer, sent once per token (CudaLayerArgs::dyn_all).
+    std::vector<uint32_t> dev_dyn_all_;
+    // step_candidates: requested count, and what the device head produced.
+    uint32_t topk_req_ = 0;
+    bool topk_done_ = false;
+#ifdef DESIREEIA_CUDA_ENABLED
+    // decode_launch: input from the device token, draw on the device.
+    bool dev_token_in_ = false;
+    const CudaSampleArgs* sample_args_ = nullptr;
+    bool sample_launched_ = false;
+#endif
+    std::vector<int32_t> topk_ids_;
+    std::vector<float> topk_vals_;
+    std::vector<float> dev_rope_all_;
 
     // Absolute position (gpt2, mpt optionally): table [n_ctx_train,
     // n_embd], added to the token embedding BEFORE the first layer.
@@ -556,6 +634,13 @@ private:
     // half-measures: a partial device copy would silently give wrong
     // results.
     bool cuda_kv_ready_ = false;
+    // The device prefill writes the new KV rows on the device only (the
+    // mirror copy to the host was a serial tail of ~0.6 GB on an 8k prompt):
+    // the host cache is then stale until sync_host_kv() downloads it, which
+    // happens only before a path that reads it on the host (export_kv and
+    // grow_cache download on their own).
+    bool kv_host_stale_ = false;
+    void sync_host_kv();
     // Set while the batch (prefill) path is filling a layer: write_kv_cache
     // then updates the host cache only and skips the per-position device
     // mirror, because the batch path uploads the whole range in ONE copy

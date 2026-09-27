@@ -55,7 +55,7 @@ private:
     // Special-token cache (CONTROL/USER_DEFINED/UNKNOWN), sorted by
     // decreasing text length so the longest match wins.
     // Needed because, without it, markers like "<|im_start|>" (used by the
-    // ChatML/Llama3/Phi/... chat templates) did NOT tokenize at all as an
+    // ChatML/header-id/Phi/... chat templates) did NOT tokenize at all as an
     // atomic vocabulary entry: they ended up split apart by ordinary
     // pre-tokenization/BPE merging into "<", "|", "im", "_", "start", "|",
     // ">" — the model never saw the real control token, and generation no

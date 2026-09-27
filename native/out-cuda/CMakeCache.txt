@@ -445,6 +445,10 @@ CUDA_sanitizer_LIBRARY:FILEPATH=C:/Program Files/NVIDIA GPU Computing Toolkit/CU
 //Build native self tests
 DESIREEIA_BUILD_TESTS:BOOL=ON
 
+//CUDA architectures to build (release: every supported generation;
+// dev: native)
+DESIREEIA_CUDA_ARCH:STRING=75-real;80-real;86-real;89-real;90
+
 //Build the CUDA backend
 DESIREEIA_ENABLE_CUDA:BOOL=ON
 

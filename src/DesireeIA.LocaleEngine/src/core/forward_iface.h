@@ -8,6 +8,8 @@
 #ifndef DESIREEIA_FORWARD_IFACE_H
 #define DESIREEIA_FORWARD_IFACE_H
 
+#include <atomic>
+#include <cstdint>
 #include "core/engine.h"
 #include <cstdint>
 #include <string>
@@ -25,12 +27,27 @@ namespace desireeia {
 // interface exists only to let EngineContext hold a single pointer, not
 // to make the two implementations share code (and indeed they share
 // nothing).
+struct StepHooks {
+    const std::atomic<bool>* cancel = nullptr;
+    void (*progress)(uint64_t done, uint64_t total, void* user) = nullptr;
+    void* user = nullptr;
+};
+
 class IForwardEngine {
 public:
     virtual ~IForwardEngine() = default;
     virtual void reset_cache() = 0;
     virtual bool step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                        std::vector<float>& last_logits, std::vector<float>* all_logits = nullptr) = 0;
+    // One decoded token whose sampler needs only the kk largest logits:
+    // 1 = ids/vals hold them (largest first, lower id first on ties),
+    // 2 = the whole vocabulary is in logits, 0 = not attempted (call step),
+    // -1 = the step failed.
+    virtual int step_candidates(ModelReader& rd, const int32_t* tokens, size_t n_tokens, uint32_t kk,
+                                std::vector<int32_t>& ids, std::vector<float>& vals, std::vector<float>& logits) {
+        (void) rd; (void) tokens; (void) n_tokens; (void) kk; (void) ids; (void) vals; (void) logits;
+        return 0;
+    }
     virtual uint64_t kv_bytes() const = 0;
     virtual bool weight_cache_enabled() const = 0;
 
@@ -72,6 +89,16 @@ public:
     }
     virtual void clear_prerouter() {}
     virtual void set_prerouter_heuristic(bool on) { (void) on; }
+
+    // Cancellation and progress of a multi-token prefill (desireeia_cancel,
+    // desireeia_set_progress_callback). The hooks object belongs to the
+    // context and outlives the engine. Default: ignored.
+    virtual void set_hooks(const StepHooks* hooks) { (void) hooks; }
+    // Whether the last step() stopped because of a cancellation.
+    virtual bool was_cancelled() const { return false; }
+    // KV cache sizing (desireeia_reserve_context / desireeia_trim_cache).
+    virtual bool reserve_positions(size_t n) { (void) n; return false; }
+    virtual void release_cache() { reset_cache(); }
 };
 
 }

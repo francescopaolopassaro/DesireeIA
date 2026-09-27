@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -13,7 +13,7 @@
        session (KV prefix reuse) - see CHANGELOG.md. -->
   <PropertyGroup>
     <PackageId>DesireeIA</PackageId>
-    <Version>0.0.3</Version>
+    <Version>0.1.2</Version>
     <Authors>Passaro Francesco Paolo</Authors>
     <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
     <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
@@ -50,7 +50,16 @@
     <NativeLibBaseName>DesireeIALocaleEngine</NativeLibBaseName>
     <NativeSourceDir>$(MSBuildThisFileDirectory)..\DesireeIA.LocaleEngine</NativeSourceDir>
     <NativeBuildDir>$(MSBuildThisFileDirectory)..\..\native\out</NativeBuildDir>
-    <BuildNativeEngine Condition="'$(BuildNativeEngine)' == ''">true</BuildNativeEngine>
+    <!-- ONE engine everywhere: the library copied next to every consumer of
+         this project (CLI, tests, bench) is the one Build\build.ps1 puts in
+         Build\runtimes\<RID>\native - the same file packed into the NuGet
+         package and the Python wheel. It used to be a separate CPU-only build
+         in native\out, so tests and benchmarks silently ran a different engine
+         than the one that ships. Rebuild it with Build\build.ps1 (quick loop:
+         -SkipLinux -SkipCli -SkipPython -SkipPack). BuildNativeEngine=true
+         brings back the local cmake build into native\out, only for machines
+         without the build.ps1 toolchain. -->
+    <BuildNativeEngine Condition="'$(BuildNativeEngine)' == ''">false</BuildNativeEngine>
   </PropertyGroup>
 
   <!-- Nome del file prodotto: cambia sui tre sistemi supportati. -->
@@ -91,7 +100,24 @@
     PreserveNewest confronta le date al momento della copia, quindi una
     libreria appena ricompilata viene sempre ripresa.
   -->
-  <ItemGroup>
+  <PropertyGroup>
+    <LocalRid Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))' == 'true'">win-x64</LocalRid>
+    <LocalRid Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))' == 'true'">linux-x64</LocalRid>
+    <LocalRid Condition="'$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))' == 'true'">osx-$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant())</LocalRid>
+    <!-- A cross-publish (build.ps1 publishes the linux-x64 CLI from Windows) still
+         evaluates this on the build machine: build.ps1 strips the Windows files
+         from that bundle and drops in Build\runtimes\linux-x64 itself. -->
+    <ShippedNativeDir>$(MSBuildThisFileDirectory)..\..\Build\runtimes\$(LocalRid)\native</ShippedNativeDir>
+  </PropertyGroup>
+  <!-- Default: the shipped engine (see ShippedNativeDir) - every file in that
+       folder, so companion runtimes (cudart on Windows) come along. -->
+  <ItemGroup Condition="'$(BuildNativeEngine)' != 'true'">
+    <None Include="$(ShippedNativeDir)\*.*"
+          Link="%(Filename)%(Extension)"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <!-- Opt-in local cmake build (BuildNativeEngine=true). -->
+  <ItemGroup Condition="'$(BuildNativeEngine)' == 'true'">
     <None Include="$(NativeBuildDir)\$(NativeLibFileName)"
           Link="$(NativeLibFileName)"
           CopyToOutputDirectory="PreserveNewest" />

@@ -3,6 +3,10 @@ CMakeFiles\DesireeIALocaleEngine.dir\src\core\probe.cpp.obj
 CMakeFiles\DesireeIALocaleEngine.dir\src\core\plan.cpp.obj
 CMakeFiles\DesireeIALocaleEngine.dir\src\core\mem_lock.cpp.obj
 CMakeFiles\DesireeIALocaleEngine.dir\src\core\matmul.cpp.obj
+CMakeFiles\DesireeIALocaleEngine.dir\src\core\i8gemm_base.cpp.obj
+CMakeFiles\DesireeIALocaleEngine.dir\src\core\i8gemm_vnni.cpp.obj
+CMakeFiles\DesireeIALocaleEngine.dir\src\core\i8gemm_vnni512.cpp.obj
+CMakeFiles\DesireeIALocaleEngine.dir\src\core\attn_cpu.cpp.obj
 CMakeFiles\DesireeIALocaleEngine.dir\src\core\thread_pool.cpp.obj
 CMakeFiles\DesireeIALocaleEngine.dir\src\core\quant.cpp.obj
 CMakeFiles\DesireeIALocaleEngine.dir\src\core\ctx.cpp.obj

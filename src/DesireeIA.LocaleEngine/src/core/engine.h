@@ -346,6 +346,28 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token);
 // last_reused_tokens reports how many prompt tokens the last engine_predict
 // took from the cache.
 bool engine_session_reset(desireeia_ctx* ctx);
+// 0.1.2: cancellation, progress, per-context logger, cache sizing, errors.
+void engine_cancel(desireeia_ctx* ctx);
+bool engine_was_cancelled(const desireeia_ctx* ctx);
+void engine_set_progress(desireeia_ctx* ctx, void (*cb)(uint64_t, uint64_t, void*), void* user);
+void engine_set_log(desireeia_ctx* ctx, LogFn log);
+bool engine_reserve(desireeia_ctx* ctx, size_t n_positions);
+bool engine_trim(desireeia_ctx* ctx);
+std::string engine_last_error(const desireeia_ctx* ctx);
+// Session persistence: saves the first n_prefix prefilled positions (0 = all
+// of them) of the KV cache with their tokens; load restores them, after
+// which a prompt starting with the same tokens reuses them instead of
+// prefilling (a fixed system prompt costs only the file read). The file
+// carries an identity of the model and of the cache layout and is refused
+// when either differs. out_tokens: positions restored.
+bool engine_session_save(desireeia_ctx* ctx, const char* path, size_t n_prefix, std::string& err);
+bool engine_session_load(desireeia_ctx* ctx, const char* path, size_t& out_tokens, std::string& err);
+// Same, as a byte image in memory: lets the host encrypt it before it ever
+// reaches the disk (the file variants just write/read this image).
+size_t engine_session_image_size(desireeia_ctx* ctx, size_t n_prefix);   // 0 = nothing to save
+bool engine_session_serialize(desireeia_ctx* ctx, size_t n_prefix, std::vector<uint8_t>& out, std::string& err);
+bool engine_session_deserialize(desireeia_ctx* ctx, const uint8_t* data, size_t size, size_t& out_tokens,
+                                std::string& err);
 bool engine_set_session_reuse(desireeia_ctx* ctx, int mode);
 size_t engine_last_reused_tokens(const desireeia_ctx* ctx);
 size_t engine_context_size(const desireeia_ctx* ctx);
@@ -397,6 +419,15 @@ bool engine_apply_chat_template(const desireeia_ctx* ctx,
 
 DESIREEIA_INTERNAL int quantized_matmul(const std::vector<float>& a, const std::vector<float>& b,
                      size_t M, size_t K, size_t N, std::vector<float>& out);
+
+// Prefill attention on the CPU over a Q8_0 KV cache (core/attn_cpu.cpp):
+// q_all/out [n_tok][q_dim], K/V rows at base + pos*pos_bytes + kv_head*row_bytes,
+// n_swa 0 = full causal attention. DESIREEIA_ERR_NOT_SUPPORTED when head_dim
+// is not a multiple of 32.
+DESIREEIA_INTERNAL int attention_prefill_cpu_q8(const float* q_all, float* out, uint32_t n_tok, uint32_t n_head,
+                                                uint32_t hpk, uint32_t hd, uint32_t q_dim, const uint8_t* kbase,
+                                                const uint8_t* vbase, size_t row_bytes, size_t pos_bytes,
+                                                uint32_t pos0, uint32_t n_swa, float inv_d);
 
 DESIREEIA_INTERNAL void quantize_q8_0(const float* src, size_t n, std::vector<int8_t>& q,
                    std::vector<float>& scales, std::vector<uint8_t>& signs);
@@ -474,6 +505,35 @@ DESIREEIA_INTERNAL int cuda_attention_batch(const float* q_all, float* out_all,
                                            uint32_t col0, uint32_t n_swa);
 DESIREEIA_INTERNAL void cuda_free_device(void* p);
 DESIREEIA_INTERNAL void cuda_backend_shutdown();
+DESIREEIA_INTERNAL int cuda_head_forward(int format, const void* d_qs, const void* d_scale, const float* norm_w,
+                                         size_t n_embd, float eps, size_t rows, float* y);
+DESIREEIA_INTERNAL int cuda_fetch_x(float* dst, size_t n);
+// cuda_head_forward keeping only the kk largest logits (kk <= 256): ids and
+// values, largest first, lower id first on ties.
+DESIREEIA_INTERNAL int cuda_head_forward_topk(int format, const void* d_qs, const void* d_scale, const float* norm_w,
+                                              size_t n_embd, float eps, size_t rows, uint32_t kk,
+                                              int32_t* ids, float* vals);
+// Pipelined decode: the next token is drawn on the device, where the next
+// step's embedding reads it, so the host never sits between two tokens.
+// The draw replicates Sampler::sample_candidates step by step; `u` is the
+// uniform number the host sampler would have drawn (generate_canonical of
+// the same generator), so the random sequence is the one of the host path.
+struct CudaSampleArgs {
+    float temperature; int32_t top_k; float top_p;
+    float penalty_repeat; float penalty_freq; float penalty_present; int32_t penalty_last_n;
+    uint32_t kk;          // candidates taken from the logits (superset of what the draw needs)
+    float logit_scale;    // applied to the candidates when non-zero, as the host path does
+    float u;              // uniform draw in [0, 1) for temperature > 0
+    int append_input;     // append the step's input token (on the device) to the history first
+    uint32_t slot;        // readback slot (0..3) the drawn token is copied to
+};
+// Head + top-k + draw, queued behind the step's layers; no synchronisation.
+DESIREEIA_INTERNAL int cuda_head_forward_sample(int format, const void* d_qs, const void* d_scale, const float* norm_w,
+                                                size_t n_embd, float eps, size_t rows, const CudaSampleArgs& s);
+// Waits for the token drawn into `slot` and returns it.
+DESIREEIA_INTERNAL int cuda_sample_wait(uint32_t slot, int32_t& token);
+// Replaces the device history the penalties read with the last `n` tokens.
+DESIREEIA_INTERNAL int cuda_sample_history(const int32_t* hist, size_t n);
 DESIREEIA_INTERNAL int matmul_q8_0_cuda_resident(const void* d_qs, const void* d_scale, size_t rows, size_t cols,
                                                 const float* x, float* y);
 
@@ -511,6 +571,13 @@ DESIREEIA_INTERNAL int matmul_q8_0_cuda_ffn_gated(const void* d_up_qs, const voi
 // (DenseForward::write_kv_cache), so it can never diverge regardless of
 // which path (prefill, decode, CPU fallback) produced k and v.
 DESIREEIA_INTERNAL bool cuda_kv_cache_reserve(size_t total_bytes);
+// Frees the device KV cache (desireeia_trim_cache).
+DESIREEIA_INTERNAL void cuda_kv_cache_release();
+// GPUs visible to the engine, and one's name/memory/capability.
+DESIREEIA_INTERNAL int32_t cuda_gpu_count();
+DESIREEIA_INTERNAL bool cuda_probe_gpu(int32_t index, char* name, size_t name_len, uint64_t& total,
+                                        uint64_t& free_bytes, int32_t& cc_major, int32_t& cc_minor,
+                                        int32_t& sms);
 DESIREEIA_INTERNAL bool cuda_kv_cache_upload(const void* k_host, const void* v_host,
                                             size_t total_bytes);
 // Pulls the device cache back to the host. Required before any host-side
@@ -592,8 +659,66 @@ struct CudaLayerArgs {
     // once per token for a uniform model, per layer when sliding-window
     // layers give different windows or RoPE bases.
     int upload_dyn;
+    // Models whose layers differ in window or RoPE base: the pos/cc_start
+    // pairs ([n_slots][2]) and RoPE tables ([n_slots][rope_stride]) of ALL
+    // layers, sent once with the first layer; this layer reads slot
+    // layer_slot. Null keeps the single shared slot above.
+    const uint32_t* dyn_all; const float* rope_all;
+    uint32_t n_slots; uint32_t rope_stride; uint32_t layer_slot;
+    // With upload_x: build x on the device from the token the previous step
+    // drew (pipelined decode) instead of copying a.x. Q8_0 embedding rows
+    // (int8 [rows][n_embd], fp16 scales [rows][n_embd/32]), times embd_mul
+    // when that is non-zero.
+    int x_from_token;
+    const void* embd_qs; const void* embd_scale; float embd_mul;
 };
 DESIREEIA_INTERNAL int cuda_layer_forward(const CudaLayerArgs& args);
+
+// Same layer as CudaLayerArgs, for n_tok consecutive tokens of a prefill
+// chunk at positions [pos0, pos0 + n_tok). The prefill runs LAYER BY
+// LAYER: every chunk of the prompt through layer l, then layer l+1. The
+// whole prompt's activations (x/x_out, [n_total][n_embd]) stay on device:
+// upload_x on the first call, download_x on the last. The chunk is rows
+// [x_row0, x_row0 + n_tok) of them. rope_caches is [n_total][n_rot] (null
+// disables RoPE), sent when upload_rope is set. prepare_weights (first
+// chunk of each layer) expands the layer's matrices for the tensor cores
+// once for the whole prompt. host_kcache/host_vcache receive the KV rows
+// written, so the host copy of the cache never goes stale.
+struct CudaLayerBatchArgs {
+    const void* wq_qs; const void* wq_scale;
+    const void* wk_qs; const void* wk_scale;
+    const void* wv_qs; const void* wv_scale;
+    const void* wo_qs; const void* wo_scale;
+    const void* wgate_qs; const void* wgate_scale;
+    const void* wup_qs; const void* wup_scale;
+    const void* wdown_qs; const void* wdown_scale;
+    const void* wag_qs; const void* wag_scale;
+    const float* bq; const float* bk; const float* bv;
+    const float* attn_norm_w; const float* ffn_norm_w;
+    const float* q_norm_w; const float* k_norm_w;
+    const float* post_attn_norm_w; const float* post_ffn_norm_w;
+    const float* x;            // host, [n_total][n_embd] (first call)
+    float* x_out;              // host, [n_total][n_embd] (last call)
+    uint32_t x_out_row0;       // last call: rows before this one are not downloaded
+    const float* rope_caches;  // host, [n_total][n_rot]; null disables RoPE
+    void* host_kcache; void* host_vcache;   // host KV cache base (mirror target)
+    size_t n_embd; size_t q_dim; size_t kv_dim; size_t n_ff;
+    uint32_t n_head; uint32_t n_head_kv; uint32_t heads_per_kv;
+    uint32_t head_dim; uint32_t n_rot;
+    size_t kv_layer_off;
+    uint32_t pos0; uint32_t n_tok; uint32_t n_swa;   // n_swa = 0 on full-attention layers
+    uint32_t x_row0; uint32_t n_total;              // chunk offset in the prompt, prompt length
+    float rms_eps; int act_gelu;
+    int fmt_q; int fmt_k; int fmt_v; int fmt_o;
+    int fmt_gate; int fmt_up; int fmt_down; int fmt_ag;
+    int upload_x; int download_x; int upload_rope; int prepare_weights;
+    // Which of up to 4 device RoPE tables this layer uses: a model that
+    // alternates bases (local/global layers) builds and sends each distinct
+    // table once per prompt instead of at every change.
+    int rope_slot;
+};
+DESIREEIA_INTERNAL int cuda_layer_forward_batch(const CudaLayerBatchArgs& args);
+DESIREEIA_INTERNAL int cuda_prefill_chunk_tokens();
 
 DESIREEIA_INTERNAL int cuda_attention_out(const void* d_wo_qs, const void* d_wo_scale,
                                          const float* q, uint32_t n_head, uint32_t heads_per_kv,

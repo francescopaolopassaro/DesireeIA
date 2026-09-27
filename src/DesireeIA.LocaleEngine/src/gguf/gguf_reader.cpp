@@ -131,11 +131,17 @@ public:
             uint32_t type = 0;
             if (!read_at(f, type)) return false;
 
+            // Every string is kept (meta_str). This branch used to keep only
+            // the two it needed and `continue` - the later type-8 branch that
+            // stores them was unreachable, so meta_str failed for EVERY key:
+            // rope.scaling.type (YaRN never enabled: Qwen2.5 wrote broken
+            // text), tokenizer.chat_template, adapter.type, the vision keys.
             if (type == 8) {
                 std::string val;
                 if (!read_string(f, val)) return false;
                 if (key == "general.architecture") arch = val;
                 if (key == "tokenizer.ggml.model") vocab_.tokenizer_tag = val;
+                kv_string_[key] = std::move(val);
                 continue;
             }
             if (type == 9) {
@@ -233,19 +239,6 @@ public:
                 uint8_t v = 0;
                 if (!read_at(f, v)) return false;
                 kv_int_[key] = v;
-                continue;
-            }
-            // type 8 = GGUF_TYPE_STRING. This used to always be discarded
-            // (skip_gguf_value): the engine read NO string at all at the
-            // key/value level. It is needed for "tokenizer.chat_template"
-            // (chat template phase, 2026-09-08): without it, the CLI has no
-            // way of knowing which chat format the model uses and has to
-            // guess from the architecture, which for families with several
-            // variants (llama3 vs llama2, mistral v1/v3/v7...) is not enough.
-            if (type == 8) {
-                std::string v;
-                if (!read_string(f, v)) return false;
-                kv_string_[key] = std::move(v);
                 continue;
             }
             if (!skip_gguf_value(f, type)) return false;
