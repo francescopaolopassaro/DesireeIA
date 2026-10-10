@@ -1,18 +1,6 @@
 # DesireeIA
-![Version 0.1.2](https://img.shields.io/badge/version-v0.1.2-blue)
+![Version 0.2.0](https://img.shields.io/badge/version-v0.2.0-blue)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
-
-> **DesireeIA 0.1.2 — stable and fast.** This release jumps straight from
-> 0.0.x to 0.1.2 because it brings more than 30 new features, optimizations
-> and fixes at once (see [CHANGELOG.md](CHANGELOG.md)), each one validated
-> with in-depth tests — native self-test, .NET and Python suites, Linux and
-> ARM64 builds — and benchmarked on real models. The engine is now stable
-> and fast: prefill several times faster on GPU and CPU, an agent system
-> prompt restored in well under a second from a saved session, a stable
-> ABI with cancellation and progress, and correctness fixes that make whole
-> model families (Qwen2.5 with YaRN, the MiniCPM/Mistral-style dense family)
-> answer properly. [Measured performance](#measured-performance) below.
----
 
 A local large language model inference engine for the .NET ecosystem: a native C++17 core exposed through a stable C ABI, with an idiomatic .NET wrapper on top.
 <img src="images/DesireeIA.jpg" />
