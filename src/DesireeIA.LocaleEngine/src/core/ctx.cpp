@@ -9,7 +9,9 @@
 #include "desireeia/abi.h"
 #include "core/arch_tags.h"
 #include "core/chat_template.h"
+#include "core/jinja.h"
 #include "core/sampler.h"
+#include "core/tool_grammar.h"
 #include "core/thread_pool.h"
 #include "models/dense_forward.h"
 #include "models/ssm_forward.h"
@@ -73,10 +75,22 @@ struct EngineContext {
     // sampling as soon as the caller raises the temperature.
     Sampler sampler;
 
+    // Token-level tool-call constraint (core/tool_grammar.h) and the
+    // decoded piece of every vocabulary entry it filters on, built once on
+    // first use (the mask needs every piece at every constrained step).
+    ToolCallConstraint tool;
+    std::vector<std::string> tool_pieces;
+    std::vector<uint8_t> tool_is_eog;
+    std::vector<uint8_t> tool_plain;   // piece is safe inside any JSON string
+
     // Chat prompt format, detected at load time (see engine_create): from
     // the GGUF's chat_template when present, otherwise from the
     // per-architecture default.
     ChatTemplateKind chat_template = ChatTemplateKind::Unknown;
+    // The model's own Jinja template, compiled at load (core/jinja.h):
+    // rendered first, with chat_template above as the fallback when it is
+    // absent or raises.
+    std::shared_ptr<jinja::Template> jinja_template;
 
     // Prompt Lookup Decoding: full history of tokens already in the KV
     // cache (prompt plus confirmed generations), used to look up an
@@ -604,6 +618,11 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         std::string tmpl_str;
         if (reader->meta_str("tokenizer.chat_template", tmpl_str) && !tmpl_str.empty()) {
             ctx->chat_template = detect_chat_template(tmpl_str);
+            try {
+                ctx->jinja_template = std::make_shared<jinja::Template>(tmpl_str);
+            } catch (const std::exception& e) {
+                if (log) log(4, (std::string("chat template not compiled, using the built-in format: ") + e.what()).c_str());
+            }
         }
         if (ctx->chat_template == ChatTemplateKind::Unknown) {
             ctx->chat_template = chat_template_for_arch(detect_arch(meta.arch));
@@ -709,6 +728,86 @@ bool engine_embed(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
     return c->bert->encode(*c->st.reader, tokens, n_tokens, out_embd);
 }
 
+
+// ---- tool-call constraint -------------------------------------------------
+
+static void tool_build_pieces(EngineContext* c, size_t vocab) {
+    c->tool_pieces.assign(vocab, std::string());
+    c->tool_is_eog.assign(vocab, 0);
+    c->tool_plain.assign(vocab, 0);
+    for (size_t id = 0; id < vocab; ++id) {
+        if (c->has_tok) c->tok.piece(static_cast<int32_t>(id), c->tool_pieces[id]);
+        c->tool_is_eog[id] = c->eog_ids.count(static_cast<int32_t>(id)) ? 1 : 0;
+        const std::string& p = c->tool_pieces[id];
+        bool plain = !p.empty() && !c->tool_is_eog[id];
+        for (unsigned char ch : p) {
+            if (ch == '"' || ch == 0x5C || ch < 0x20) { plain = false; break; }
+        }
+        c->tool_plain[id] = plain;
+    }
+}
+
+// Masks every token the constraint rejects. If that would mask the whole
+// vocabulary the grammar is at a dead end: it gives up for this generation
+// rather than forcing an arbitrary token.
+static void tool_mask(EngineContext* c, std::vector<float>& logits) {
+    if (c->tool_pieces.size() != logits.size()) tool_build_pieces(c, logits.size());
+    // A piece whose first byte is rejected is rejected: 256 checks up front
+    // skip the full automaton walk for almost the whole vocabulary.
+    bool first_ok[256];
+    for (int b = 0; b < 256; ++b) first_ok[b] = c->tool.allows(std::string(1, static_cast<char>(b)), false);
+    // Inside a free-form string (most of a call: argument values) a plain
+    // piece is accepted without walking the automaton at all.
+    const bool plain_string = c->tool.in_plain_string();
+    std::vector<uint8_t> keep(logits.size(), 0);
+    size_t kept = 0;
+    for (size_t id = 0; id < logits.size(); ++id) {
+        const std::string& piece = c->tool_pieces[id];
+        bool ok;
+        if (plain_string && c->tool_plain[id]) {
+            ok = true;
+        } else if (c->tool_is_eog[id]) {
+            ok = c->tool.allows(piece, true);
+        } else {
+            ok = !piece.empty() && first_ok[static_cast<unsigned char>(piece[0])] && c->tool.allows(piece, false);
+        }
+        keep[id] = ok;
+        kept += ok;
+    }
+    if (kept == 0) {
+        c->tool.give_up();
+        return;
+    }
+    for (size_t id = 0; id < logits.size(); ++id) {
+        if (!keep[id]) logits[id] = -1e30f;
+    }
+}
+
+static void tool_accept(EngineContext* c, int32_t token) {
+    if (!c->tool.configured()) return;
+    if (c->eog_ids.count(token)) {
+        c->tool.accept(std::string());
+        return;
+    }
+    std::string piece;
+    if (c->has_tok) c->tok.piece(token, piece);
+    c->tool.accept(piece);
+}
+
+static bool tool_needs_host(const EngineContext* c) {
+    return c->tool.configured() && (c->tool.constraining() || c->tool.armed());
+}
+
+bool engine_set_tool_constraint(desireeia_ctx* ctx, const std::string& open_tag, const std::string& close_tag,
+                                const std::vector<std::string>& tool_names) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    c->tool.configure(open_tag, close_tag, tool_names);
+    return true;
+}
+
 bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, int32_t& out_token) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c) return false;
@@ -744,7 +843,9 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     // The history for the repetition penalties is the prompt itself: the
     // first generated token must not repeat what's already written.
     c->history.assign(tokens, tokens + n_tokens);
+    c->tool.reset();
     out_token = c->sampler.sample(logits, c->history);
+    tool_accept(c, out_token);
     c->last_token = out_token;
     c->has_session = true;
     c->pending.clear();
@@ -866,9 +967,17 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     if (!c->gf || !c->st.reader || !c->has_session) return false;
 
 #ifdef DESIREEIA_CUDA_ENABLED
-    {
+    if (!tool_needs_host(c)) {
         const int r = next_token_pipelined(c, out_token);
+        if (r == 1) {
+            tool_accept(c, out_token);
+            // The step already in flight drew the next token unconstrained:
+            // undo it so that token is drawn under the mask.
+            if (tool_needs_host(c)) drain_pipeline(c);
+        }
         if (r >= 0) return r == 1;                  // -1: not applicable, the step-by-step path below
+    } else {
+        drain_pipeline(c);
     }
 #endif
     int32_t tk = c->last_token;
@@ -883,7 +992,9 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     // selects them on the device and only those come back (not the whole
     // vocabulary); the token drawn is the same.
     int got = 0;
-    const uint32_t kk = c->sampler.candidates_needed(c->history);
+    // The mask needs the whole vocabulary, not just the top candidates.
+    const bool masking = c->tool.constraining();
+    const uint32_t kk = masking ? 0 : c->sampler.candidates_needed(c->history);
     if (kk) got = c->gf->step_candidates(*c->st.reader, &tk, 1, kk, c->cand_ids, c->cand_vals, logits);
     const bool ok = got == 0 ? c->gf->step(*c->st.reader, &tk, 1, logits) : got > 0;
     if (!ok) {
@@ -896,8 +1007,10 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     }
     // The token just consumed is now in the cache too.
     if (c->kv_valid) c->kv_tokens.push_back(tk);
+    if (masking && got != 1) tool_mask(c, logits);
     out_token = got == 1 ? c->sampler.sample_candidates(c->cand_ids, c->cand_vals, c->history)
                          : c->sampler.sample(logits, c->history);
+    tool_accept(c, out_token);
     c->last_token = out_token;
     return true;
 }
@@ -1238,6 +1351,32 @@ bool engine_set_prerouter_heuristic(desireeia_ctx* ctx, bool enabled) {
     return true;
 }
 
+// Renders the model's Jinja template. The tokenizer adds BOS itself, so a
+// leading bos_token the template printed is dropped (it would be doubled).
+static bool render_jinja(const EngineContext* c, const jinja::Value& messages, const jinja::Value* tools,
+                         bool add_assistant, std::string& out) {
+    if (!c->jinja_template) return false;
+    std::string bos, eos;
+    if (c->has_tok) {
+        if (c->bos_id >= 0) c->tok.piece(c->bos_id, bos);
+        if (c->eos_id >= 0) c->tok.piece(c->eos_id, eos);
+    }
+    jinja::Value vars = jinja::Value::object();
+    vars.set("messages", messages);
+    vars.set("add_generation_prompt", jinja::Value(add_assistant));
+    vars.set("bos_token", jinja::Value(bos));
+    vars.set("eos_token", jinja::Value(eos));
+    if (tools && !tools->is_none() && !tools->is_undefined()) vars.set("tools", *tools);
+    try {
+        out = c->jinja_template->render(vars);
+    } catch (const std::exception& e) {
+        if (c->st.log) c->st.log(4, (std::string("chat template failed, using the built-in format: ") + e.what()).c_str());
+        return false;
+    }
+    if (!bos.empty() && out.compare(0, bos.size(), bos) == 0) out.erase(0, bos.size());
+    return true;
+}
+
 bool engine_apply_chat_template(const desireeia_ctx* ctx,
                                 const char** roles, const char** contents, size_t n_messages,
                                 bool add_assistant, std::string& out) {
@@ -1245,8 +1384,48 @@ bool engine_apply_chat_template(const desireeia_ctx* ctx,
     if (!c) return false;
     std::vector<ChatMessage> chat;
     chat.reserve(n_messages);
+    jinja::Value messages = jinja::Value::array();
     for (size_t i = 0; i < n_messages; ++i) {
         chat.push_back({roles[i] ? roles[i] : "", contents[i] ? contents[i] : ""});
+        messages.arr().push_back(jinja::Value::object({{"role", jinja::Value(chat.back().role)},
+                                                       {"content", jinja::Value(chat.back().content)}}));
+    }
+    if (render_jinja(c, messages, nullptr, add_assistant, out)) return true;
+    out = apply_chat_template(c->chat_template, chat, add_assistant);
+    return true;
+}
+
+bool engine_apply_chat_template_json(const desireeia_ctx* ctx, const std::string& messages_json,
+                                     const std::string& tools_json, bool add_assistant, std::string& out) {
+    const EngineContext* c = reinterpret_cast<const EngineContext*>(ctx);
+    if (!c) return false;
+    jinja::Value messages, tools;
+    try {
+        messages = jinja::parse_json(messages_json);
+        if (!tools_json.empty()) tools = jinja::parse_json(tools_json);
+    } catch (const std::exception& e) {
+        if (c->st.log) c->st.log(3, (std::string("chat template: bad JSON: ") + e.what()).c_str());
+        return false;
+    }
+    if (!messages.is_array()) return false;
+    if (render_jinja(c, messages, tools.is_undefined() ? nullptr : &tools, add_assistant, out)) return true;
+    // Built-in formats only know system/user/assistant: tool results become
+    // a user turn and assistant tool calls their <tool_call> text.
+    std::vector<ChatMessage> chat;
+    for (const auto& m : messages.arr()) {
+        std::string role = m.get("role").to_string();
+        std::string content = m.get("content").is_string() ? m.get("content").str() : std::string();
+        if (role == "tool") {
+            content = "[Tool result: " + m.get("name").to_string() + "]\n" + content;
+            role = "user";
+        } else if (role == "assistant" && m.get("tool_calls").is_array()) {
+            for (const auto& call : m.get("tool_calls").arr()) {
+                const jinja::Value fn = call.get("function");
+                jinja::Value obj = jinja::Value::object({{"name", fn.get("name")}, {"arguments", fn.get("arguments")}});
+                content += "<tool_call>\n" + obj.to_json() + "\n</tool_call>";
+            }
+        }
+        chat.push_back({role, content});
     }
     out = apply_chat_template(c->chat_template, chat, add_assistant);
     return true;
@@ -1441,7 +1620,9 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
         return false;
     }
     c->history.assign(tokens, tokens + n_tokens);
+    c->tool.reset();
     out_token = c->sampler.sample(logits, c->history);
+    tool_accept(c, out_token);
     c->last_token = out_token;
     c->has_session = true;
     c->pending.clear();

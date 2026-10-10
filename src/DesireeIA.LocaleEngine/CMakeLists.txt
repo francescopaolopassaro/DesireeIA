@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(DesireeIALocaleEngine CXX)
+project(DesireeIALocaleEngine C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -45,7 +45,9 @@ add_library(DesireeIALocaleEngine SHARED
     src/core/quant.cpp
     src/core/ctx.cpp
     src/core/sampler.cpp
+    src/core/tool_grammar.cpp
     src/core/chat_template.cpp
+    src/core/jinja.cpp
     src/core/arch_tags.cpp
     src/models/dense_forward.cpp
     src/models/moe_route.cpp
@@ -68,7 +70,22 @@ add_library(DesireeIALocaleEngine SHARED
     src/vision/vision_image.cpp
     src/vision/vision_clip.cpp
     src/vision/vision_gguf.cpp
+    src/memory/context_memory.cpp
 )
+
+# Brotli compresses the context-memory blocks (src/memory). Built static
+# from source and linked privately, so the shipped DLL carries no extra
+# runtime dependency.
+include(FetchContent)
+set(BROTLI_DISABLE_TESTS ON CACHE BOOL "" FORCE)
+set(BROTLI_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(brotli
+    GIT_REPOSITORY https://github.com/google/brotli.git
+    GIT_TAG v1.1.0
+    GIT_SHALLOW TRUE)
+FetchContent_MakeAvailable(brotli)
+target_link_libraries(DesireeIALocaleEngine PRIVATE brotlienc brotlidec brotlicommon)
 
 if(DESIREEIA_ENABLE_CUDA)
     target_sources(DesireeIALocaleEngine PRIVATE src/cuda/backend_cuda.cu)
@@ -146,6 +163,15 @@ if(DESIREEIA_BUILD_TESTS)
         target_compile_definitions(desireeia_selftest PRIVATE DESIREEIA_CUDA_ENABLED)
     endif()
     add_test(NAME desireeia_selftest COMMAND desireeia_selftest)
+
+    # Agentic layer without a model: tool-call constraint, Jinja chat
+    # templates (vs jinja2 fixtures), context memory.
+    add_executable(desireeia_agentic_test tests/agentic_test.cpp)
+    target_include_directories(desireeia_agentic_test PRIVATE src)
+    target_link_libraries(desireeia_agentic_test PRIVATE DesireeIALocaleEngine)
+    target_compile_definitions(desireeia_agentic_test PRIVATE
+        DESIREEIA_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
+    add_test(NAME desireeia_agentic_test COMMAND desireeia_agentic_test)
 
     # Sessione di conversazione (riuso del prefisso della KV cache) su un modello reale:
     #   desireeia_session_test <modello.gguf>   (senza argomento viene saltato).

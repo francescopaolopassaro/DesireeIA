@@ -1,0 +1,4 @@
+[gMASK]<sop><|user|>
+Hi<|assistant|>
+<think></think>
+Hello!

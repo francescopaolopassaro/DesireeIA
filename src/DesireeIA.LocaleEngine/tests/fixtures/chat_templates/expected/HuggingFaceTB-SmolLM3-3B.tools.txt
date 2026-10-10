@@ -1,0 +1,35 @@
+<|im_start|>system
+## Metadata
+
+Knowledge Cutoff Date: June 2025
+Today Date: 01 January 2026
+Reasoning Mode: /think
+
+## Custom Instructions
+
+Agent.
+
+### Tools
+
+You may call one or more functions to assist with the user query.
+You are provided with function signatures within <tools></tools> XML tags:
+
+<tools>
+{'type': 'function', 'function': {'name': 'memory_search', 'description': 'Search an opened file.', 'parameters': {'type': 'object', 'properties': {'handle': {'type': 'string'}, 'query': {'type': 'string'}}, 'required': ['query']}}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+<|im_end|>
+<|im_start|>user
+Find calcola_sconto<|im_end|>
+<|im_start|>assistant
+<|im_end|>
+<|im_start|>user
+{"results": []}<|im_end|>
+<|im_start|>user
+ok<|im_end|>
+<|im_start|>assistant

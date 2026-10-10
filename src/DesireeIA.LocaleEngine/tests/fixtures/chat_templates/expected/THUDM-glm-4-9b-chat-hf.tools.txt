@@ -1,0 +1,5 @@
+[gMASK]<sop><|system|>
+Agent.<|user|>
+Find calcola_sconto<|tool|>
+{"results": []}<|user|>
+ok<|assistant|>

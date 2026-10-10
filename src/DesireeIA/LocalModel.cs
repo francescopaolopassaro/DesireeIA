@@ -59,6 +59,10 @@ public sealed class LocalModel : IDisposable
     private bool _disposed;
     private readonly NativeMethods.LogCallback? _loggerInstance;
 
+    // Raw desireeia_ctx*, for engine features that take a loaded model
+    // (ContextMemory.SetEmbedder).
+    internal IntPtr NativeHandle => _context;
+
     public string ModelPath { get; }
     public ExecutionPlan Plan { get; }
 
@@ -435,6 +439,31 @@ public sealed class LocalModel : IDisposable
     /// Falcon3, Exaone3) — no longer just gemma hardcoded here in the CLI.
     /// Unrecognized formats fall back to ChatML.
     /// </summary>
+    /// <summary>
+    /// Renders full OpenAI-shaped messages (JSON array: roles system/user/assistant/tool,
+    /// assistant "tool_calls") and optional tool definitions (JSON array) through the
+    /// model's own Jinja chat template, executed natively by the engine.
+    /// </summary>
+    public string ApplyChatTemplateJson(string messagesJson, string? toolsJson = null, bool addAssistant = true)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var msgs = Utf8Z(messagesJson);
+        var tools = toolsJson is null ? null : Utf8Z(toolsJson);
+        var err = NativeMethods.desireeia_apply_chat_template_json(_context, msgs, tools, addAssistant ? 1 : 0, null, 0, out var needed);
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Apply chat template failed: {err}");
+        var buf = new byte[needed + 1];
+        err = NativeMethods.desireeia_apply_chat_template_json(_context, msgs, tools, addAssistant ? 1 : 0, buf, (nuint)buf.Length, out needed);
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Apply chat template failed: {err}");
+        return System.Text.Encoding.UTF8.GetString(buf, 0, (int)needed);
+
+        static byte[] Utf8Z(string s)
+        {
+            var b = new byte[System.Text.Encoding.UTF8.GetByteCount(s) + 1];
+            System.Text.Encoding.UTF8.GetBytes(s, 0, s.Length, b, 0);
+            return b;
+        }
+    }
+
     public string ApplyChatTemplate(IReadOnlyList<(string Role, string Content)> messages, bool addAssistant = true)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -490,6 +519,45 @@ public sealed class LocalModel : IDisposable
     /// <summary>
     /// Sets the sampling parameters. Takes effect from the next token onward.
     /// </summary>
+    /// <summary>
+    /// Constrains tool calls at token level: once <paramref name="openTag"/> is
+    /// generated, the engine only samples tokens forming a valid
+    /// {"name": &lt;tool&gt;, "arguments": {...}} followed by <paramref name="closeTag"/>.
+    /// <paramref name="toolNames"/> null turns it off; empty accepts any name.
+    /// </summary>
+    public void SetToolConstraint(IReadOnlyList<string>? toolNames, string openTag = "<tool_call>",
+        string closeTag = "</tool_call>")
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (toolNames is null)
+        {
+            Check(NativeMethods.desireeia_set_tool_constraint(_context, null, null, null, 0));
+            return;
+        }
+        var handles = new IntPtr[toolNames.Count];
+        try
+        {
+            for (int i = 0; i < handles.Length; i++) handles[i] = Utf8ZAlloc(toolNames[i]);
+            Check(NativeMethods.desireeia_set_tool_constraint(_context, Utf8Z(openTag), Utf8Z(closeTag),
+                handles, (nuint)handles.Length));
+        }
+        finally
+        {
+            foreach (var h in handles) if (h != IntPtr.Zero) Marshal.FreeHGlobal(h);
+        }
+
+        static byte[] Utf8Z(string s)
+        {
+            var b = new byte[System.Text.Encoding.UTF8.GetByteCount(s) + 1];
+            System.Text.Encoding.UTF8.GetBytes(s, 0, s.Length, b, 0);
+            return b;
+        }
+        static void Check(NativeMethods.Error err)
+        {
+            if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Set tool constraint failed: {err}");
+        }
+    }
+
     public void SetSampling(SamplingOptions options)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);

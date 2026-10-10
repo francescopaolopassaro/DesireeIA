@@ -1,0 +1,19 @@
+<|im_start|>system
+## Metadata
+
+Knowledge Cutoff Date: June 2025
+Today Date: 01 January 2026
+Reasoning Mode: /think
+
+## Custom Instructions
+
+You are helpful.
+
+<|im_start|>user
+Ciao, città è perché? "quoted" <tag> {{x}}<|im_end|>
+<|im_start|>assistant
+Risposta.
+Seconda riga.<|im_end|>
+<|im_start|>user
+E poi?<|im_end|>
+<|im_start|>assistant

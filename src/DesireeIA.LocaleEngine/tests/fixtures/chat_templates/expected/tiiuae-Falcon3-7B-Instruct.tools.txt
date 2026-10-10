@@ -1,0 +1,66 @@
+<|system|>
+Agent.You are a Falcon assistant skilled in function calling. You are helpful, respectful, and concise.
+
+# Tools
+
+You have access to the following functions. You MUST use them to answer questions when needed. For each function call, you MUST return a JSON object inside <tool_call></tool_call> tags.
+
+<tools>[
+  {
+    "type": "function",
+    "function": {
+      "name": "memory_search",
+      "description": "Search an opened file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "handle": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  }
+]</tools>
+
+# Output Format
+
+Your response MUST follow this format when making function calls:
+<tool_call>
+[
+  {"name": "function_name", "arguments": {"arg1": "value1", "arg2": "value2"}},
+  {"name": "another_function", "arguments": {"arg": "value"}}
+]
+</tool_call>
+If no function calls are needed, respond normally without the tool_call tags.
+<|user|>
+Find calcola_sconto
+
+<tool_call>
+[
+  {
+    "type": "function",
+    "id": "call_1",
+    "function": {
+      "name": "memory_search",
+      "arguments": {
+        "handle": "sp_1",
+        "query": "calcola_sconto"
+      }
+    }
+  }
+]
+</tool_call></s>
+<|assistant|>
+<tool_response>
+{"results": []}
+</tool_response>
+<|user|>
+ok
+<|assistant|>

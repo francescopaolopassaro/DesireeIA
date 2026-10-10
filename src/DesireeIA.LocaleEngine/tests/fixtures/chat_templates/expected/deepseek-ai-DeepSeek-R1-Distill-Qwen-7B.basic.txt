@@ -1,0 +1,2 @@
+<s>You are helpful.<｜User｜>Ciao, città è perché? "quoted" <tag> {{x}}<｜Assistant｜>Risposta.
+Seconda riga.<｜end▁of▁sentence｜><｜User｜>E poi?<｜Assistant｜><think>

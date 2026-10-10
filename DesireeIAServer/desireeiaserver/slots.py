@@ -34,6 +34,7 @@ import time
 from typing import Dict, Iterator, List, Optional, Tuple
 
 from . import engine as engine_mod
+from . import toolcalling
 from . import models_store
 from .api.errors import NotFoundError, UnavailableError
 from .config import Settings
@@ -245,6 +246,12 @@ class SlotPrediction:
             from dataclasses import replace
             target = replace(target, **kwargs)
         model.set_sampling(target)
+        # Always (re)set: the constraint persists on the model across
+        # requests, so a request without tools must turn it back off.
+        if hasattr(model, "set_tool_constraint"):
+            names = self._params.tool_names
+            model.set_tool_constraint(list(names) if names is not None else None,
+                                      toolcalling.TOOL_CALL_OPEN, toolcalling.TOOL_CALL_CLOSE)
 
     def _build_generation(self, model) -> None:
         options = engine_mod.generate_options(

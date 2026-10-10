@@ -422,6 +422,30 @@ class LocalModel:
 
     # -- chat template -------------------------------------------------------
 
+    def apply_chat_template_messages(self, messages: list, tools: Optional[list] = None,
+                                     add_assistant: bool = True) -> str:
+        """Render full OpenAI-shaped messages (``tool`` role, assistant
+        ``tool_calls``) and optional tool definitions through the model's
+        own Jinja chat template, executed natively by the engine."""
+        import json as _json
+        self._check()
+        lib = _nat.get_lib()
+        msgs = _json.dumps(messages, ensure_ascii=False).encode("utf-8")
+        tls = _json.dumps(tools, ensure_ascii=False).encode("utf-8") if tools is not None else None
+        needed = c_uint64()
+        with self._lock:
+            err = lib.desireeia_apply_chat_template_json(self._ctx, msgs, tls, 1 if add_assistant else 0,
+                                                         None, 0, byref(needed))
+        if err != Error.OK:
+            raise RuntimeError(f"Apply chat template failed: {Error(err).name}")
+        buf = (c_char * (needed.value + 1))()
+        with self._lock:
+            err = lib.desireeia_apply_chat_template_json(self._ctx, msgs, tls, 1 if add_assistant else 0,
+                                                         buf, needed.value + 1, byref(needed))
+        if err != Error.OK:
+            raise RuntimeError(f"Apply chat template failed: {Error(err).name}")
+        return bytes(buf[: needed.value]).decode("utf-8", errors="replace")
+
     def apply_chat_template(
         self,
         messages: List[Tuple[str, str]],
@@ -472,6 +496,24 @@ class LocalModel:
             )
         if err != Error.OK:
             raise RuntimeError(f"Set sampling failed: {Error(err).name}")
+
+    def set_tool_constraint(self, tool_names: Optional[List[str]] = None,
+                            open_tag: str = "<tool_call>", close_tag: str = "</tool_call>") -> None:
+        """Constrain tool calls at token level: once ``open_tag`` is generated,
+        the engine only samples tokens that form a valid
+        ``{"name": <tool>, "arguments": {...}}`` followed by ``close_tag``.
+        ``tool_names=None`` turns the constraint off; ``[]`` accepts any name."""
+        self._check()
+        lib = _nat.get_lib()
+        if tool_names is None:
+            err = lib.desireeia_set_tool_constraint(self._ctx, None, None, None, 0)
+        else:
+            arr = (ctypes.c_char_p * max(1, len(tool_names)))(*[n.encode("utf-8") for n in tool_names])
+            with self._lock:
+                err = lib.desireeia_set_tool_constraint(self._ctx, open_tag.encode("utf-8"),
+                                                        close_tag.encode("utf-8"), arr, len(tool_names))
+        if err != Error.OK:
+            raise RuntimeError(f"Set tool constraint failed: {Error(err).name}")
 
     def get_sampling(self) -> SamplingOptions:
         """Get current sampling parameters."""

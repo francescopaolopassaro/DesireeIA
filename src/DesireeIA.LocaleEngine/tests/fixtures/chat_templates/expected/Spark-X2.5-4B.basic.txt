@@ -1,0 +1,5 @@
+<｜start▁of▁sentence｜><|System|>
+you are a helpful assistant.
+
+You are helpful.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Ciao, città è perché? "quoted" <tag> {{x}}<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|></think>Risposta.
+Seconda riga.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>E poi?<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>

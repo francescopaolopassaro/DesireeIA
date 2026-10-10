@@ -109,6 +109,41 @@ def render_tool_call_text(name: str, arguments: Any) -> str:
     return f"{TOOL_CALL_OPEN}{payload}{TOOL_CALL_CLOSE}"
 
 
+def _repair_truncated_object(raw: str) -> Optional[str]:
+    """Small models often drop the final "}" of a tool call and trail stray
+    tag text (seen: `{"name": ..., "arguments": {...}</arg_value>`). Walk
+    the first object string-aware, cut at the first non-JSON junk once the
+    nesting is back to depth 1, and close whatever is still open."""
+    start = raw.find("{")
+    if start == -1:
+        return None
+    depth, in_str, esc, end = 0, False, False, None
+    for i in range(start, len(raw)):
+        c = raw[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+            end = i + 1
+            if depth == 0:
+                return raw[start:end]
+        elif c == "<" and end is not None:
+            break
+    if end is None or in_str:
+        return None
+    return raw[start:end] + "}" * depth
+
+
 def _parse_name_arguments_object(raw: str) -> Optional[dict]:
     """Parse a JSON object shaped {"name": ..., "arguments": {...}} - the
     body of <tool_call>/<function_call>, and also what a <function=NAME>
@@ -116,22 +151,20 @@ def _parse_name_arguments_object(raw: str) -> Optional[dict]:
     name inside the JSON too, rather than only in the tag)."""
     from desireeia.generation import StructuredOutput
 
-    candidate = StructuredOutput.try_extract_json(raw)
-    if candidate is None:
-        return None
-    try:
-        parsed = json.loads(candidate)
-    except (json.JSONDecodeError, ValueError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    name = parsed.get("name")
-    if not isinstance(name, str) or not name:
-        return None
-    arguments = parsed.get("arguments", {})
-    if not isinstance(arguments, dict):
-        return None
-    return {"name": name, "arguments": arguments}
+    for candidate in (StructuredOutput.try_extract_json(raw), _repair_truncated_object(raw)):
+        if candidate is None:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(parsed, dict):
+            continue
+        name = parsed.get("name")
+        arguments = parsed.get("arguments", {})
+        if isinstance(name, str) and name and isinstance(arguments, dict):
+            return {"name": name, "arguments": arguments}
+    return None
 
 
 def _parse_json_object(raw: str) -> Optional[dict]:
@@ -157,6 +190,18 @@ def extract_tool_call(text: str) -> Optional[dict]:
             result = _parse_name_arguments_object(match.group(1))
             if result is not None:
                 return result
+
+    # Small models often break the block: EOS right after the JSON (no
+    # closing </tool_call>), or stray tag text between the JSON and the
+    # closing tag. Take whatever follows <tool_call> and let the lenient
+    # object parser recover it.
+    open_at = text.find("<tool_call>")
+    if open_at != -1:
+        body = text[open_at + len("<tool_call>"):]
+        close_at = body.find("</tool_call>")
+        result = _parse_name_arguments_object(body if close_at == -1 else body[:close_at])
+        if result is not None:
+            return result
 
     match = _FUNCTION_INLINE_RE.search(text)
     if match:

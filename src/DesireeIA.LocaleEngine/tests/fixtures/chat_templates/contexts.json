@@ -1,0 +1,116 @@
+{
+  "basic": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are helpful."
+      },
+      {
+        "role": "user",
+        "content": "Ciao, città è perché? \"quoted\" <tag> {{x}}"
+      },
+      {
+        "role": "assistant",
+        "content": "Risposta.\nSeconda riga."
+      },
+      {
+        "role": "user",
+        "content": "E poi?"
+      }
+    ],
+    "add_generation_prompt": true
+  },
+  "nosystem": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi"
+      }
+    ],
+    "add_generation_prompt": true
+  },
+  "nogen": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello!"
+      }
+    ],
+    "add_generation_prompt": false
+  },
+  "tools": {
+    "bos_token": "<s>",
+    "eos_token": "</s>",
+    "messages": [
+      {
+        "role": "system",
+        "content": "Agent."
+      },
+      {
+        "role": "user",
+        "content": "Find calcola_sconto"
+      },
+      {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "function",
+            "id": "call_1",
+            "function": {
+              "name": "memory_search",
+              "arguments": {
+                "handle": "sp_1",
+                "query": "calcola_sconto"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "role": "tool",
+        "tool_call_id": "call_1",
+        "name": "memory_search",
+        "content": "{\"results\": []}"
+      },
+      {
+        "role": "user",
+        "content": "ok"
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "memory_search",
+          "description": "Search an opened file.",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "handle": {
+                "type": "string"
+              },
+              "query": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        }
+      }
+    ],
+    "add_generation_prompt": true
+  }
+}

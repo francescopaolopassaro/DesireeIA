@@ -28,6 +28,7 @@ SERIALIZED_KEYS = (
     "top_p", "repeat_penalty", "repeat_last_n", "frequency_penalty",
     "presence_penalty", "seed", "n_predict", "system_prompt", "log_level",
     "max_upload_mb", "max_request_mb", "whisper_model",
+    "context_memory_ttl_seconds", "context_spill_chars",
 )
 
 
@@ -81,6 +82,12 @@ class Settings:
     enable_python_tool: bool = False
     enable_whisper: bool = False
     whisper_model: str = "base"
+    # Engine context memory (desireeia_memory_*): per-session working store
+    # on SSD for big tool payloads. A session idle longer than the TTL is
+    # deleted from disk; tool results longer than context_spill_chars are
+    # replaced in the prompt by a short stub the model pages through.
+    context_memory_ttl_seconds: int = 1800
+    context_spill_chars: int = 4000
     config_path: Optional[Path] = None
 
     @property

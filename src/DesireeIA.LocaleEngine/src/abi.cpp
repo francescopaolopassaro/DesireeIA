@@ -8,10 +8,17 @@
 #include "desireeia/abi.h"
 #include "core/engine.h"
 #include "core/profile.h"
+#include "memory/context_memory.h"
 #include "vision/vision_clip.h"
 #include "vision/vision_image.h"
 
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 #include <exception>
 #include <new>
 #include <string>
@@ -483,6 +490,30 @@ DESIREEIA_API desireeia_error desireeia_apply_chat_template(const desireeia_ctx*
     ABI_GUARD_END
 }
 
+DESIREEIA_API desireeia_error desireeia_apply_chat_template_json(const desireeia_ctx* ctx,
+                                                         const char* messages_json,
+                                                         const char* tools_json,
+                                                         int add_assistant,
+                                                         char* out_buf,
+                                                         size_t buf_size,
+                                                         size_t* out_len) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !messages_json) return DESIREEIA_ERR_INVALID_ARG;
+    std::string result;
+    if (!desireeia::engine_apply_chat_template_json(ctx, messages_json, tools_json ? tools_json : "",
+                                                    add_assistant != 0, result)) {
+        return DESIREEIA_ERR_PARSE;
+    }
+    if (out_len) *out_len = result.size();
+    if (out_buf && buf_size > 0) {
+        const size_t n = result.size() < buf_size - 1 ? result.size() : buf_size - 1;
+        std::memcpy(out_buf, result.data(), n);
+        out_buf[n] = '\0';
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
 DESIREEIA_API int32_t desireeia_abi_version(void) {
     return DESIREEIA_ABI_VERSION;
 }
@@ -778,6 +809,218 @@ DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
         return DESIREEIA_ERR_UNDEFINED;
     }
     *out_token = token;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+// ---- tool-call constraint ----------------------------------------------
+
+DESIREEIA_API desireeia_error desireeia_set_tool_constraint(desireeia_ctx* ctx, const char* open_tag,
+                                                            const char* close_tag,
+                                                            const char* const* tool_names, size_t n_tools) {
+    ABI_GUARD_BEGIN
+    if (!ctx || (n_tools && !tool_names)) return DESIREEIA_ERR_INVALID_ARG;
+    std::vector<std::string> names;
+    for (size_t i = 0; i < n_tools; ++i) {
+        if (!tool_names[i]) return DESIREEIA_ERR_INVALID_ARG;
+        names.emplace_back(tool_names[i]);
+    }
+    if (!desireeia::engine_set_tool_constraint(ctx, open_tag ? open_tag : "", close_tag ? close_tag : "", names)) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+// ---- context memory ----------------------------------------------------
+
+struct desireeia_memory {
+    std::unique_ptr<desireeia::ContextMemory> impl;
+};
+
+namespace {
+    desireeia_error memory_out(const std::string& json, char** out_json) {
+        char* buf = static_cast<char*>(std::malloc(json.size() + 1));
+        if (!buf) return DESIREEIA_ERR_NO_MEM;
+        std::memcpy(buf, json.c_str(), json.size() + 1);
+        *out_json = buf;
+        return DESIREEIA_OK;
+    }
+
+    // I/O failures (file locked, missing, disk full) are reported as a JSON
+    // {"error": ...} result rather than a bare code: the caller is usually
+    // an agent loop that hands the result straight back to the model, which
+    // can only react to an error it can read.
+    desireeia_error memory_error(const char* fn, const char* what, char** out_json) {
+        log_msg(2, (std::string(fn) + ": " + what).c_str());
+        std::string json = "{\"error\":\"";
+        for (const char* p = what; *p; ++p) {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            if (c == '"' || c == '\\') { json += '\\'; json += static_cast<char>(c); }
+            else if (c >= 0x20) json += static_cast<char>(c);
+            else json += ' ';
+        }
+        json += "\"}";
+        return memory_out(json, out_json);
+    }
+
+    // Engine embedding of one block: mean pooled over tokens, L2 normalized.
+    std::vector<float> memory_embed(desireeia_ctx* ctx, const std::string& text) {
+        std::vector<int32_t> ids;
+        if (!desireeia::engine_tokenize(ctx, text, true, ids) || ids.empty()) return {};
+        if (ids.size() > 512) ids.resize(512);  // encoder context; the block head carries the topic
+        std::vector<float> rows;
+        uint32_t dim = 0;
+        if (!desireeia::engine_embed(ctx, ids.data(), ids.size(), rows, dim) || dim == 0) return {};
+        std::vector<float> pooled(dim, 0.0f);
+        const size_t n = rows.size() / dim;
+        for (size_t t = 0; t < n; ++t) {
+            for (uint32_t d = 0; d < dim; ++d) pooled[d] += rows[t * dim + d];
+        }
+        double norm = 0.0;
+        for (float v : pooled) norm += static_cast<double>(v) * v;
+        norm = std::sqrt(norm);
+        if (norm > 0) {
+            for (float& v : pooled) v = static_cast<float>(v / norm);
+        }
+        return pooled;
+    }
+}
+
+#define MEM_CHECK(cond) if (!(cond)) return DESIREEIA_ERR_INVALID_ARG
+#define MEM_TRY(expr) \
+    try { return memory_out((expr), out_json); } \
+    catch (const std::invalid_argument& e) { return report_exception(__func__, e.what(), DESIREEIA_ERR_INVALID_ARG); } \
+    catch (const std::filesystem::filesystem_error& e) { return memory_error(__func__, e.what(), out_json); } \
+    catch (const std::runtime_error& e) { return memory_error(__func__, e.what(), out_json); }
+
+DESIREEIA_API desireeia_error desireeia_memory_open(const char* root_dir, double ttl_seconds,
+                                                    desireeia_memory** out_mem) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(root_dir && out_mem);
+    auto mem = std::make_unique<desireeia_memory>();
+    mem->impl = std::make_unique<desireeia::ContextMemory>(std::filesystem::u8path(root_dir), ttl_seconds);
+    *out_mem = mem.release();
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_close(desireeia_memory* mem) {
+    ABI_GUARD_BEGIN
+    delete mem;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_set_embedder(desireeia_memory* mem, desireeia_ctx* ctx) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem);
+    if (ctx) {
+        mem->impl->set_embedder([ctx](const std::string& text) { return memory_embed(ctx, text); });
+    } else {
+        mem->impl->set_embedder(nullptr);
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API void desireeia_memory_free_string(char* s) {
+    std::free(s);
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_put_file(desireeia_memory* mem, const char* session,
+                                                        const char* name, const char* path, char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && name && path && out_json);
+    MEM_TRY(mem->impl->put_file(session, name, std::filesystem::u8path(path)))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_put_text(desireeia_memory* mem, const char* session,
+                                                        const char* name, const char* text, size_t text_len,
+                                                        char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && name && (text || text_len == 0) && out_json);
+    MEM_TRY(mem->impl->put_text(session, name, std::string(text ? text : "", text_len)))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_append(desireeia_memory* mem, const char* session,
+                                                      const char* name, const char* text, size_t text_len,
+                                                      char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && name && (text || text_len == 0) && out_json);
+    MEM_TRY(mem->impl->append(session, name, std::string(text ? text : "", text_len)))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_read(desireeia_memory* mem, const char* session,
+                                                    const char* handle, uint32_t offset, uint32_t limit,
+                                                    char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && handle && out_json);
+    MEM_TRY(mem->impl->read(session, handle, offset, limit))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_search(desireeia_memory* mem, const char* session,
+                                                      const char* query, const char* handle, uint32_t k,
+                                                      char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && query && out_json);
+    MEM_TRY(mem->impl->search(session, query, handle ? handle : "", k))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_list(desireeia_memory* mem, const char* session, char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && out_json);
+    MEM_TRY(mem->impl->list(session))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_replace_lines(desireeia_memory* mem, const char* session,
+                                                             const char* handle, uint32_t first, uint32_t last,
+                                                             const char* text, size_t text_len, char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && handle && (text || text_len == 0) && out_json);
+    MEM_TRY(mem->impl->replace_lines(session, handle, first, last, std::string(text ? text : "", text_len)))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_export(desireeia_memory* mem, const char* session,
+                                                      const char* handle, const char* path, char** out_json) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session && handle && path && out_json);
+    MEM_TRY(mem->impl->export_to(session, handle, std::filesystem::u8path(path)))
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_touch(desireeia_memory* mem, const char* session) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session);
+    mem->impl->touch(session);
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_drop_session(desireeia_memory* mem, const char* session) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem && session);
+    try {
+        mem->impl->drop_session(session);
+    } catch (const std::invalid_argument& e) {
+        return report_exception(__func__, e.what(), DESIREEIA_ERR_INVALID_ARG);
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_memory_sweep(desireeia_memory* mem, int32_t* out_removed) {
+    ABI_GUARD_BEGIN
+    MEM_CHECK(mem);
+    const int removed = mem->impl->sweep();
+    if (out_removed) *out_removed = removed;
     return DESIREEIA_OK;
     ABI_GUARD_END
 }

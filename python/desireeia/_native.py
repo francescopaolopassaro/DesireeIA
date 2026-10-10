@@ -348,6 +348,9 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.desireeia_set_sampling.argtypes = [c_void_p, POINTER(Sampling)]
     lib.desireeia_set_sampling.restype = c_int32
 
+    lib.desireeia_set_tool_constraint.argtypes = [c_void_p, c_char_p, c_char_p, POINTER(c_char_p), c_uint64]
+    lib.desireeia_set_tool_constraint.restype = c_int32
+
     lib.desireeia_get_sampling.argtypes = [c_void_p, POINTER(Sampling)]
     lib.desireeia_get_sampling.restype = c_int32
 
@@ -375,6 +378,11 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         POINTER(ctypes.c_char), c_uint64, POINTER(c_uint64)
     ]
     lib.desireeia_apply_chat_template.restype = c_int32
+
+    lib.desireeia_apply_chat_template_json.argtypes = [
+        c_void_p, c_char_p, c_char_p, c_int32, POINTER(ctypes.c_char), c_uint64, POINTER(c_uint64)
+    ]
+    lib.desireeia_apply_chat_template_json.restype = c_int32
 
     # profiling
     lib.desireeia_profile_dump.argtypes = [
@@ -439,3 +447,29 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         POINTER(c_float), c_uint64, c_int32, POINTER(c_int32)
     ]
     lib.desireeia_predict_image.restype = c_int32
+
+    # context memory (on-board RAG over SSD, see abi.h)
+    lib.desireeia_memory_open.argtypes = [c_char_p, ctypes.c_double, POINTER(c_void_p)]
+    lib.desireeia_memory_open.restype = c_int32
+    lib.desireeia_memory_close.argtypes = [c_void_p]
+    lib.desireeia_memory_close.restype = c_int32
+    lib.desireeia_memory_set_embedder.argtypes = [c_void_p, c_void_p]
+    lib.desireeia_memory_set_embedder.restype = c_int32
+    lib.desireeia_memory_free_string.argtypes = [c_void_p]
+    lib.desireeia_memory_free_string.restype = None
+    _out = POINTER(c_void_p)
+    lib.desireeia_memory_put_file.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p, _out]
+    lib.desireeia_memory_put_text.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p, c_uint64, _out]
+    lib.desireeia_memory_append.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p, c_uint64, _out]
+    lib.desireeia_memory_read.argtypes = [c_void_p, c_char_p, c_char_p, c_uint32, c_uint32, _out]
+    lib.desireeia_memory_search.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p, c_uint32, _out]
+    lib.desireeia_memory_list.argtypes = [c_void_p, c_char_p, _out]
+    lib.desireeia_memory_replace_lines.argtypes = [c_void_p, c_char_p, c_char_p, c_uint32, c_uint32,
+                                                   c_char_p, c_uint64, _out]
+    lib.desireeia_memory_export.argtypes = [c_void_p, c_char_p, c_char_p, c_char_p, _out]
+    lib.desireeia_memory_touch.argtypes = [c_void_p, c_char_p]
+    lib.desireeia_memory_drop_session.argtypes = [c_void_p, c_char_p]
+    lib.desireeia_memory_sweep.argtypes = [c_void_p, POINTER(c_int32)]
+    for fn in ("put_file", "put_text", "append", "read", "search", "list", "replace_lines", "export",
+               "touch", "drop_session", "sweep"):
+        getattr(lib, "desireeia_memory_" + fn).restype = c_int32

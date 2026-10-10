@@ -184,3 +184,100 @@ async def search_files(request: Request):
     results = await anyio.to_thread.run_sync(sandbox.search_files, workspace_dir, payload["query"])
     metrics.record_tool_call()
     return {"results": results}
+
+
+# ---------------------------------------------------------------------------
+# Context memory tools (engine-side, desireeia_memory_*): open a workspace
+# file as a short stub, then search / read windows / edit by line range. The
+# file on disk stays the source of truth: the engine re-syncs when it
+# changes and writes edits straight back to it.
+# ---------------------------------------------------------------------------
+
+def _memory_and_session(request: Request, payload: dict):
+    memory = getattr(request.app.state, "memory", None)
+    if memory is None:
+        raise NotSupportedError("the loaded engine has no context memory")
+    session_id = payload.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        raise InvalidRequestError("field 'session_id' (string) is required", param="session_id")
+    return memory, session_id
+
+
+def _int_field(payload: dict, key: str, default: int) -> int:
+    value = payload.get(key, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise InvalidRequestError(f"field '{key}' must be an integer", param=key) from exc
+
+
+async def _memory_call(fn, *args):
+    try:
+        return await anyio.to_thread.run_sync(fn, *args)
+    except RuntimeError as exc:
+        raise InvalidRequestError(str(exc)) from exc
+
+
+@router.post("/open_file")
+async def open_file(request: Request):
+    settings: Settings = request.app.state.settings
+    _require_enabled(settings)
+    payload = await _read_json_body(request)
+    memory, session_id = _memory_and_session(request, payload)
+    if not isinstance(payload.get("path"), str):
+        raise InvalidRequestError("field 'path' (string) is required", param="path")
+    workspace_dir = _resolve_workspace(settings, payload, required=True)
+    try:
+        target = sandbox.resolve_in_workspace(workspace_dir, payload["path"])
+    except ValueError as exc:
+        raise InvalidRequestError(str(exc), param="path") from exc
+    if not target.is_file():
+        raise InvalidRequestError(f"not a file: {payload['path']}", param="path")
+    metrics.record_tool_call()
+    return await _memory_call(memory.put_file, session_id, str(target), str(target))
+
+
+@router.post("/memory_read")
+async def memory_read(request: Request):
+    _require_enabled(request.app.state.settings)
+    payload = await _read_json_body(request)
+    memory, session_id = _memory_and_session(request, payload)
+    metrics.record_tool_call()
+    return await _memory_call(memory.read, session_id, str(payload.get("handle", "")),
+                              _int_field(payload, "offset", 1), _int_field(payload, "limit", 200))
+
+
+@router.post("/memory_search")
+async def memory_search(request: Request):
+    _require_enabled(request.app.state.settings)
+    payload = await _read_json_body(request)
+    memory, session_id = _memory_and_session(request, payload)
+    if not isinstance(payload.get("query"), str) or not payload["query"]:
+        raise InvalidRequestError("field 'query' (non-empty string) is required", param="query")
+    handle = payload.get("handle") or None
+    metrics.record_tool_call()
+    return await _memory_call(memory.search, session_id, payload["query"], handle, _int_field(payload, "k", 5))
+
+
+@router.post("/memory_replace_lines")
+async def memory_replace_lines(request: Request):
+    _require_enabled(request.app.state.settings)
+    payload = await _read_json_body(request)
+    memory, session_id = _memory_and_session(request, payload)
+    if not isinstance(payload.get("text"), str):
+        raise InvalidRequestError("field 'text' (string) is required", param="text")
+    metrics.record_tool_call()
+    return await _memory_call(memory.replace_lines, session_id, str(payload.get("handle", "")),
+                              _int_field(payload, "first", 1), _int_field(payload, "last", 0), payload["text"])
+
+
+@router.post("/memory_append")
+async def memory_append(request: Request):
+    """Stream ingestion: append text to a named item (created on first use)."""
+    _require_enabled(request.app.state.settings)
+    payload = await _read_json_body(request)
+    memory, session_id = _memory_and_session(request, payload)
+    if not isinstance(payload.get("name"), str) or not isinstance(payload.get("text"), str):
+        raise InvalidRequestError("fields 'name' and 'text' (strings) are required")
+    metrics.record_tool_call()
+    return await _memory_call(memory.append, session_id, payload["name"], payload["text"])

@@ -41,6 +41,9 @@ class CodegenParams:
     echo: bool = False
     n: int = 1
     response_format: Optional[dict] = None
+    # Names of the tools the request declares: the engine then constrains
+    # every <tool_call> block at token level to a valid call of one of them.
+    tool_names: Optional[Tuple[str, ...]] = None
 
     def generation_max_tokens(self, settings: Settings) -> int:
         if self.max_tokens is not None and self.max_tokens > 0:

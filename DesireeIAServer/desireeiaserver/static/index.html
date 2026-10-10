@@ -1542,7 +1542,9 @@ server binary, not a product with its own release cycle.
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read a text file from the conversation workspace.',
+      description: 'Open a text file of the workspace for reading or analysis. Returns a short stub ' +
+        '(handle, line count, outline, first lines), never the whole file: the content stays on the ' +
+        'server and is reached with memory_search, memory_read and memory_replace_lines using the handle.',
       parameters: {
         type: 'object',
         properties: { path: { type: 'string', description: 'File path, relative to the workspace root.' } },
@@ -1563,6 +1565,64 @@ server binary, not a product with its own release cycle.
           content: { type: 'string', description: 'Full text content to write.' },
         },
         required: ['path', 'content'],
+      },
+    },
+  };
+
+  // Context-memory tools: the engine keeps opened files (and any big tool
+  // result) on SSD, outside the prompt, so they cost neither context nor
+  // VRAM. The file on disk stays the source of truth: edits are written
+  // straight back to it and outside changes are picked up automatically.
+  const MEMORY_SEARCH_TOOL = {
+    type: 'function',
+    function: {
+      name: 'memory_search',
+      description: 'Search inside an opened file (or every opened file / big tool result when handle is omitted). ' +
+        'Returns the best matching line ranges with numbered snippets.',
+      parameters: {
+        type: 'object',
+        properties: {
+          handle: { type: 'string', description: 'Handle returned by read_file (optional).' },
+          query: { type: 'string', description: 'Words or identifiers to look for.' },
+        },
+        required: ['query'],
+      },
+    },
+  };
+
+  const MEMORY_READ_TOOL = {
+    type: 'function',
+    function: {
+      name: 'memory_read',
+      description: 'Read a window of lines of an opened file. Lines are 1-based and numbered in the result; ' +
+        'next_offset tells where the following window starts.',
+      parameters: {
+        type: 'object',
+        properties: {
+          handle: { type: 'string' },
+          offset: { type: 'integer', description: 'First line to read (1-based).' },
+          limit: { type: 'integer', description: 'How many lines (max 400).' },
+        },
+        required: ['handle', 'offset'],
+      },
+    },
+  };
+
+  const MEMORY_REPLACE_TOOL = {
+    type: 'function',
+    function: {
+      name: 'memory_replace_lines',
+      description: 'Edit an opened file: replace lines first..last (inclusive, 1-based) with text. Use first = last + 1 ' +
+        'to insert. The change is written to the real file immediately; do not repeat an edit that returned ok.',
+      parameters: {
+        type: 'object',
+        properties: {
+          handle: { type: 'string' },
+          first: { type: 'integer' },
+          last: { type: 'integer' },
+          text: { type: 'string', description: 'Replacement lines, without line numbers.' },
+        },
+        required: ['handle', 'first', 'last', 'text'],
       },
     },
   };
@@ -1614,7 +1674,8 @@ server binary, not a product with its own release cycle.
     const hasWorkspace = !!(state.workspacePath || state.workspaceId);
     if (perms.code && state.serverRunPythonEnabled && hasWorkspace) tools.push(RUN_PYTHON_TOOL);
     if (perms.files && state.serverRunPythonEnabled && hasWorkspace) {
-      tools.push(LIST_FILES_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, SEARCH_FILES_TOOL);
+      tools.push(LIST_FILES_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL, SEARCH_FILES_TOOL,
+        MEMORY_SEARCH_TOOL, MEMORY_READ_TOOL, MEMORY_REPLACE_TOOL);
     }
     if ((perms.code || perms.files) && state.serverRunPythonEnabled) tools.push(SET_WORKSPACE_TOOL);
     return tools;
@@ -1707,7 +1768,38 @@ server binary, not a product with its own release cycle.
     if (!perms.files) throw new Error('file access is disabled in Permissions');
     const path = (args && args.path || '').trim();
     if (!path) throw new Error('missing "path" argument');
-    return postTool('/tools/read_file', { ...requireWorkspace(), path });
+    return postTool('/tools/open_file', { ...requireWorkspace(), session_id: memorySession(), path });
+  }
+
+  // The chat session id doubles as the engine context-memory session: its
+  // stored files are dropped from disk once the chat has been idle past
+  // the server's TTL.
+  function memorySession() {
+    if (!state.currentSessionId) throw new Error('no active chat session');
+    return state.currentSessionId;
+  }
+
+  async function toolMemorySearch(args) {
+    if (!perms.files) throw new Error('file access is disabled in Permissions');
+    const query = (args && args.query || '').trim();
+    if (!query) throw new Error('missing "query" argument');
+    return postTool('/tools/memory_search', { session_id: memorySession(), handle: args.handle || null, query });
+  }
+
+  async function toolMemoryRead(args) {
+    if (!perms.files) throw new Error('file access is disabled in Permissions');
+    if (!args || !args.handle) throw new Error('missing "handle" argument');
+    return postTool('/tools/memory_read', {
+      session_id: memorySession(), handle: args.handle, offset: args.offset || 1, limit: args.limit || 200,
+    });
+  }
+
+  async function toolMemoryReplace(args) {
+    if (!perms.files) throw new Error('file access is disabled in Permissions');
+    if (!args || !args.handle) throw new Error('missing "handle" argument');
+    return postTool('/tools/memory_replace_lines', {
+      session_id: memorySession(), handle: args.handle, first: args.first, last: args.last, text: args.text || '',
+    });
   }
 
   async function toolWriteFile(args) {
@@ -1742,6 +1834,9 @@ server binary, not a product with its own release cycle.
     read_file: toolReadFile,
     write_file: toolWriteFile,
     search_files: toolSearchFiles,
+    memory_search: toolMemorySearch,
+    memory_read: toolMemoryRead,
+    memory_replace_lines: toolMemoryReplace,
     set_workspace: toolSetWorkspace,
   };
 
@@ -2185,6 +2280,9 @@ server binary, not a product with its own release cycle.
           messages: messagesForRequest(),
           stream: true,
           tools: activeTools(),
+          // Lets the server spill oversized tool results into the engine
+          // context memory of this chat instead of the prompt.
+          session_id: state.currentSessionId || undefined,
           temperature: Number(el.sliders.temperature.value),
           top_p: Number(el.sliders.top_p.value),
           top_k: parseInt(el.numbers.top_k.value, 10),

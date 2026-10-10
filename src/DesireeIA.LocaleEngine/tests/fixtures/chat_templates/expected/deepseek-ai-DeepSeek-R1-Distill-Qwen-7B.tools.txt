@@ -1,0 +1,1 @@
+<s>Agent.<｜User｜>Find calcola_sconto<｜Assistant｜><｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>{"results": []}<｜tool▁output▁end｜><｜User｜>ok<｜Assistant｜><think>

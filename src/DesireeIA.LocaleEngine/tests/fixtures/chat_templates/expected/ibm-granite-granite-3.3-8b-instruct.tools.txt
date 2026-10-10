@@ -1,0 +1,29 @@
+<|start_of_role|>system<|end_of_role|>Agent.<|end_of_text|>
+<|start_of_role|>available_tools<|end_of_role|>[
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search an opened file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "string"
+                    },
+                    "query": {
+                        "type": "string"
+                    }
+                },
+                "required": [
+                    "query"
+                ]
+            }
+        }
+    }
+]<|end_of_text|>
+<|start_of_role|>user<|end_of_role|>Find calcola_sconto<|end_of_text|>
+<|start_of_role|>assistant<|end_of_role|><|end_of_text|>
+<|start_of_role|>tool<|end_of_role|>{"results": []}<|end_of_text|>
+<|start_of_role|>user<|end_of_role|>ok<|end_of_text|>
+<|start_of_role|>assistant<|end_of_role|>

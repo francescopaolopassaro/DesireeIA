@@ -1,0 +1,9 @@
+<s><|system|>
+Agent.
+<|user|>
+Find calcola_sconto
+<|assistant|>
+</s>
+<|user|>
+ok
+<|assistant|>

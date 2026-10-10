@@ -1,0 +1,2 @@
+<|system|>You are helpful.<|end|><|user|>Ciao, città è perché? "quoted" <tag> {{x}}<|end|><|assistant|>Risposta.
+Seconda riga.<|end|><|user|>E poi?<|end|><|assistant|>

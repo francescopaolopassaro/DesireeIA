@@ -6,7 +6,8 @@ bin/
 obj/
 
 # Native build output (CMake)
-native/out/
+native/
+src/DesireeIA.LocaleEngine/build_test/
 build/
 
 # Editor/IDE
@@ -21,6 +22,7 @@ Thumbs.db
 # Python
 .venv/
 __pycache__/
+*.pyc
 *.egg-info/
 .pytest_cache/
 build/

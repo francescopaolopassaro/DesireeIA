@@ -1,0 +1,4 @@
+<s>[INST] Ciao, città è perché? "quoted" <tag> {{x}}[/INST] Risposta.
+Seconda riga.</s>[INST] You are helpful.
+
+E poi?[/INST]

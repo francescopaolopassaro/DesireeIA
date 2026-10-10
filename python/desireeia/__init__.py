@@ -62,7 +62,10 @@ from .generation import (
 
 __version__ = "0.1.4"
 
+from .memory import ContextMemory
+
 __all__ = [
+    "ContextMemory",
     # enums
     "Backend",
     "Error",

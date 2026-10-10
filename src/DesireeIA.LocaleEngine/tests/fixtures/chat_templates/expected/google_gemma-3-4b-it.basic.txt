@@ -1,0 +1,10 @@
+<s><start_of_turn>user
+You are helpful.
+
+Ciao, città è perché? "quoted" <tag> {{x}}<end_of_turn>
+<start_of_turn>model
+Risposta.
+Seconda riga.<end_of_turn>
+<start_of_turn>user
+E poi?<end_of_turn>
+<start_of_turn>model

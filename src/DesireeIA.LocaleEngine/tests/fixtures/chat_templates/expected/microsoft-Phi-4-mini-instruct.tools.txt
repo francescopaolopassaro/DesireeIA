@@ -1,0 +1,1 @@
+<|system|>Agent.<|end|><|user|>Find calcola_sconto<|end|><|assistant|><|end|><|tool|>{"results": []}<|end|><|user|>ok<|end|><|assistant|>

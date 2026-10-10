@@ -357,6 +357,21 @@ DESIREEIA_API desireeia_error desireeia_apply_chat_template(const desireeia_ctx*
                                                     size_t buf_size,
                                                     size_t* out_len);
 
+/* Like desireeia_apply_chat_template, but with the full conversation as a
+ * JSON array of OpenAI-shaped messages (roles system/user/assistant/tool,
+ * assistant "tool_calls", tool "tool_call_id"/"name") and optional tool
+ * definitions (JSON array, NULL for none). Rendered through the model's own
+ * Jinja chat template, so tools and tool calls come out in the exact format
+ * the model was trained on; models without a usable template fall back to
+ * the built-in formats. Same output-buffer convention. */
+DESIREEIA_API desireeia_error desireeia_apply_chat_template_json(const desireeia_ctx* ctx,
+                                                         const char* messages_json,
+                                                         const char* tools_json,
+                                                         int add_assistant,
+                                                         char* out_buf,
+                                                         size_t buf_size,
+                                                         size_t* out_len);
+
 /* Minimal always-on profiler (cumulative time per matmul kernel type:
  * activation quantization, Q4_0/Q4_K/Q6_K, float fallback).
  * desireeia_profile_dump writes a human-readable line into out_buf
@@ -542,6 +557,66 @@ DESIREEIA_API desireeia_error desireeia_probe_gpu(int32_t index, desireeia_gpu_i
  * whole cache back (chat closed, app idle) and drops the session. */
 DESIREEIA_API desireeia_error desireeia_reserve_context(desireeia_ctx* ctx, size_t n_positions);
 DESIREEIA_API desireeia_error desireeia_trim_cache(desireeia_ctx* ctx);
+
+/* Token-level tool-call constraint. Once the generated text contains
+ * open_tag (e.g. "<tool_call>"), the sampler may only pick tokens that keep
+ * the output a valid prefix of {"name": <one of tool_names>, "arguments":
+ * {...}} followed by close_tag, then an end-of-generation token. Outside a
+ * call nothing is constrained. n_tools = 0 accepts any name; open_tag NULL
+ * or "" turns the constraint off. Persists across predicts until changed. */
+DESIREEIA_API desireeia_error desireeia_set_tool_constraint(desireeia_ctx* ctx, const char* open_tag,
+                                                            const char* close_tag,
+                                                            const char* const* tool_names, size_t n_tools);
+
+/* ---- Context memory (on-board RAG over SSD) -----------------------------
+ * Keeps big tool payloads (files, uploads, command output, streams) on SSD
+ * instead of in the prompt, so they cost neither prompt tokens nor KV cache
+ * in VRAM. A payload is stored under a stable name (path, upload name,
+ * stream id) inside a session; the model gets a short JSON stub (handle,
+ * size, outline, first lines) and then reads line windows or runs a hybrid
+ * BM25 + embedding search. A new put with the same name replaces the item
+ * (version + 1); append() extends it incrementally (streams). Sessions idle
+ * longer than ttl_seconds are deleted from disk by a background thread.
+ *
+ * Every call returning text gives back a NUL-terminated UTF-8 JSON string
+ * allocated by the engine: release it with desireeia_memory_free_string. */
+typedef struct desireeia_memory desireeia_memory;
+
+DESIREEIA_API desireeia_error desireeia_memory_open(const char* root_dir, double ttl_seconds,
+                                                    desireeia_memory** out_mem);
+DESIREEIA_API desireeia_error desireeia_memory_close(desireeia_memory* mem);
+/* Use a loaded encoder model for the vector half of search (mean pooled,
+ * L2 normalized). NULL, or a model that can't embed, = BM25 only. The ctx
+ * must outlive the memory or be cleared first. */
+DESIREEIA_API desireeia_error desireeia_memory_set_embedder(desireeia_memory* mem, desireeia_ctx* ctx);
+DESIREEIA_API void desireeia_memory_free_string(char* s);
+
+DESIREEIA_API desireeia_error desireeia_memory_put_file(desireeia_memory* mem, const char* session,
+                                                        const char* name, const char* path, char** out_json);
+DESIREEIA_API desireeia_error desireeia_memory_put_text(desireeia_memory* mem, const char* session,
+                                                        const char* name, const char* text, size_t text_len,
+                                                        char** out_json);
+DESIREEIA_API desireeia_error desireeia_memory_append(desireeia_memory* mem, const char* session,
+                                                      const char* name, const char* text, size_t text_len,
+                                                      char** out_json);
+DESIREEIA_API desireeia_error desireeia_memory_read(desireeia_memory* mem, const char* session,
+                                                    const char* handle, uint32_t offset, uint32_t limit,
+                                                    char** out_json);
+/* handle NULL/"" searches every item of the session. */
+DESIREEIA_API desireeia_error desireeia_memory_search(desireeia_memory* mem, const char* session,
+                                                      const char* query, const char* handle, uint32_t k,
+                                                      char** out_json);
+DESIREEIA_API desireeia_error desireeia_memory_list(desireeia_memory* mem, const char* session, char** out_json);
+/* Replace lines [first, last] (1-based, inclusive) with text; first = last + 1
+ * inserts, first = total_lines + 1 appends. */
+DESIREEIA_API desireeia_error desireeia_memory_replace_lines(desireeia_memory* mem, const char* session,
+                                                             const char* handle, uint32_t first, uint32_t last,
+                                                             const char* text, size_t text_len, char** out_json);
+DESIREEIA_API desireeia_error desireeia_memory_export(desireeia_memory* mem, const char* session,
+                                                      const char* handle, const char* path, char** out_json);
+DESIREEIA_API desireeia_error desireeia_memory_touch(desireeia_memory* mem, const char* session);
+DESIREEIA_API desireeia_error desireeia_memory_drop_session(desireeia_memory* mem, const char* session);
+DESIREEIA_API desireeia_error desireeia_memory_sweep(desireeia_memory* mem, int32_t* out_removed);
 
 #ifdef __cplusplus
 }

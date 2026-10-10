@@ -18,6 +18,7 @@ from . import __version__
 from .api import (chat, embeddings, errors as api_errors, health, metrics_api,
                    models_files, props, settings_api, tokenize, tools_api, transcribe_api)
 from .api.v1 import build_router as build_v1_router
+from . import engine
 from .config import Settings
 from .logging_setup import get_logger
 from .middleware import (ApiKeyMiddleware, MaxBodySizeMiddleware,
@@ -73,6 +74,8 @@ async def _lifespan(app: FastAPI):
     settings: Settings = app.state.settings
     manager = SlotManager(settings)
     app.state.slots = manager
+    app.state.memory = engine.open_context_memory(
+        str(settings.resolved_data_dir / "context_memory"), float(settings.context_memory_ttl_seconds))
     background_tasks = []
     if settings.models_autoload:
         background_tasks.append(asyncio.create_task(_background_load_all(manager)))
@@ -85,6 +88,8 @@ async def _lifespan(app: FastAPI):
             if not task.done():
                 task.cancel()
         manager.shutdown()
+        if app.state.memory is not None:
+            app.state.memory.close()
 
 
 def create_app(settings: Settings) -> FastAPI:

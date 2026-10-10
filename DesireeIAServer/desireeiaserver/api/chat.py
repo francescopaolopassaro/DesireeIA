@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+import hashlib
 import json
 import time
 import uuid
-from typing import AsyncGenerator, List, Tuple
+from typing import AsyncGenerator, List, Optional, Tuple
 
 from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
@@ -102,6 +104,18 @@ def _apply_response_format(messages: List[dict], params: CodegenParams) -> None:
     _prepend_system(messages, StructuredOutput.build_json_instruction(schema))
 
 
+def tool_names(payload: dict) -> Optional[Tuple[str, ...]]:
+    tools = payload.get("tools")
+    if not isinstance(tools, list) or not tools or payload.get("tool_choice", "auto") == "none":
+        return None
+    names = []
+    for tool in tools:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        if isinstance(fn.get("name"), str) and fn["name"]:
+            names.append(fn["name"])
+    return tuple(names)
+
+
 def _apply_tools(messages: List[dict], payload: dict) -> bool:
     """Merge a tool-use instruction into the system message when the
     request declares `tools`. Returns True if tool-call detection should
@@ -120,6 +134,28 @@ def _apply_tools(messages: List[dict], payload: dict) -> bool:
         return False
     _prepend_system(messages, toolcalling.build_tools_instruction(tools))
     return True
+
+
+def _spill_tool_results(messages: List[dict], memory, session_id: Optional[str], threshold: int) -> None:
+    """Replace oversized tool results with the engine context-memory stub,
+    so a big file or command output costs a few hundred prompt tokens
+    instead of living in the KV cache (VRAM) for the rest of the chat.
+    Items are keyed by content, so re-sending the same history yields
+    byte-identical stubs and the prompt prefix stays cache-reusable."""
+    if memory is None or not session_id or threshold <= 0:
+        return
+    for message in messages:
+        content = message.get("content")
+        if message["role"] != "tool" or not isinstance(content, str) or len(content) <= threshold:
+            continue
+        if '"spilled": true' in content or '"spilled":true' in content:
+            continue  # already a stub (e.g. open_file result)
+        name = "tool:" + hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
+        try:
+            stub = memory.put_text(session_id, name, content)
+        except Exception:
+            continue  # invalid session id or disk error: keep it inline
+        message["content"] = json.dumps(stub, ensure_ascii=False)
 
 
 def _to_engine_messages(messages: List[dict]) -> List[Tuple[str, str]]:
@@ -240,8 +276,14 @@ async def chat_completions(request: Request):
     slot = request.app.state.slots.resolve(payload.get("model"))
 
     messages = _normalize_messages(payload)
+    session_id = payload.get("session_id")
+    _spill_tool_results(messages, getattr(request.app.state, "memory", None),
+                        session_id if isinstance(session_id, str) else None,
+                        request.app.state.settings.context_spill_chars)
     _apply_response_format(messages, params)
     tools_active = _apply_tools(messages, payload)
+    if tools_active:
+        params = replace(params, tool_names=tool_names(payload))
     engine_messages = _to_engine_messages(messages)
 
     model_id = slot.model_id

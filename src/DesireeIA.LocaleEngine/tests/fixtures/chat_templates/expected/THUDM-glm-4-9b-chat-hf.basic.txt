@@ -1,0 +1,6 @@
+[gMASK]<sop><|system|>
+You are helpful.<|user|>
+Ciao, città è perché? "quoted" <tag> {{x}}<|assistant|>
+Risposta.
+Seconda riga.<|user|>
+E poi?<|assistant|>

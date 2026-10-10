@@ -161,3 +161,12 @@ def default_generation_settings(settings: Settings) -> dict:
         "seed": settings.seed,
         "n_predict": settings.n_predict,
     }
+
+def open_context_memory(root: str, ttl_seconds: float):
+    """The engine's on-board context memory, or None when the loaded engine
+    build predates it (the server then keeps tool results inline)."""
+    try:
+        return _require().ContextMemory(root, ttl_seconds)
+    except Exception:
+        logger.warning("context memory unavailable", exc_info=True)
+        return None

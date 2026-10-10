@@ -1,0 +1,12 @@
+<s><|start_header_id|>system<|end_header_id|>
+
+Agent.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Find calcola_sconto<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+<|eot_id|><|start_header_id|>tool<|end_header_id|>
+
+{"results": []}<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+ok<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+

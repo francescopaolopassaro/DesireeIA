@@ -1,0 +1,14 @@
+<s><|im_start|>system
+You are helpful.<|im_end|>
+<|im_start|>user
+Ciao, città è perché? "quoted" <tag> {{x}}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+Risposta.
+Seconda riga.<|im_end|>
+<|im_start|>user
+E poi?<|im_end|>
+<|im_start|>assistant

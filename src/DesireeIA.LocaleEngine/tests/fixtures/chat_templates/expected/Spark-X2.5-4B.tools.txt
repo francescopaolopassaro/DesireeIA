@@ -1,0 +1,8 @@
+<｜start▁of▁sentence｜><|System|>
+you are a helpful assistant.## Tools
+You have access to the following functions:
+<tools>
+{"name": "memory_search", "description": "Search an opened file.", "parameters": {"type": "object", "properties": {"handle": {"type": "string"}, "query": {"type": "string"}}, "required": ["query"]}}
+</tools>
+
+Agent.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Find calcola_sconto<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|></think><tool_call>memory_search<arg_key>handle</arg_key><arg_value>sp_1</arg_value><arg_key>query</arg_key><arg_value>calcola_sconto</arg_value></tool_call><｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Tool|><tool_response>{"results": []}</tool_response><｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>ok<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>

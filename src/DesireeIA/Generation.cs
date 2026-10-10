@@ -152,24 +152,90 @@ public static class ToolCalling
         if (start < 0) return false;
         start += OpenTag.Length;
         var end = responseText.IndexOf(CloseTag, start, StringComparison.Ordinal);
-        var json = (end < 0 ? responseText[start..] : responseText[start..end]).Trim();
-        if (json.Length == 0) return false;
+        var body = (end < 0 ? responseText[start..] : responseText[start..end]).Trim();
+        if (body.Length == 0) return false;
 
-        try
+        if (!body.StartsWith('{') && body.Contains("<arg_key>", StringComparison.Ordinal))
+            return TryParseArgKeyDialect(body, out call);
+
+        // Small models often drop the final "}" or trail stray tag text
+        // after the JSON: try the text as-is, then a repaired candidate.
+        foreach (var json in new[] { body, RepairTruncatedObject(body) })
         {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("name", out var nameEl)) return false;
-            var name = nameEl.GetString();
-            if (string.IsNullOrEmpty(name)) return false;
-            var argsJson = root.TryGetProperty("arguments", out var argsEl) ? argsEl.GetRawText() : "{}";
-            call = new ToolCall(name, argsJson);
-            return true;
+            if (json is null) continue;
+            try
+            {
+                using var doc = JsonDocument.Parse(json);
+                var root = doc.RootElement;
+                if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("name", out var nameEl)) continue;
+                var name = nameEl.GetString();
+                if (string.IsNullOrEmpty(name)) continue;
+                var argsJson = root.TryGetProperty("arguments", out var argsEl) ? argsEl.GetRawText() : "{}";
+                call = new ToolCall(name, argsJson);
+                return true;
+            }
+            catch (JsonException)
+            {
+            }
         }
-        catch (JsonException)
+        return false;
+    }
+
+    // GLM-style block emitted natively by some models (Spark, GLM4.5+):
+    // name<arg_key>k</arg_key><arg_value>v</arg_value>... Values that parse
+    // as JSON (numbers, objects) are kept typed, anything else is a string.
+    private static bool TryParseArgKeyDialect(string body, out ToolCall? call)
+    {
+        call = null;
+        var keyAt = body.IndexOf("<arg_key>", StringComparison.Ordinal);
+        var name = body[..keyAt].Trim();
+        if (name.Length == 0) return false;
+        var args = new Dictionary<string, JsonElement>();
+        var matches = System.Text.RegularExpressions.Regex.Matches(body,
+            @"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)(?:</arg_value>|$)",
+            System.Text.RegularExpressions.RegexOptions.Singleline);
+        foreach (System.Text.RegularExpressions.Match m in matches)
         {
-            return false;
+            var raw = m.Groups[2].Value.Trim();
+            JsonElement value;
+            try { value = JsonDocument.Parse(raw).RootElement.Clone(); }
+            catch (JsonException) { value = JsonSerializer.SerializeToElement(m.Groups[2].Value); }
+            args[m.Groups[1].Value.Trim()] = value;
         }
+        call = new ToolCall(name, JsonSerializer.Serialize(args));
+        return true;
+    }
+
+    // Walk the first object string-aware, cut at stray tag text once the
+    // nesting is back above the root, and close whatever is still open.
+    private static string? RepairTruncatedObject(string raw)
+    {
+        var start = raw.IndexOf('{');
+        if (start < 0) return null;
+        int depth = 0, end = -1;
+        bool inStr = false, esc = false;
+        for (int i = start; i < raw.Length; i++)
+        {
+            var c = raw[i];
+            if (inStr)
+            {
+                if (esc) esc = false;
+                else if (c == '\\') esc = true;
+                else if (c == '"') inStr = false;
+                continue;
+            }
+            if (c == '"') inStr = true;
+            else if (c is '{' or '[') depth++;
+            else if (c is '}' or ']')
+            {
+                depth--;
+                end = i + 1;
+                if (depth == 0) return raw[start..end];
+            }
+            else if (c == '<' && end >= 0) break;
+        }
+        if (end < 0 || inStr) return null;
+        return raw[start..end] + new string('}', depth);
     }
 
     /// <summary>

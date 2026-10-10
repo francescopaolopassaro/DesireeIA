@@ -1,0 +1,2 @@
+<|im_system|>system<|im_middle|>You are helpful.<|im_end|><|im_user|>user<|im_middle|>Ciao, città è perché? "quoted" <tag> {{x}}<|im_end|><|im_assistant|>assistant<|im_middle|>Risposta.
+Seconda riga.<|im_end|><|im_user|>user<|im_middle|>E poi?<|im_end|><|im_assistant|>assistant<|im_middle|>

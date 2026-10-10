@@ -1,0 +1,2 @@
+<s>[SYSTEM_PROMPT]You are helpful.[/SYSTEM_PROMPT][INST]Ciao, città è perché? "quoted" <tag> {{x}}[/INST]Risposta.
+Seconda riga.</s>[INST]E poi?[/INST]

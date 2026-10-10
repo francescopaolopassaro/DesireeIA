@@ -276,6 +276,11 @@ internal static class NativeMethods
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_set_sampling(IntPtr ctx, in Sampling parameters);
 
+    // tool_names is an array of NUL-terminated UTF-8 strings (IntPtr each).
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_tool_constraint(IntPtr ctx, byte[]? openTag, byte[]? closeTag,
+        IntPtr[]? toolNames, nuint nTools);
+
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_get_sampling(IntPtr ctx, out Sampling outParams);
 
@@ -300,6 +305,10 @@ internal static class NativeMethods
     // this runtime ("Invalid managed/unmanaged type combination"): string
     // arrays are passed as IntPtr[] to manually allocated UTF-8 pointers
     // (see LocalModel.ApplyChatTemplate, which builds and frees them).
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_apply_chat_template_json(IntPtr ctx, byte[] messagesJson, byte[]? toolsJson,
+        int addAssistant, byte[]? outBuf, nuint bufSize, out nuint outLen);
+
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_apply_chat_template(
         IntPtr ctx,
@@ -407,4 +416,54 @@ internal static class NativeMethods
         nuint nEmbd,
         int imageToken,
         out int outToken);
+
+    // ---- context memory (on-board RAG over SSD, see abi.h) ----------------
+    // char* arguments are NUL-terminated UTF-8 byte arrays; results come back
+    // as engine-allocated UTF-8 JSON released with desireeia_memory_free_string.
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_open(byte[] rootDir, double ttlSeconds, out IntPtr mem);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_close(IntPtr mem);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_set_embedder(IntPtr mem, IntPtr ctx);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern void desireeia_memory_free_string(IntPtr s);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_put_file(IntPtr mem, byte[] session, byte[] name, byte[] path, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_put_text(IntPtr mem, byte[] session, byte[] name, byte[] text, nuint textLen, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_append(IntPtr mem, byte[] session, byte[] name, byte[] text, nuint textLen, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_read(IntPtr mem, byte[] session, byte[] handle, uint offset, uint limit, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_search(IntPtr mem, byte[] session, byte[] query, byte[]? handle, uint k, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_list(IntPtr mem, byte[] session, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_replace_lines(IntPtr mem, byte[] session, byte[] handle, uint first, uint last,
+        byte[] text, nuint textLen, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_export(IntPtr mem, byte[] session, byte[] handle, byte[] path, out IntPtr json);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_touch(IntPtr mem, byte[] session);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_drop_session(IntPtr mem, byte[] session);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_memory_sweep(IntPtr mem, out int removed);
 }

@@ -1,0 +1,11 @@
+<s><|start_header_id|>system<|end_header_id|>
+
+You are helpful.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Ciao, città è perché? "quoted" <tag> {{x}}<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+Risposta.
+Seconda riga.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+E poi?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+

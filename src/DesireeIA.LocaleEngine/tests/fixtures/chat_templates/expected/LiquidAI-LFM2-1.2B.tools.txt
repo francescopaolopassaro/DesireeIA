@@ -1,0 +1,12 @@
+<s><|im_start|>system
+Agent.
+List of tools: <|tool_list_start|>[{"type": "function", "function": {"name": "memory_search", "description": "Search an opened file.", "parameters": {"type": "object", "properties": {"handle": {"type": "string"}, "query": {"type": "string"}}, "required": ["query"]}}}]<|tool_list_end|><|im_end|>
+<|im_start|>user
+Find calcola_sconto<|im_end|>
+<|im_start|>assistant
+<|tool_call_start|>[memory_search(handle='sp_1', query='calcola_sconto')]<|tool_call_end|><|im_end|>
+<|im_start|>tool
+<|tool_response_start|>{"results": []}<|tool_response_end|><|im_end|>
+<|im_start|>user
+ok<|im_end|>
+<|im_start|>assistant

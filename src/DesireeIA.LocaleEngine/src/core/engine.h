@@ -378,6 +378,14 @@ size_t engine_context_size(const desireeia_ctx* ctx);
 // "<arch>.context_length"), 0 if unknown. Informational only - the engine's
 // KV cache grows dynamically and is not capped by this value.
 uint32_t engine_context_length_trained(const desireeia_ctx* ctx);
+// Token-level tool-call constraint (core/tool_grammar.h); empty open_tag
+// turns it off.
+bool engine_set_tool_constraint(desireeia_ctx* ctx, const std::string& open_tag, const std::string& close_tag,
+                                const std::vector<std::string>& tool_names);
+// Full OpenAI-shaped messages (tool role, assistant tool_calls) and tool
+// definitions as JSON, rendered through the model's own template.
+bool engine_apply_chat_template_json(const desireeia_ctx* ctx, const std::string& messages_json,
+                                     const std::string& tools_json, bool add_assistant, std::string& out);
 bool engine_tokenize(desireeia_ctx* ctx, const std::string& text, bool add_bos, std::vector<int32_t>& out_ids);
 bool engine_token_piece(desireeia_ctx* ctx, int32_t id, std::string& out);
 // which: 0=BOS 1=EOS 2=UNK 3=PAD (desireeia_special_token in abi.h).
