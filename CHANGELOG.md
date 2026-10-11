@@ -1,5 +1,64 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.2.0 · PyPI `desireeia` 0.2.0 · `desireeia-server` 0.2.0 · engine 0.2.0 (ABI 3)
+
+### Added — context memory: big files and tool output stay on SSD, not in the prompt
+
+- A file or tool result pasted into the conversation was paid for on every
+  later turn in prompt tokens and in KV cache, which lives in VRAM next to
+  the weights. The engine now keeps them in a per-session store on SSD
+  (own format: Brotli-compressed 40-line blocks, an append-only term index,
+  optional embedding rows) and the model gets a short stub: handle, size,
+  outline, first lines. It then reads line windows or runs a hybrid BM25 +
+  vector search. Measured: a 1 MB source file that would cost 470k prompt
+  tokens is worked on within 5k; a 10 MB file is indexed in under 3 s and
+  searched in about 40 ms, RAM use bounded by fixed buffers.
+- The file on disk stays the source of truth: edits are written straight
+  back to it (line endings kept, long lines never truncated), a change made
+  outside is picked up on the next access, and an edit based on line
+  numbers the file no longer has is refused. Uploads with the same name
+  replace the item, streams append to it.
+- Sessions idle longer than the TTL are deleted from disk by the engine.
+- API: `desireeia_memory_*` (abi.h); `desireeia.ContextMemory` (Python),
+  `DesireeIA.ContextMemory` (C#).
+- Server: `/tools/open_file`, `/tools/memory_read`, `/tools/memory_search`,
+  `/tools/memory_replace_lines`, `/tools/memory_append`; tool results
+  longer than `context_spill_chars` are moved to the store automatically.
+  The web UI's `read_file` now opens files this way.
+
+### Added — tool calls constrained at token level
+
+- Once the model writes `<tool_call>`, the sampler may only pick tokens that
+  keep the output a valid `{"name": <declared tool>, "arguments": {...}}`,
+  then the closing tag, then end of generation. Small models no longer
+  drop braces, add stray tags or invent tool names; arguments keep their
+  JSON types. Free text is not affected.
+- `desireeia_set_tool_constraint`; `set_tool_constraint` (Python),
+  `SetToolConstraint` (C#). The server enables it whenever a request
+  declares tools.
+
+### Added — the model's own chat template, run natively
+
+- The engine executes the GGUF's Jinja `tokenizer.chat_template` itself
+  (Hugging Face settings: trim_blocks, lstrip_blocks), so every model gets
+  exactly the prompt format it was trained on, tool roles and tool calls
+  included. Byte-identical to jinja2 on 23 real templates (Qwen 2.5/3,
+  Llama 3.1/3.2, Gemma 2/3, Mistral, Phi-4, DeepSeek-R1, GLM-4/4.5, Kimi-K2,
+  gpt-oss, Granite, Falcon3, OLMo, LFM2, SmolLM3, Spark, MiniCPM). A
+  template that raises falls back to the built-in formats.
+- `desireeia_apply_chat_template_json` (full OpenAI-shaped messages and
+  tool definitions); `apply_chat_template_messages` (Python),
+  `ApplyChatTemplateJson` (C#). `apply_chat_template` uses the template too.
+
+### Changed
+
+- Reasoning models now get their native generation prompt (often a
+  `<think>` block): leave them enough `max_tokens` (measured: 400 cut Spark
+  off before its tool call, 2000 did not).
+- Tool-call parsing (server and C#) also recovers truncated JSON and the
+  `<arg_key>/<arg_value>` format some models emit natively.
+- ABI 3: wrappers 0.2.0 refuse an older engine with a clear message.
+
 ## NuGet `DesireeIA` 0.1.4 · PyPI `desireeia` 0.1.4 · engine 0.1.3 (unchanged)
 
 ### Fixed — emoji and accented characters broken in streamed output

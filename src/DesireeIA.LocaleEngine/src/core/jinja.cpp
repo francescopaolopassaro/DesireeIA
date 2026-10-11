@@ -1025,7 +1025,7 @@ static Value apply_filter(const std::string& name, const Value& v, Args& args, K
         if (v.is_number() || v.type() == Value::Type::Bool) return Value(v.as_float());
         return kwarg(kw, "default", args, 0, Value(0.0));
     }
-    if (name == "abs") return v.type() == Value::Type::Float ? Value(std::fabs(v.as_float())) : Value(std::llabs(v.as_int()));
+    if (name == "abs") return v.type() == Value::Type::Float ? Value(std::fabs(v.as_float())) : Value(static_cast<int64_t>(std::llabs(v.as_int())));
     if (name == "round") {
         const int64_t prec = kwarg(kw, "precision", args, 0, Value(int64_t(0))).as_int();
         const double m = std::pow(10.0, static_cast<double>(prec));

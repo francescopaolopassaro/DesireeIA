@@ -512,8 +512,9 @@ DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
 
 /* Version of this interface. Wrappers compare it with the one they were
  * written for and refuse an older engine with a clear message instead of a
- * missing-symbol crash. 2 = engine 0.1.2 (the functions below). */
-#define DESIREEIA_ABI_VERSION 2
+ * missing-symbol crash. 2 = engine 0.1.2 (the functions below); 3 = engine
+ * 0.2.0 (tool-call constraint, apply_chat_template_json, context memory). */
+#define DESIREEIA_ABI_VERSION 3
 DESIREEIA_API int32_t desireeia_abi_version(void);
 
 /* Text of the last error: the context's own (a failed predict, a refused

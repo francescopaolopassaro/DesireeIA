@@ -196,7 +196,9 @@ static void test_context_memory() {
         const std::string edit = mem.replace_lines("s1", handle, total, total, "    return 'new'");
         CHECK(field(edit, "ok") == "true" && field(edit, "written_to_source") == "true", "edit applied and written through");
         const std::string disk = slurp(src);
-        CHECK(disk.size() > 20 && disk.compare(disk.size() - 17, 17, "    return 'new'\r\n") == 0, "edit on disk, CRLF kept");
+        const std::string tail = "    return 'new'\r\n";
+        CHECK(disk.size() > tail.size() && disk.compare(disk.size() - tail.size(), tail.size(), tail) == 0,
+              "edit on disk, CRLF kept");
 
         { std::ofstream out(src, std::ios::binary | std::ios::app); out << "# external change\r\n"; }
         const std::string resynced = mem.read("s1", handle, total + 1, 1);

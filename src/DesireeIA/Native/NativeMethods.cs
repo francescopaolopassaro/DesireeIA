@@ -104,7 +104,7 @@ internal static class NativeMethods
     }
 
     /// <summary>Interface version this wrapper is written for (DESIREEIA_ABI_VERSION).</summary>
-    internal const int AbiVersion = 2;
+    internal const int AbiVersion = 3;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void ProgressCallback(ulong done, ulong total, IntPtr user);

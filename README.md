@@ -2,11 +2,21 @@
 ![Version 0.2.0](https://img.shields.io/badge/version-v0.2.0-blue)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
-A local large language model inference engine for the .NET ecosystem: a native C++17 core exposed through a stable C ABI, with an idiomatic .NET wrapper on top.
+**A local inference engine built for agents.** A native C++17 core with a stable C ABI, official packages for .NET (NuGet) and Python (PyPI), and an OpenAI-compatible server — where the things an agent needs are part of the engine itself, down to the token, instead of glue code around it.
 <img src="images/DesireeIA.jpg" />
 ## What it does
 
-DesireeIA loads quantized language models from disk and runs them entirely on local hardware — no network calls, no external services. It targets practical CPU throughput while auto-adapting its execution plan to the hardware it's running on.
+DesireeIA loads quantized language models from disk and runs them entirely on local hardware — no network calls, no external services. It auto-adapts its execution plan to the machine it's running on, and on a 6 GB laptop GPU it outruns llama.cpp on the same GGUF files (see "Measured performance").
+
+What sets it apart is what happens when a model works as an **agent** — reading files, calling tools, editing code:
+
+| | What the engine does | Measured |
+|---|---|---|
+| 🧠 **Context memory on SSD** | Files and big tool results never enter the prompt: the engine keeps them on SSD (Brotli blocks + its own index) and the model reads windows and searches by meaning or keyword. Edits are written straight to the real file. | A 1 MB source file that would cost **470,000 prompt tokens** is analysed and fixed by a 4B model within **5,000**, with VRAM flat during the whole task |
+| 🎯 **Tool calls constrained at token level** | Once the model opens a `<tool_call>`, the sampler can only produce valid JSON naming a tool that exists — no missing braces, no invented tools, arguments with their real types. | Zero malformed calls in every agent run, at full generation speed |
+| 📜 **The model's own chat template, run natively** | A built-in Jinja interpreter executes the template shipped in the GGUF, so every model gets exactly the prompt format it was trained on — tool roles and tool calls included. | **Byte-identical to jinja2** on 23 real templates (Qwen, Llama, Gemma, Mistral, Phi, DeepSeek, GLM, Kimi, gpt-oss, Granite, …) |
+
+All three are on by default in the server and one call away in C# and Python — see "Agentic engine" below.
 
 ## Background
 
@@ -43,7 +53,77 @@ DesireeIA is designed to provide high-performance AI integration tailored for pr
 - [x] Performance and memory benchmarking on enterprise laptop profiles
 - [x] Advanced hallucination mitigation and model tuning for Spark
 - [x] Multi-language bindings (Python SDK + OpenAI-compatible server, see "Python server" below)
+- [x] Agentic engine (0.2.0): context memory on SSD, token-level tool calls, native Jinja chat templates
+- [ ] Tool-call constraint driven by each tool's JSON schema (required fields, types)
+- [ ] Project-wide context memory (index a whole folder, symbol-aware outlines)
 - [ ] Comprehensive API documentation and deployment guides
+
+---
+
+## Agentic engine
+
+An agent spends most of its life not generating prose but moving data in and out of the model: reading files, getting tool results back, emitting tool calls, editing. On a local GPU that is exactly where things break — a pasted file fills the context and the KV cache next to the weights in VRAM, a small model drops a brace in its JSON, a prompt format the model wasn't trained on makes it ignore its tools. DesireeIA handles all three inside the engine.
+
+### Context memory — the file stays on SSD, the model gets the part it needs
+
+```
+ read_file("gestionale.py")  ──►  engine streams it to SSD  ──►  model sees a stub:
+ 1 MB, 36k lines                  Brotli blocks of 40 lines        handle, size, outline,
+                                  + term index (+ vectors)         first 20 lines (~1k tokens)
+
+ memory_search(handle, "calcola_sconto")      → the 3 best line ranges (BM25 + embeddings)
+ memory_read(handle, offset=18001, limit=10)  → exactly those lines, numbered
+ memory_replace_lines(handle, 18003, 18003, "…")  → written to the real file, CRLF kept
+```
+
+- **Nothing big is held in VRAM or RAM.** Data lives on SSD in the engine's own format: each 40-line block is Brotli-compressed on its own (random access touches only the blocks it needs), next to an append-only term index and optional embedding rows. Search streams the index from disk with fixed buffers.
+- **The real file is the source of truth.** The store is working memory, not a container: edits go straight to the file on disk (line endings kept, long lines never truncated); a change made outside is picked up on the next access; an edit based on line numbers the file no longer has is refused, so the model re-reads instead of corrupting code.
+- **Uploads and streams.** A new upload with the same name replaces the item (version + 1); a stream appends to it, re-indexing only the tail.
+- **Sessions clean themselves up.** Each chat has its own store; the engine deletes it from disk once the session has been idle longer than the TTL.
+- **Prompt-cache friendly.** Stubs are derived from the content, so re-sending the same history yields byte-identical text and the engine's KV prefix reuse keeps working.
+
+Measured on a 6 GB RTX 1000 Ada laptop GPU with Spark-X2.5 4B: the agent opens a 1 MB file, searches, reads the exact lines and fixes the bug in 3–5 tool calls, with the prompt never above ~5k tokens (the whole file would be 470k) and VRAM flat at the model's own footprint. A 10 MB file is indexed in under 3 s and searched in ~40 ms.
+
+### Tool calls constrained at token level
+
+When the generated text reaches `<tool_call>`, the sampler switches to a byte-level automaton: only tokens that keep the output a valid prefix of `{"name": <one of the declared tools>, "arguments": {...}}` can be drawn, then the closing tag, then end of generation. Free text before and after is untouched, and inside string values the mask takes a fast path, so generation keeps its normal speed. The CUDA pipeline that draws tokens ahead is paused only while a call is being written.
+
+### Every model's own chat template
+
+The engine compiles the GGUF's `tokenizer.chat_template` at load time and renders it with a native Jinja interpreter — `if`/`for`/`set`/`namespace`/`macro`, filters such as `tojson`, `selectattr` and `map`, Python string and dict methods, Hugging Face's `trim_blocks`/`lstrip_blocks`. The test suite renders 23 real templates in 4 conversations each and compares them byte for byte with jinja2. A template that refuses a conversation (Gemma has no `tool` role) falls back to the engine's built-in formats.
+
+### Using it
+
+```csharp
+using var model = LocalModel.LoadAuto("Spark-X2.5-4B-Q4_K_M.gguf", out var cfg);
+model.SetToolConstraint(new[] { "open_file", "memory_search", "memory_read", "memory_replace_lines" });
+
+using var memory = new ContextMemory(@"C:\agent\memory", ttlSeconds: 1800);
+using var stub = memory.PutFile(sessionId, "gestionale.py", @"C:\repo\gestionale.py");
+var handle = stub.RootElement.GetProperty("handle").GetString()!;
+var hits   = memory.Search(sessionId, "calcola_sconto", handle);
+var window = memory.Read(sessionId, handle, offset: 18001, limit: 10);
+memory.ReplaceLines(sessionId, handle, 18003, 18003, "    return prezzo - prezzo * percentuale / 100");
+
+// Full conversations, tool role and tool calls included, in the model's own format:
+var prompt = model.ApplyChatTemplateJson(messagesJson, toolsJson);
+```
+
+```python
+model, cfg = desireeia.LocalModel.load_auto("Spark-X2.5-4B-Q4_K_M.gguf")
+model.set_tool_constraint(["open_file", "memory_search", "memory_read", "memory_replace_lines"])
+
+mem = desireeia.ContextMemory(r"C:\agent\memory", ttl_seconds=1800)
+stub = mem.put_file(session_id, "gestionale.py", path)
+hits = mem.search(session_id, "calcola_sconto", stub["handle"])
+mem.replace_lines(session_id, stub["handle"], 18003, 18003, "    return prezzo - prezzo * percentuale / 100")
+
+prompt = model.apply_chat_template_messages(messages, tools)
+```
+
+In `desireeia-server` it is automatic: the web UI's file tools open files through the context memory, tool results longer than `context_spill_chars` are moved there on their own, and the tool constraint is switched on whenever a request declares tools.
+
+Reasoning models now get their native generation prompt (often a `<think>` block): give them enough `max_tokens` for the reasoning *and* the call — 2000 is a sensible floor.
 
 ---
 
@@ -399,13 +479,13 @@ Beyond plain `Predict`/`NextToken`, the .NET wrapper offers:
 - **Stop sequences** — `GenerateOptions.StopSequences` stops generation the
   moment any of the given strings appears, trimming it out of the output,
   even when the sequence spans more than one decoded piece.
-- **Tool calling** (`ToolCalling`) — prompt-based: builds a system prompt
-  describing the available tools and parses a `<tool_call>{...}</tool_call>`
-  block from the response. This is not native function-calling — reliability
-  depends on the model actually following the instruction — and tool
-  results are re-appended to history with role `"user"` rather than `"tool"`,
-  since most non-ChatML chat templates here don't have a branch for an
-  arbitrary `"tool"` role and would silently drop it.
+- **Tool calling** (`ToolCalling`) — builds a system prompt describing the
+  available tools and parses the `<tool_call>{...}</tool_call>` block from
+  the response. With `SetToolConstraint` the engine guarantees that block is
+  valid JSON naming a declared tool (see "Agentic engine"); the parser also
+  recovers truncated JSON and the `<arg_key>/<arg_value>` format some models
+  emit natively. `ApplyChatTemplateJson` renders real `tool` roles and
+  assistant `tool_calls` through the model's own template.
 - **Structured/JSON output** (`StructuredOutput`) — a prompt instruction plus
   a tolerant extractor that recovers the first balanced, valid JSON block
   even if the model wrapped it in prose or a markdown fence. Best-effort,
@@ -570,6 +650,7 @@ appears here only when the feature is absent from their repository.
 | Mixture-of-Experts weights streamed from SSD, with prerouter prediction | yes | no |
 | Web server installable with `pip install desireeia-server` | yes | no (distributed as binaries) |
 | One command to start, stop and check the server in the background, same on Windows, Linux and macOS (`desireeia-server-ctl`) | yes | no |
+| Context memory in the engine: files and tool output kept on SSD outside the prompt and KV cache, searched and edited by line range, written back to the source file | yes | no |
 
 Both ship an OpenAI-compatible HTTP server with a web UI; that is common
 ground, not a difference.

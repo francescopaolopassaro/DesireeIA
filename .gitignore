@@ -6,7 +6,7 @@ bin/
 obj/
 
 # Native build output (CMake)
-native/
+/native/
 src/DesireeIA.LocaleEngine/build_test/
 build/
 

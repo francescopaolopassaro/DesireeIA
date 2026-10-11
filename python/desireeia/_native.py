@@ -147,7 +147,7 @@ LOG_CB = CFUNCTYPE(None, c_int32, c_char_p, c_void_p)
 PROGRESS_CB = CFUNCTYPE(None, c_uint64, c_uint64, c_void_p)
 
 # Interface version this wrapper is written for (DESIREEIA_ABI_VERSION).
-ABI_VERSION = 2
+ABI_VERSION = 3
 
 
 class GpuInfoNative(Structure):
