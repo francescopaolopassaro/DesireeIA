@@ -51,6 +51,29 @@ public class LocalModelInteropTest
         Assert.True(model.ContextSize() > 0);
     }
 
+    [Fact]
+    public void EngineExtras_ConfidenceBudgetAndSampling_RunOnRealModel()
+    {
+        if (!NativeAvailable()) return;
+        var path = ModelPath();
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return;
+
+        using var model = LocalModel.Load(path, DesireeIAEngine.BuildPlan(path));
+        model.SetSamplingExt(minP: 0.05f, dryMultiplier: 0.5f);
+        model.SetSamplingExt();                 // all off again
+        model.SetReasoningBudget(16);
+        model.SetReasoningBudget(0);
+        model.SetConfidenceTracking(true);
+        model.Predict(new[] { 2 });
+        model.NextToken();
+        var st = model.GetTokenStats();
+        Assert.NotNull(st);
+        Assert.True(st!.Value.LogProb <= 0f);
+        Assert.True(st.Value.Entropy >= 0f);
+        Assert.InRange(st.Value.MaxProb, 0f, 1f);
+        model.SetConfidenceTracking(false);
+    }
+
     // Conversation session: turn 2 re-sends turn 1 + a follow-up. Exact mode
     // reuses the turn-1 prompt from the cache and must answer exactly like a
     // full prefill (greedy sampling is the default, so it's deterministic).

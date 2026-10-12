@@ -284,6 +284,32 @@ internal static class NativeMethods
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_get_sampling(IntPtr ctx, out Sampling outParams);
 
+    /// <summary>Corresponds to desireeia_sampling_ext in abi.h (ABI 4).</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct SamplingExt
+    {
+        public float MinP;
+        public float DryMultiplier;
+        public float DryBase;
+        public int DryAllowedLength;
+        public int DryLastN;
+    }
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_sampling_ext(IntPtr ctx, in SamplingExt parameters);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_get_sampling_ext(IntPtr ctx, out SamplingExt outParams);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_reasoning_budget(IntPtr ctx, int maxTokens, byte[]? openTag, byte[]? closeTag);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_confidence_tracking(IntPtr ctx, int enabled);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_get_token_stats(IntPtr ctx, out float logprob, out float entropy, out float maxProb);
+
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_load_lora_adapter(IntPtr ctx,
         [MarshalAs(UnmanagedType.LPUTF8Str)] string loraGgufPath, float scale);

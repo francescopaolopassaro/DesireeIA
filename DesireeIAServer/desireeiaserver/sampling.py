@@ -13,7 +13,6 @@ from .config import Settings
 from .api.errors import InvalidRequestError, NotSupportedError
 
 UNSUPPORTED_FIELDS = (
-    "min_p",
     "mirostat",
     "mirostat_eta",
     "mirostat_tau",
@@ -34,6 +33,10 @@ class CodegenParams:
     repeat_penalty: Optional[float] = None
     repeat_last_n: Optional[int] = None
     seed: Optional[int] = None
+    # Engine extras (ABI 4): min-p, DRY and a cap on the thinking tokens.
+    min_p: Optional[float] = None
+    dry_multiplier: Optional[float] = None
+    reasoning_budget: Optional[int] = None
     stop: Optional[List[str]] = None
     max_tokens: Optional[int] = None
     n_predict: Optional[int] = None
@@ -140,6 +143,9 @@ def resolve(body, *, allow_n_predict: bool = False) -> CodegenParams:
         repeat_penalty=_optional_float(body, "repeat_penalty", None),
         repeat_last_n=_optional_int(body, "repeat_last_n", None),
         seed=_optional_int(body, "seed", None),
+        min_p=_optional_float(body, "min_p", None),
+        dry_multiplier=_optional_float(body, "dry_multiplier", None),
+        reasoning_budget=_optional_int(body, "reasoning_budget", None),
         stop=_stop_sequences(body),
         max_tokens=_optional_int(body, "max_tokens", None),
         n_predict=_optional_int(body, "n_predict", None) if allow_n_predict else None,

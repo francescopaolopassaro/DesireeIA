@@ -1,5 +1,5 @@
 # DesireeIA
-![Version 0.2.0](https://img.shields.io/badge/version-v0.2.0-blue)
+![Version 0.2.1](https://img.shields.io/badge/version-v0.2.1-blue)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
 **A local inference engine built for agents.** A native C++17 core with a stable C ABI, official packages for .NET (NuGet) and Python (PyPI), and an OpenAI-compatible server — where the things an agent needs are part of the engine itself, down to the token, instead of glue code around it.
@@ -87,6 +87,16 @@ Measured on a 6 GB RTX 1000 Ada laptop GPU with Spark-X2.5 4B: the agent opens a
 ### Tool calls constrained at token level
 
 When the generated text reaches `<tool_call>`, the sampler switches to a byte-level automaton: only tokens that keep the output a valid prefix of `{"name": <one of the declared tools>, "arguments": {...}}` can be drawn, then the closing tag, then end of generation. Free text before and after is untouched, and inside string values the mask takes a fast path, so generation keeps its normal speed. The CUDA pipeline that draws tokens ahead is paused only while a call is being written.
+
+### Reasoning budget, min-p, DRY and token confidence (0.2.1)
+
+Small reasoning models can spend the whole token allowance thinking, or repeat one sentence until the turn is cut. Three switches, all off by default:
+
+- **Reasoning budget** — `SetReasoningBudget(60)` / `set_reasoning_budget(60)`: after 60 tokens inside `<think>` the engine writes `</think>` itself and the model answers. Spark-X2.5-4B, same prompt: 232 tokens unbounded against 110 with a budget of 60, same correct answer.
+- **min-p and DRY** — `SetSamplingExt(minP: 0.05f, dryMultiplier: 0.3f)`. DRY penalises a token that would extend a sequence already written in this generation (not the prompt, and not while a constrained tool call is written). It also lowers the odds of digits and names that legitimately repeat, so use a small multiplier against loops.
+- **Token confidence** — `SetConfidenceTracking(true)`, then `GetTokenStats()` after each token: log-probability, entropy of the whole distribution, probability of the most likely token. A flat distribution marks a guess (an invented file name, a made-up word).
+
+`desireeia-server` reads `reasoning_budget`, `min_p` and `dry_multiplier` from the request body.
 
 ### Every model's own chat template
 

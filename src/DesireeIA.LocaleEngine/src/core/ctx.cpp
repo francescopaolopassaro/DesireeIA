@@ -83,6 +83,17 @@ struct EngineContext {
     std::vector<uint8_t> tool_is_eog;
     std::vector<uint8_t> tool_plain;   // piece is safe inside any JSON string
 
+    // Reasoning budget (desireeia_set_reasoning_budget): after rb_max tokens
+    // inside the thinking block the engine writes rb_close itself and the
+    // model goes on with its answer. rb_state: 0 = waiting for rb_open,
+    // 1 = thinking, 2 = closed.
+    int32_t rb_max = 0;
+    std::string rb_open, rb_close;
+    int rb_state = 0;
+    int32_t rb_count = 0;
+    std::string rb_tail;
+    std::deque<int32_t> rb_forced;
+
     // Chat prompt format, detected at load time (see engine_create): from
     // the GGUF's chat_template when present, otherwise from the
     // per-architecture default.
@@ -794,8 +805,67 @@ static void tool_accept(EngineContext* c, int32_t token) {
     c->tool.accept(piece);
 }
 
+// ---- reasoning budget -------------------------------------------------
+
+static bool rb_active(const EngineContext* c) {
+    return c->rb_max > 0 && !c->rb_open.empty() && !c->rb_close.empty() && c->has_tok;
+}
+
+// Start of a generation: the prompt may already end inside the thinking
+// block (the generation prompt of reasoning models opens it).
+static void rb_reset(EngineContext* c, const int32_t* prompt, size_t n) {
+    c->rb_state = 0;
+    c->rb_count = 0;
+    c->rb_forced.clear();
+    c->rb_tail.clear();
+    if (!rb_active(c)) return;
+    std::string tail;
+    for (size_t i = n > 16 ? n - 16 : 0; i < n; ++i) {
+        std::string pc;
+        c->tok.piece(prompt[i], pc);
+        tail += pc;
+    }
+    const size_t po = tail.rfind(c->rb_open);
+    const size_t pc2 = tail.rfind(c->rb_close);
+    if (po != std::string::npos && (pc2 == std::string::npos || pc2 < po)) c->rb_state = 1;
+}
+
+static void rb_accept(EngineContext* c, int32_t token) {
+    if (!rb_active(c) || c->rb_state == 2) return;
+    std::string pc;
+    c->tok.piece(token, pc);
+    c->rb_tail += pc;
+    const size_t keep = std::max(c->rb_open.size(), c->rb_close.size()) + 32;
+    if (c->rb_tail.size() > keep * 2) c->rb_tail.erase(0, c->rb_tail.size() - keep);
+    if (c->rb_state == 0) {
+        if (c->rb_tail.find(c->rb_open) != std::string::npos) {
+            c->rb_state = 1;
+            c->rb_count = 0;
+            c->rb_tail.clear();
+        }
+    } else {
+        ++c->rb_count;
+        if (c->rb_tail.find(c->rb_close) != std::string::npos) c->rb_state = 2;
+    }
+}
+
+// Called with the token just drawn: past the budget it is replaced by the
+// closing tag (one token per call), so the thinking ends here.
+static void rb_apply(EngineContext* c, int32_t& token) {
+    if (!rb_active(c) || c->tool.constraining()) return;
+    if (c->rb_state == 1 && c->rb_forced.empty() && c->rb_count >= c->rb_max) {
+        for (int32_t id : c->tok.encode(c->rb_close + "\n\n", false)) c->rb_forced.push_back(id);
+        if (c->st.log) c->st.log(1, "reasoning budget reached: closing the thinking block");
+    }
+    if (!c->rb_forced.empty()) {
+        token = c->rb_forced.front();
+        c->rb_forced.pop_front();
+    }
+    rb_accept(c, token);
+}
+
 static bool tool_needs_host(const EngineContext* c) {
-    return c->tool.configured() && (c->tool.constraining() || c->tool.armed());
+    return rb_active(c) || (c->tool.configured() && (c->tool.constraining() || c->tool.armed()));
 }
 
 bool engine_set_tool_constraint(desireeia_ctx* ctx, const std::string& open_tag, const std::string& close_tag,
@@ -844,7 +914,11 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     // first generated token must not repeat what's already written.
     c->history.assign(tokens, tokens + n_tokens);
     c->tool.reset();
+    c->sampler.set_generation_start(n_tokens);
+    c->sampler.set_dry_suspended(false);
+    rb_reset(c, tokens, n_tokens);
     out_token = c->sampler.sample(logits, c->history);
+    rb_apply(c, out_token);
     tool_accept(c, out_token);
     c->last_token = out_token;
     c->has_session = true;
@@ -1008,8 +1082,10 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     // The token just consumed is now in the cache too.
     if (c->kv_valid) c->kv_tokens.push_back(tk);
     if (masking && got != 1) tool_mask(c, logits);
+    c->sampler.set_dry_suspended(c->tool.constraining());
     out_token = got == 1 ? c->sampler.sample_candidates(c->cand_ids, c->cand_vals, c->history)
                          : c->sampler.sample(logits, c->history);
+    rb_apply(c, out_token);
     tool_accept(c, out_token);
     c->last_token = out_token;
     return true;
@@ -1030,6 +1106,71 @@ bool engine_set_sampling(desireeia_ctx* ctx, const desireeia_sampling& p) {
     sp.penalty_last_n  = p.penalty_last_n;
     sp.seed            = p.seed;
     c->sampler.configure(sp);
+    return true;
+}
+
+bool engine_set_sampling_ext(desireeia_ctx* ctx, const desireeia_sampling_ext& p) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    SamplerExt e;
+    e.min_p           = p.min_p < 0.0f ? 0.0f : p.min_p;
+    e.dry_multiplier  = p.dry_multiplier < 0.0f ? 0.0f : p.dry_multiplier;
+    e.dry_base        = p.dry_base > 1.0f ? p.dry_base : 1.75f;
+    e.dry_allowed_len = p.dry_allowed_length > 0 ? p.dry_allowed_length : 2;
+    e.dry_last_n      = p.dry_last_n;
+    c->sampler.configure_ext(e);
+    return true;
+}
+
+bool engine_get_sampling_ext(const desireeia_ctx* ctx, desireeia_sampling_ext& out) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    const SamplerExt& e = c->sampler.ext();
+    out.min_p = e.min_p;
+    out.dry_multiplier = e.dry_multiplier;
+    out.dry_base = e.dry_base;
+    out.dry_allowed_length = e.dry_allowed_len;
+    out.dry_last_n = e.dry_last_n;
+    return true;
+}
+
+bool engine_set_reasoning_budget(desireeia_ctx* ctx, int32_t max_tokens, const std::string& open_tag,
+                                 const std::string& close_tag) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    c->rb_max = max_tokens > 0 ? max_tokens : 0;
+    c->rb_open = open_tag;
+    c->rb_close = close_tag;
+    c->rb_state = 0;
+    c->rb_count = 0;
+    c->rb_forced.clear();
+    c->rb_tail.clear();
+    return true;
+}
+
+bool engine_set_confidence_tracking(desireeia_ctx* ctx, bool enabled) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    c->sampler.set_track_stats(enabled);
+    return true;
+}
+
+bool engine_get_token_stats(const desireeia_ctx* ctx, float& logprob, float& entropy, float& max_prob) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    const TokenStats& t = c->sampler.last_stats();
+    if (!t.valid) return false;
+    logprob = t.logprob;
+    entropy = t.entropy;
+    max_prob = t.max_prob;
     return true;
 }
 
@@ -1621,7 +1762,11 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
     }
     c->history.assign(tokens, tokens + n_tokens);
     c->tool.reset();
+    c->sampler.set_generation_start(n_tokens);
+    c->sampler.set_dry_suspended(false);
+    rb_reset(c, tokens, n_tokens);
     out_token = c->sampler.sample(logits, c->history);
+    rb_apply(c, out_token);
     tool_accept(c, out_token);
     c->last_token = out_token;
     c->has_session = true;

@@ -34,12 +34,52 @@ struct SamplerParams {
     uint32_t seed            = 0;      // 0 = seed from random_device
 };
 
+// Extra samplers, off by default (desireeia_set_sampling_ext).
+//  - min_p: drops every candidate whose probability is below min_p times the
+//    probability of the best one (after top-k, before top-p). Adapts the
+//    cut to how sure the model is: tight when it is confident, wide when not.
+//  - DRY: penalises a token that would extend a sequence already written in
+//    THIS generation (not the prompt): the longer the repeated run, the
+//    stronger the penalty, multiplier * base^(run - allowed_length). Breaks
+//    the "same sentence over and over" loops small models fall into without
+//    touching words that merely occur twice.
+struct SamplerExt {
+    float   min_p            = 0.0f;   // 0 = off
+    float   dry_multiplier   = 0.0f;   // 0 = off
+    float   dry_base         = 1.75f;
+    int32_t dry_allowed_len  = 2;
+    int32_t dry_last_n       = 256;    // how many generated tokens back to look
+};
+
+// Confidence of the last token drawn (see Sampler::set_track_stats).
+struct TokenStats {
+    float logprob  = 0.0f;   // ln P(chosen) over the whole vocabulary
+    float entropy  = 0.0f;   // entropy of the distribution, in nats
+    float max_prob = 0.0f;   // probability of the most likely token
+    bool  valid    = false;
+};
+
 // Stateful sampler (the pseudo-random generator). Not thread-safe: one
 // instance per inference context, protected by the context's mutex.
 class Sampler {
 public:
     void configure(const SamplerParams& p);
     const SamplerParams& params() const { return params_; }
+    void configure_ext(const SamplerExt& e) { ext_ = e; }
+    const SamplerExt& ext() const { return ext_; }
+    // Where the generation starts in the history (the prompt length): DRY
+    // only looks at what was generated after it.
+    void set_generation_start(size_t n) { gen_start_ = n; }
+    // DRY is switched off while a constrained tool call is being written
+    // (its JSON repeats keys and braces by design).
+    void set_dry_suspended(bool v) { dry_suspended_ = v; }
+    // Per-token confidence, exact over the whole vocabulary: costs one more
+    // pass over the logits and keeps the sampling on the host.
+    void set_track_stats(bool v) { track_ = v; last_stats_ = TokenStats{}; }
+    bool track_stats() const { return track_; }
+    const TokenStats& last_stats() const { return last_stats_; }
+    // The extras that the device draw cannot reproduce.
+    bool host_only() const { return ext_.min_p > 0.0f || ext_.dry_multiplier > 0.0f || track_; }
 
     // Picks the next token from the logits. `history` are the tokens
     // already present in the sequence (prompt + generated), used for the
@@ -79,6 +119,14 @@ public:
 
 private:
     SamplerParams params_;
+    SamplerExt    ext_;
+    size_t        gen_start_ = 0;
+    bool          dry_suspended_ = false;
+    bool          track_ = false;
+    TokenStats    last_stats_;
+    int32_t sample_impl_(std::vector<float>& logits, const std::vector<int32_t>& history);
+    void apply_dry_(std::vector<float>& logits, const std::vector<int32_t>& history) const;
+    void compute_stats_(const std::vector<float>& logits, int32_t chosen);
     std::mt19937  rng_{std::random_device{}()};
     bool          seeded_ = false;
 

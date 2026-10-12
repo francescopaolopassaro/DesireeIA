@@ -515,6 +515,58 @@ class LocalModel:
         if err != Error.OK:
             raise RuntimeError(f"Set tool constraint failed: {Error(err).name}")
 
+    def _need_abi4(self, name: str):
+        lib = _nat.get_lib()
+        if not hasattr(lib, name):
+            raise RuntimeError(f"{name} needs a native engine with ABI {_nat.ABI_EXTRAS} or newer")
+        return lib
+
+    def set_sampling_ext(self, min_p: float = 0.0, dry_multiplier: float = 0.0, dry_base: float = 1.75,
+                         dry_allowed_length: int = 2, dry_last_n: int = 256) -> None:
+        """Extra samplers (all off by default). ``min_p`` drops candidates below that fraction of the best
+        one's probability. DRY (``dry_multiplier`` > 0) penalises a token that would extend a sequence already
+        written in this generation, by ``dry_multiplier * dry_base ** (run - dry_allowed_length)``; it breaks
+        the repeat loops small models fall into. Requires temperature > 0 for min_p."""
+        self._check()
+        lib = self._need_abi4("desireeia_set_sampling_ext")
+        native = _nat.SamplingExt(min_p, dry_multiplier, dry_base, dry_allowed_length, dry_last_n)
+        with self._lock:
+            err = lib.desireeia_set_sampling_ext(self._ctx, byref(native))
+        if err != Error.OK:
+            raise RuntimeError(f"Set sampling ext failed: {Error(err).name}")
+
+    def set_reasoning_budget(self, max_tokens: int = 0, open_tag: str = "<think>", close_tag: str = "</think>") -> None:
+        """Cap the thinking of a reasoning model: after ``max_tokens`` tokens inside the thinking block the
+        engine writes ``close_tag`` itself and the model goes on with its answer. 0 turns it off."""
+        self._check()
+        lib = self._need_abi4("desireeia_set_reasoning_budget")
+        with self._lock:
+            err = lib.desireeia_set_reasoning_budget(self._ctx, int(max_tokens), open_tag.encode("utf-8"),
+                                                     close_tag.encode("utf-8"))
+        if err != Error.OK:
+            raise RuntimeError(f"Set reasoning budget failed: {Error(err).name}")
+
+    def set_confidence_tracking(self, enabled: bool = True) -> None:
+        """Record, for every token drawn, its log-probability, the entropy of the distribution and the
+        probability of the most likely token (``token_stats``). Costs one pass over the logits per token."""
+        self._check()
+        lib = self._need_abi4("desireeia_set_confidence_tracking")
+        with self._lock:
+            err = lib.desireeia_set_confidence_tracking(self._ctx, 1 if enabled else 0)
+        if err != Error.OK:
+            raise RuntimeError(f"Set confidence tracking failed: {Error(err).name}")
+
+    def token_stats(self):
+        """(logprob, entropy, max_prob) of the last token drawn, or None if nothing was recorded."""
+        self._check()
+        lib = self._need_abi4("desireeia_get_token_stats")
+        lp, en, mp = c_float(), c_float(), c_float()
+        with self._lock:
+            err = lib.desireeia_get_token_stats(self._ctx, byref(lp), byref(en), byref(mp))
+        if err != Error.OK:
+            return None
+        return (lp.value, en.value, mp.value)
+
     def get_sampling(self) -> SamplingOptions:
         """Get current sampling parameters."""
         self._check()

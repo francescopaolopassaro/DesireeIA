@@ -246,6 +246,16 @@ class SlotPrediction:
             from dataclasses import replace
             target = replace(target, **kwargs)
         model.set_sampling(target)
+        # Engine extras persist on the model across requests: always (re)set,
+        # so a request that does not ask for them turns them back off.
+        if hasattr(model, "set_sampling_ext"):
+            try:
+                model.set_sampling_ext(min_p=env.min_p or 0.0, dry_multiplier=env.dry_multiplier or 0.0)
+                model.set_reasoning_budget(env.reasoning_budget or 0)
+            except RuntimeError:
+                # An engine older than ABI 4 does not have them: not an error for a request that does not use them.
+                if env.min_p or env.dry_multiplier or env.reasoning_budget:
+                    raise
         # Always (re)set: the constraint persists on the model across
         # requests, so a request without tools must turn it back off.
         if hasattr(model, "set_tool_constraint"):

@@ -39,7 +39,7 @@ def test_resolve_stop_list():
 
 
 def test_rejects_unsupported_sampling_fields():
-    for field in ("min_p", "mirostat", "typical_p", "top_logprobs"):
+    for field in ("mirostat", "typical_p", "top_logprobs"):
         with pytest.raises(NotSupportedError):
             resolve({field: 0.1})
 
@@ -75,3 +75,9 @@ def test_n_predict_allowed_in_native_mode():
     params = resolve({"n_predict": 128}, allow_n_predict=True)
     assert params.n_predict == 128
     assert params.generation_max_tokens(Settings()) == 128
+
+def test_engine_extras_are_read_from_the_request():
+    p = resolve({"min_p": 0.05, "dry_multiplier": 0.8, "reasoning_budget": 256})
+    assert (p.min_p, p.dry_multiplier, p.reasoning_budget) == (0.05, 0.8, 256)
+    q = resolve({})
+    assert (q.min_p, q.dry_multiplier, q.reasoning_budget) == (None, None, None)

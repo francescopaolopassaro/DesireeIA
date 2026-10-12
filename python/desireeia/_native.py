@@ -147,7 +147,8 @@ LOG_CB = CFUNCTYPE(None, c_int32, c_char_p, c_void_p)
 PROGRESS_CB = CFUNCTYPE(None, c_uint64, c_uint64, c_void_p)
 
 # Interface version this wrapper is written for (DESIREEIA_ABI_VERSION).
-ABI_VERSION = 3
+ABI_VERSION = 3          # minimum; the extras below need 4 and are checked one by one
+ABI_EXTRAS = 4
 
 
 class GpuInfoNative(Structure):
@@ -212,6 +213,16 @@ class Sampling(Structure):
         ("penalty_last_n",   c_int32),
         ("seed",             c_uint32),
     ]
+
+class SamplingExt(Structure):
+    _fields_ = [
+        ("min_p", c_float),
+        ("dry_multiplier", c_float),
+        ("dry_base", c_float),
+        ("dry_allowed_length", c_int32),
+        ("dry_last_n", c_int32),
+    ]
+
 
 class VisionImage(Structure):
     _fields_ = [
@@ -347,6 +358,19 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     # sampling
     lib.desireeia_set_sampling.argtypes = [c_void_p, POINTER(Sampling)]
     lib.desireeia_set_sampling.restype = c_int32
+
+    # ABI 4 extras (absent on an older engine: the wrapper methods say so)
+    if hasattr(lib, "desireeia_set_sampling_ext"):
+        lib.desireeia_set_sampling_ext.argtypes = [c_void_p, POINTER(SamplingExt)]
+        lib.desireeia_set_sampling_ext.restype = c_int32
+        lib.desireeia_get_sampling_ext.argtypes = [c_void_p, POINTER(SamplingExt)]
+        lib.desireeia_get_sampling_ext.restype = c_int32
+        lib.desireeia_set_reasoning_budget.argtypes = [c_void_p, c_int32, c_char_p, c_char_p]
+        lib.desireeia_set_reasoning_budget.restype = c_int32
+        lib.desireeia_set_confidence_tracking.argtypes = [c_void_p, c_int32]
+        lib.desireeia_set_confidence_tracking.restype = c_int32
+        lib.desireeia_get_token_stats.argtypes = [c_void_p, POINTER(c_float), POINTER(c_float), POINTER(c_float)]
+        lib.desireeia_get_token_stats.restype = c_int32
 
     lib.desireeia_set_tool_constraint.argtypes = [c_void_p, c_char_p, c_char_p, POINTER(c_char_p), c_uint64]
     lib.desireeia_set_tool_constraint.restype = c_int32

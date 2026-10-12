@@ -20,6 +20,7 @@
 #include "ssd_tier/hybrid_tier.h"
 #include "models/dense_forward.h"
 #include "models/prerouter.h"
+#include "core/sampler.h"
 #include <cstdio>
 #include <cassert>
 #include <vector>
@@ -2614,6 +2615,93 @@ int main(int argc, char** argv) {
         } else {
             std::printf("  prerouter_predict shape-mismatch FAIL (should be empty)\n");
             failed++;
+        }
+    }
+
+
+    // ---- sampler extras: min-p, DRY, per-token confidence ----------------
+    {
+        using desireeia::Sampler;
+        using desireeia::SamplerParams;
+        using desireeia::SamplerExt;
+        auto make = [](float temp, int top_k, float top_p, uint32_t seed) {
+            SamplerParams sp; sp.temperature = temp; sp.top_k = top_k; sp.top_p = top_p; sp.seed = seed;
+            return sp;
+        };
+
+        // min-p: two close candidates and a long tail. With min_p 0.5 only
+        // the two best may ever be drawn; without it the tail shows up.
+        {
+            Sampler a, b;
+            a.configure(make(1.0f, 0, 1.0f, 7));
+            b.configure(make(1.0f, 0, 1.0f, 7));
+            SamplerExt e; e.min_p = 0.5f;
+            b.configure_ext(e);
+            int tail_a = 0, tail_b = 0;
+            for (int i = 0; i < 2000; ++i) {
+                std::vector<float> l(50, 0.0f); l[3] = 6.0f; l[9] = 5.8f;
+                std::vector<float> l2 = l;
+                const int32_t ta = a.sample(l, {});
+                const int32_t tb = b.sample(l2, {});
+                if (ta != 3 && ta != 9) ++tail_a;
+                if (tb != 3 && tb != 9) ++tail_b;
+            }
+            if (tail_b == 0 && tail_a > 0) { std::printf("  sampler min_p cuts the tail (%d draws without it, 0 with) OK\n", tail_a); passed++; }
+            else { std::printf("  sampler min_p FAIL: tail without=%d with=%d\n", tail_a, tail_b); failed++; }
+        }
+
+        // DRY: history "A B C ... A B" -> C extends a repeated run and is
+        // pushed down; a token that was never part of a run is untouched.
+        {
+            Sampler s;
+            s.configure(make(0.0f, 0, 1.0f, 1));
+            SamplerExt e; e.dry_multiplier = 5.0f; e.dry_base = 2.0f; e.dry_allowed_len = 2; e.dry_last_n = 0;
+            s.configure_ext(e);
+            s.set_generation_start(0);
+            const std::vector<int32_t> hist = {10, 11, 12, 13, 10, 11, 12, 13, 10, 11, 12};   // next would be 13 again
+            std::vector<float> l(32, 0.0f); l[13] = 10.0f; l[20] = 9.0f;
+            const int32_t t = s.sample(l, hist);
+            // the run is 3 long (10 11 12): penalty 5 * 2^(3-2) = 10 -> 13 drops to 0, 20 wins
+            if (t == 20) { std::printf("  sampler DRY breaks a repeated run OK\n"); passed++; }
+            else { std::printf("  sampler DRY FAIL: picked %d (expected 20)\n", (int) t); failed++; }
+
+            // the prompt is not looked at: generation starts after the repeat
+            s.set_generation_start(hist.size());
+            std::vector<float> l2(32, 0.0f); l2[13] = 10.0f; l2[20] = 9.0f;
+            const int32_t t2 = s.sample(l2, hist);
+            if (t2 == 13) { std::printf("  sampler DRY ignores the prompt OK\n"); passed++; }
+            else { std::printf("  sampler DRY prompt FAIL: picked %d (expected 13)\n", (int) t2); failed++; }
+
+            // suspended (constrained tool call): untouched
+            s.set_generation_start(0);
+            s.set_dry_suspended(true);
+            std::vector<float> l3(32, 0.0f); l3[13] = 10.0f; l3[20] = 9.0f;
+            const int32_t t3 = s.sample(l3, hist);
+            if (t3 == 13) { std::printf("  sampler DRY suspended OK\n"); passed++; }
+            else { std::printf("  sampler DRY suspended FAIL: picked %d\n", (int) t3); failed++; }
+        }
+
+        // confidence: uniform over 4 tokens -> entropy ln 4, logprob ln 1/4, max 1/4
+        {
+            Sampler s;
+            s.configure(make(0.0f, 0, 1.0f, 1));
+            s.set_track_stats(true);
+            std::vector<float> l(4, 1.0f);
+            s.sample(l, {});
+            const desireeia::TokenStats& st = s.last_stats();
+            if (st.valid && approx(st.entropy, std::log(4.0f), 1e-4f) && approx(st.logprob, -std::log(4.0f), 1e-4f) &&
+                approx(st.max_prob, 0.25f, 1e-5f)) {
+                std::printf("  sampler confidence stats (uniform) OK\n"); passed++;
+            } else {
+                std::printf("  sampler confidence stats FAIL: valid=%d H=%f lp=%f max=%f\n", (int) st.valid, st.entropy, st.logprob, st.max_prob);
+                failed++;
+            }
+            // very peaked: chosen prob near 1, entropy near 0
+            std::vector<float> l2 = {20.0f, 0.0f, 0.0f, 0.0f};
+            s.sample(l2, {});
+            const desireeia::TokenStats& st2 = s.last_stats();
+            if (st2.valid && st2.entropy < 1e-3f && st2.logprob > -1e-3f && st2.max_prob > 0.999f) { std::printf("  sampler confidence stats (peaked) OK\n"); passed++; }
+            else { std::printf("  sampler confidence stats peaked FAIL: H=%f lp=%f\n", st2.entropy, st2.logprob); failed++; }
         }
     }
 

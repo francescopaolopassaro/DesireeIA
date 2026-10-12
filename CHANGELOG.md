@@ -1,5 +1,55 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.2.1 · PyPI `desireeia` 0.2.1 · `desireeia-server` 0.2.1 · engine 0.2.1 (ABI 4)
+
+Found by running small local models as an agent, and what their logs showed:
+a reasoning model spending the whole token allowance thinking, sentences
+repeated until the turn was cut, and no way to tell a guessed word from a
+known one. Everything is off by default and additive: wrappers built for
+ABI 3 keep working against this engine.
+
+### Added — reasoning budget
+
+- `desireeia_set_reasoning_budget(max_tokens, open_tag, close_tag)`: after
+  `max_tokens` tokens inside the thinking block (it starts at `open_tag`,
+  whether the prompt already ends with it or the model writes it) the engine
+  writes `close_tag` itself and the model goes on with its answer. Measured
+  on Spark-X2.5-4B, same prompt: 232 tokens unbounded (thinking, then the
+  answer) against 110 with a budget of 60, same correct answer.
+- `set_reasoning_budget` (Python), `SetReasoningBudget` (C#); the server
+  reads `reasoning_budget` from the request.
+
+### Added — min-p and DRY
+
+- `desireeia_set_sampling_ext`: `min_p` (drop candidates below that fraction
+  of the best one's probability) and DRY (a token that would extend a
+  sequence already written in this generation loses
+  `multiplier * base^(run - allowed_length)` from its logit; the prompt is
+  not looked at, and it is suspended while a constrained tool call is
+  written). A separate struct, so ABI 3 wrappers are not affected.
+- DRY also lowers the odds of digits or names that legitimately repeat (a
+  run on Spark with multiplier 0.8 wrote "22, 32, 132" for three primes):
+  keep the multiplier low and use it against loops, not by default.
+- `set_sampling_ext` (Python), `SetSamplingExt` (C#); the server reads
+  `min_p` and `dry_multiplier` from the request (`min_p` used to be rejected).
+
+### Added — per-token confidence
+
+- `desireeia_set_confidence_tracking` / `desireeia_get_token_stats`: for the
+  last token drawn, its log-probability, the entropy of the whole
+  distribution and the probability of the most likely token. A flat
+  distribution marks a guess, e.g. an invented file name. Costs one pass over
+  the logits per token and keeps the draw on the host.
+- `set_confidence_tracking` / `token_stats` (Python),
+  `SetConfidenceTracking` / `GetTokenStats` (C#).
+
+### Tests
+
+- Native self-test: 79 cases (new: min-p cuts the tail, DRY breaks a repeated
+  run / ignores the prompt / is suspended, entropy and log-probability on a
+  uniform and a peaked distribution). Python: the three features on a real
+  model. C#: same.
+
 ## NuGet `DesireeIA` 0.2.0 · PyPI `desireeia` 0.2.0 · `desireeia-server` 0.2.0 · engine 0.2.0 (ABI 3)
 
 ### Added — context memory: big files and tool output stay on SSD, not in the prompt

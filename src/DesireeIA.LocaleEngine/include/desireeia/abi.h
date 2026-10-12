@@ -514,7 +514,7 @@ DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
  * written for and refuse an older engine with a clear message instead of a
  * missing-symbol crash. 2 = engine 0.1.2 (the functions below); 3 = engine
  * 0.2.0 (tool-call constraint, apply_chat_template_json, context memory). */
-#define DESIREEIA_ABI_VERSION 3
+#define DESIREEIA_ABI_VERSION 4
 DESIREEIA_API int32_t desireeia_abi_version(void);
 
 /* Text of the last error: the context's own (a failed predict, a refused
@@ -568,6 +568,50 @@ DESIREEIA_API desireeia_error desireeia_trim_cache(desireeia_ctx* ctx);
 DESIREEIA_API desireeia_error desireeia_set_tool_constraint(desireeia_ctx* ctx, const char* open_tag,
                                                             const char* close_tag,
                                                             const char* const* tool_names, size_t n_tools);
+
+/* ---- Sampling extras, reasoning budget, per-token confidence (ABI 4) ------
+ * Separate from desireeia_sampling on purpose: that struct is passed by
+ * pointer without a size, so growing it would break every wrapper built
+ * against ABI 3. All off by default.
+ *
+ * min_p: drops candidates whose probability is below min_p times the best
+ *   one's (0 = off).
+ * dry_*: "don't repeat yourself": a token that would extend a sequence
+ *   already written in THIS generation (the prompt is not looked at) loses
+ *   dry_multiplier * dry_base^(run - dry_allowed_length) from its logit
+ *   (dry_multiplier 0 = off; dry_base <= 1 means 1.75; dry_allowed_length
+ *   <= 0 means 2; dry_last_n = how many generated tokens back, <= 0 = all).
+ *   Suspended while a constrained tool call is being written. */
+typedef struct desireeia_sampling_ext {
+    float    min_p;
+    float    dry_multiplier;
+    float    dry_base;
+    int32_t  dry_allowed_length;
+    int32_t  dry_last_n;
+} desireeia_sampling_ext;
+
+DESIREEIA_API desireeia_error desireeia_set_sampling_ext(desireeia_ctx* ctx, const desireeia_sampling_ext* params);
+DESIREEIA_API desireeia_error desireeia_get_sampling_ext(const desireeia_ctx* ctx, desireeia_sampling_ext* out);
+
+/* Reasoning budget. A model that thinks before answering can think for the
+ * whole token allowance. With max_tokens > 0, once max_tokens tokens have
+ * been generated inside the thinking block (it starts at open_tag, e.g.
+ * "<think>", whether the prompt already ends with it or the model writes
+ * it), the engine writes close_tag itself and the model continues with its
+ * answer. max_tokens = 0 or an empty tag turns it off. Persists until
+ * changed. */
+DESIREEIA_API desireeia_error desireeia_set_reasoning_budget(desireeia_ctx* ctx, int32_t max_tokens,
+                                                             const char* open_tag, const char* close_tag);
+
+/* Per-token confidence. While enabled, every drawn token records its
+ * log-probability, the entropy of the whole distribution (nats) and the
+ * probability of the most likely token; a flat distribution or a chosen
+ * token far from the top marks a guess. Costs one pass over the logits per
+ * token and keeps the draw on the host. desireeia_get_token_stats returns
+ * DESIREEIA_ERR_INVALID_ARG when nothing was recorded yet. */
+DESIREEIA_API desireeia_error desireeia_set_confidence_tracking(desireeia_ctx* ctx, int32_t enabled);
+DESIREEIA_API desireeia_error desireeia_get_token_stats(const desireeia_ctx* ctx, float* out_logprob,
+                                                        float* out_entropy, float* out_max_prob);
 
 /* ---- Context memory (on-board RAG over SSD) -----------------------------
  * Keeps big tool payloads (files, uploads, command output, streams) on SSD

@@ -517,8 +517,67 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
-    /// Sets the sampling parameters. Takes effect from the next token onward.
+    /// Extra samplers, all off by default. <paramref name="minP"/> drops candidates below that fraction of the best
+    /// one's probability (needs temperature &gt; 0). DRY (<paramref name="dryMultiplier"/> &gt; 0) penalises a token
+    /// that would extend a sequence already written in this generation by
+    /// <c>dryMultiplier * dryBase ^ (run - dryAllowedLength)</c>: it breaks the repeat loops small models fall into.
+    /// It also lowers the odds of legitimately repeated digits or names, so keep it low. Needs engine ABI 4.
     /// </summary>
+    public void SetSamplingExt(float minP = 0f, float dryMultiplier = 0f, float dryBase = 1.75f,
+        int dryAllowedLength = 2, int dryLastN = 256)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var p = new NativeMethods.SamplingExt
+        {
+            MinP = minP, DryMultiplier = dryMultiplier, DryBase = dryBase,
+            DryAllowedLength = dryAllowedLength, DryLastN = dryLastN,
+        };
+        CheckExtras(() => NativeMethods.desireeia_set_sampling_ext(_context, in p), "Set sampling ext");
+    }
+
+    /// <summary>
+    /// Caps the thinking of a reasoning model: after <paramref name="maxTokens"/> tokens inside the thinking block
+    /// the engine writes <paramref name="closeTag"/> itself and the model continues with its answer. 0 turns it off.
+    /// Needs engine ABI 4.
+    /// </summary>
+    public void SetReasoningBudget(int maxTokens, string openTag = "<think>", string closeTag = "</think>")
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var open = System.Text.Encoding.UTF8.GetBytes(openTag + "\0");
+        var close = System.Text.Encoding.UTF8.GetBytes(closeTag + "\0");
+        CheckExtras(() => NativeMethods.desireeia_set_reasoning_budget(_context, maxTokens, open, close), "Set reasoning budget");
+    }
+
+    /// <summary>
+    /// Records, for every token drawn, its log-probability, the entropy of the distribution and the probability of
+    /// the most likely token (<see cref="GetTokenStats"/>). A flat distribution marks a guess. Costs one pass over
+    /// the logits per token. Needs engine ABI 4.
+    /// </summary>
+    public void SetConfidenceTracking(bool enabled)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        CheckExtras(() => NativeMethods.desireeia_set_confidence_tracking(_context, enabled ? 1 : 0), "Set confidence tracking");
+    }
+
+    /// <summary>Confidence of the last token drawn, or null when nothing was recorded.</summary>
+    public (float LogProb, float Entropy, float MaxProb)? GetTokenStats()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        float lp, en, mp;
+        try { err = NativeMethods.desireeia_get_token_stats(_context, out lp, out en, out mp); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Needs a native engine with ABI 4 or newer."); }
+        return err == NativeMethods.Error.Ok ? (lp, en, mp) : null;
+    }
+
+    private static void CheckExtras(Func<NativeMethods.Error> call, string what)
+    {
+        NativeMethods.Error err;
+        try { err = call(); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException($"{what}: needs a native engine with ABI 4 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"{what} failed: {err}");
+    }
+
     /// <summary>
     /// Constrains tool calls at token level: once <paramref name="openTag"/> is
     /// generated, the engine only samples tokens forming a valid

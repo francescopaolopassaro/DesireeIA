@@ -406,6 +406,12 @@ bool engine_embed(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
 // Sampling (see core/sampler.h and desireeia_sampling in abi.h).
 bool engine_set_sampling(desireeia_ctx* ctx, const desireeia_sampling& params);
 bool engine_get_sampling(const desireeia_ctx* ctx, desireeia_sampling& out);
+bool engine_set_sampling_ext(desireeia_ctx* ctx, const desireeia_sampling_ext& params);
+bool engine_get_sampling_ext(const desireeia_ctx* ctx, desireeia_sampling_ext& out);
+bool engine_set_reasoning_budget(desireeia_ctx* ctx, int32_t max_tokens, const std::string& open_tag,
+                                 const std::string& close_tag);
+bool engine_set_confidence_tracking(desireeia_ctx* ctx, bool enabled);
+bool engine_get_token_stats(const desireeia_ctx* ctx, float& logprob, float& entropy, float& max_prob);
 
 // LoRA adapters (Recover-LoRA). Forwards to IForwardEngine::load_lora/
 // clear_lora — DESIREEIA_ERR_NOT_SUPPORTED-equivalent (returns false) for

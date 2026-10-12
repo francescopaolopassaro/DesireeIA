@@ -25,6 +25,60 @@ void Sampler::configure(const SamplerParams& p) {
 }
 
 int32_t Sampler::sample(std::vector<float>& logits, const std::vector<int32_t>& history) {
+    const int32_t t = sample_impl_(logits, history);
+    if (track_ && t >= 0) compute_stats_(logits, t);
+    return t;
+}
+
+void Sampler::compute_stats_(const std::vector<float>& logits, int32_t chosen) {
+    last_stats_ = TokenStats{};
+    const size_t n = logits.size();
+    if (n == 0 || chosen < 0 || (size_t) chosen >= n) return;
+    float mx = logits[0];
+    for (size_t i = 1; i < n; ++i) mx = logits[i] > mx ? logits[i] : mx;
+    double sum = 0.0, wsum = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double d = (double) logits[i] - (double) mx;
+        const double e = std::exp(d);
+        sum += e;
+        wsum += e * d;
+    }
+    if (sum <= 0.0) return;
+    const double lse = std::log(sum);                       // relative to mx
+    last_stats_.logprob  = (float) (((double) logits[(size_t) chosen] - (double) mx) - lse);
+    last_stats_.entropy  = (float) (lse - wsum / sum);
+    last_stats_.max_prob = (float) (1.0 / sum);
+    last_stats_.valid = true;
+}
+
+void Sampler::apply_dry_(std::vector<float>& logits, const std::vector<int32_t>& history) const {
+    if (ext_.dry_multiplier <= 0.0f || dry_suspended_) return;
+    const size_t n = history.size();
+    const size_t from = std::min(gen_start_, n);
+    size_t lo = from;
+    if (ext_.dry_last_n > 0 && n - from > (size_t) ext_.dry_last_n) lo = n - (size_t) ext_.dry_last_n;
+    if (n < lo + (size_t) ext_.dry_allowed_len + 2) return;
+    const int32_t last = history[n - 1];
+    constexpr int kMaxRun = 64;
+    std::unordered_map<int32_t, int> longest;                 // next token -> longest run it would extend
+    for (size_t i = lo; i + 1 < n; ++i) {
+        if (history[i] != last) continue;
+        // length of the common suffix of history[..i] and history[..n-1], inside the window
+        int run = 1;
+        while (run < kMaxRun && i >= lo + (size_t) run && history[i - (size_t) run] == history[n - 1 - (size_t) run]) ++run;
+        const int32_t nxt = history[i + 1];
+        auto it = longest.find(nxt);
+        if (it == longest.end() || it->second < run) longest[nxt] = run;
+    }
+    for (const auto& kv : longest) {
+        if (kv.second < ext_.dry_allowed_len) continue;
+        if (kv.first < 0 || (size_t) kv.first >= logits.size()) continue;
+        const double pen = (double) ext_.dry_multiplier * std::pow((double) ext_.dry_base, (double) (kv.second - ext_.dry_allowed_len));
+        logits[(size_t) kv.first] -= (float) std::min(pen, 1e4);
+    }
+}
+
+int32_t Sampler::sample_impl_(std::vector<float>& logits, const std::vector<int32_t>& history) {
     const size_t n_vocab = logits.size();
     if (n_vocab == 0) return -1;
 
@@ -51,6 +105,8 @@ int32_t Sampler::sample(std::vector<float>& logits, const std::vector<int32_t>& 
             lg -= (float) kv.second * params_.penalty_freq + params_.penalty_present;
         }
     }
+
+    apply_dry_(logits, history);
 
     // --- 2. Greedy -----------------------------------------------------
     // Separate, allocation-free path: this is the default, and it must
@@ -136,6 +192,14 @@ int32_t Sampler::finish_(const std::vector<float>& logits, size_t k) {
     if (sum <= 0.0f) return idx_[0];
     for (size_t i = 0; i < k; ++i) probs_[i] /= sum;
 
+    // --- 4b. Min-p: relative to the best candidate (idx_ is sorted) -------
+    if (ext_.min_p > 0.0f) {
+        const float cut = probs_[0] * ext_.min_p;
+        size_t m = k;
+        for (size_t i = 1; i < k; ++i) { if (probs_[i] < cut) { m = i; break; } }
+        k = m;
+    }
+
     // --- 5. Top-p (nucleus) --------------------------------------------
     // idx_ is already sorted by decreasing logit, hence also by
     // decreasing probability: it's enough to truncate where the
@@ -166,6 +230,7 @@ int32_t Sampler::finish_(const std::vector<float>& logits, size_t k) {
 }
 
 uint32_t Sampler::candidates_needed(const std::vector<int32_t>& history) const {
+    if (ext_.dry_multiplier > 0.0f || track_) return 0;          // needs the whole vocabulary
     const bool pen = params_.penalty_last_n > 0 &&
         (params_.penalty_repeat != 1.0f || params_.penalty_freq != 0.0f || params_.penalty_present != 0.0f);
     if (pen && (params_.penalty_repeat < 1.0f || params_.penalty_freq < 0.0f || params_.penalty_present < 0.0f)) {
@@ -183,6 +248,7 @@ uint32_t Sampler::candidates_needed(const std::vector<int32_t>& history) const {
 }
 
 bool Sampler::device_params(DeviceParams& out) const {
+    if (host_only()) return false;                              // the device draw does not know these
     const bool pen = params_.penalty_last_n > 0 &&
         (params_.penalty_repeat != 1.0f || params_.penalty_freq != 0.0f || params_.penalty_present != 0.0f);
     if (pen && (params_.penalty_repeat < 1.0f || params_.penalty_freq < 0.0f || params_.penalty_present < 0.0f)) {

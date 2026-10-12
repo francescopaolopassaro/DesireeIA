@@ -69,7 +69,7 @@ namespace {
 #define DESIREEIA_EMIT(level, msg) emit_impl(__FILE__, __LINE__, __func__, (level), (msg))
 
 DESIREEIA_API const char* desireeia_version(void) {
-    return "0.2.0";
+    return "0.2.1";
 }
 
 DESIREEIA_API desireeia_error desireeia_set_logger(desireeia_log_cb cb, void* user) {
@@ -828,6 +828,52 @@ DESIREEIA_API desireeia_error desireeia_set_tool_constraint(desireeia_ctx* ctx, 
     if (!desireeia::engine_set_tool_constraint(ctx, open_tag ? open_tag : "", close_tag ? close_tag : "", names)) {
         return DESIREEIA_ERR_INVALID_ARG;
     }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+// ---- sampling extras, reasoning budget, confidence ----------------------
+
+DESIREEIA_API desireeia_error desireeia_set_sampling_ext(desireeia_ctx* ctx, const desireeia_sampling_ext* params) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !params) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_sampling_ext(ctx, *params)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_get_sampling_ext(const desireeia_ctx* ctx, desireeia_sampling_ext* out) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !out) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_get_sampling_ext(ctx, *out)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_set_reasoning_budget(desireeia_ctx* ctx, int32_t max_tokens,
+                                                             const char* open_tag, const char* close_tag) {
+    ABI_GUARD_BEGIN
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_reasoning_budget(ctx, max_tokens, open_tag ? open_tag : "", close_tag ? close_tag : "")) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_set_confidence_tracking(desireeia_ctx* ctx, int32_t enabled) {
+    ABI_GUARD_BEGIN
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_confidence_tracking(ctx, enabled != 0)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_get_token_stats(const desireeia_ctx* ctx, float* out_logprob,
+                                                        float* out_entropy, float* out_max_prob) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !out_logprob || !out_entropy || !out_max_prob) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_get_token_stats(ctx, *out_logprob, *out_entropy, *out_max_prob)) return DESIREEIA_ERR_INVALID_ARG;
     return DESIREEIA_OK;
     ABI_GUARD_END
 }
