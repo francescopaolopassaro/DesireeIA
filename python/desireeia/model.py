@@ -515,6 +515,79 @@ class LocalModel:
         if err != Error.OK:
             raise RuntimeError(f"Set tool constraint failed: {Error(err).name}")
 
+    def score_tokens(self, tokens: List[int], from_index: int = 1) -> Tuple[List[float], List[float]]:
+        """Score text the model did not write. Returns ``(logprobs, entropies)`` for ``tokens[from_index:]``:
+        the log-probability of each token given everything before it, and the entropy (nats) of the model's
+        distribution at that position. Nothing is generated. Compare two versions of a prompt, see how
+        surprised the model is by each token, or pick a label. Dense (attention) models only."""
+        self._check()
+        lib = self._need_abi4("desireeia_score_tokens")
+        n = len(tokens)
+        if from_index < 1 or from_index >= n:
+            raise ValueError("from_index must be in [1, len(tokens))")
+        ids = (c_int32 * n)(*tokens)
+        lp = (c_float * (n - from_index))()
+        en = (c_float * (n - from_index))()
+        with self._lock:
+            err = lib.desireeia_score_tokens(self._ctx, ids, n, from_index, lp, en)
+        if err != Error.OK:
+            raise RuntimeError(f"Score tokens failed: {Error(err).name}")
+        return list(lp), list(en)
+
+    def score_text(self, text: str, prefix: str = "") -> Tuple[List[int], List[float], List[float]]:
+        """Score ``text`` as a continuation of ``prefix`` (``prefix`` may be empty: the first token of ``text`` then
+        has the start-of-text token before it). Returns ``(token_ids, logprobs, entropies)`` for the tokens of ``text``."""
+        head = self.tokenize(prefix, add_bos=True) if prefix else self.tokenize("", add_bos=True)
+        body = self.tokenize(text, add_bos=False)
+        if head is None or body is None:
+            raise RuntimeError("this model has no tokenizer")
+        if not body:
+            return [], [], []
+        if not head:
+            head = [body[0]]
+            body_scored = body[1:]
+            tokens = head + body_scored
+            lp, en = self.score_tokens(tokens, 1)
+            return body, [0.0] + lp, [0.0] + en
+        tokens = head + body
+        lp, en = self.score_tokens(tokens, len(head))
+        return body, lp, en
+
+    def set_logit_bias(self, bias=None) -> None:
+        """Add ``bias[token_id]`` to that token's logit before every draw (``None`` or ``{}`` clears it; -100 forbids)."""
+        self._check()
+        lib = self._need_abi4("desireeia_set_logit_bias")
+        items = list((bias or {}).items())
+        n = len(items)
+        ids = (c_int32 * max(1, n))(*[int(k) for k, _ in items])
+        vals = (c_float * max(1, n))(*[float(v) for _, v in items])
+        with self._lock:
+            err = lib.desireeia_set_logit_bias(self._ctx, ids if n else None, vals if n else None, n)
+        if err != Error.OK:
+            raise RuntimeError(f"Set logit bias failed: {Error(err).name}")
+
+    def set_json_schema(self, schema=None) -> None:
+        """Make the whole output a document valid against a JSON schema: the engine only samples tokens that
+        keep the text a valid prefix of one, and ends the generation only when the document is complete, so
+        the result always parses and has the required keys and types. ``schema`` is a dict, a JSON string, the
+        word ``"json"`` (any JSON value) or ``None`` to turn it off. It replaces the tool-call constraint while
+        set. Supported: type (also lists), properties / required / additionalProperties, items / minItems /
+        maxItems, minLength / maxLength, enum / const, anyOf / oneOf, $ref to ``#/$defs/..``."""
+        self._check()
+        lib = self._need_abi4("desireeia_set_json_schema")
+        if schema is None or schema == "":
+            text = None
+        elif isinstance(schema, str):
+            text = schema.encode("utf-8")
+        else:
+            import json as _json
+            text = _json.dumps(schema).encode("utf-8")
+        with self._lock:
+            err = lib.desireeia_set_json_schema(self._ctx, text)
+        if err != Error.OK:
+            from .engine import last_error
+            raise ValueError(f"JSON schema refused: {Error(err).name}: {last_error()}")
+
     def _need_abi4(self, name: str):
         lib = _nat.get_lib()
         if not hasattr(lib, name):
@@ -566,6 +639,115 @@ class LocalModel:
         if err != Error.OK:
             return None
         return (lp.value, en.value, mp.value)
+
+    def _need_abi5(self, name: str):
+        lib = _nat.get_lib()
+        if not hasattr(lib, name):
+            raise RuntimeError(f"{name} needs a native engine with ABI 5 or newer")
+        return lib
+
+    def set_top_candidates(self, k: int = 5) -> None:
+        """Record, for every token drawn, the ``k`` (0..16, 0 = off) most likely tokens of its distribution:
+        what the model considered besides what it wrote. Needs ``set_confidence_tracking(True)``.
+        Read them with ``top_candidates``. Costs nothing while off."""
+        self._check()
+        if not 0 <= k <= 16:
+            raise ValueError("k must be between 0 and 16")
+        lib = self._need_abi5("desireeia_set_top_candidates")
+        with self._lock:
+            err = lib.desireeia_set_top_candidates(self._ctx, int(k))
+        if err != Error.OK:
+            raise RuntimeError(f"Set top candidates failed: {Error(err).name}")
+
+    def top_candidates(self):
+        """[(token_id, logprob), ...] best first for the last token drawn, or None if nothing was recorded."""
+        self._check()
+        lib = self._need_abi5("desireeia_get_top_candidates")
+        ids = (c_int32 * 16)()
+        lps = (c_float * 16)()
+        n = c_int32()
+        with self._lock:
+            err = lib.desireeia_get_top_candidates(self._ctx, ids, lps, 16, byref(n))
+        if err != Error.OK or n.value <= 0:
+            return None
+        return [(ids[i], lps[i]) for i in range(n.value)]
+
+    def set_prefix_cache(self, budget_bytes: int = 0, min_tokens: int = 64) -> bool:
+        """Keep the K/V of earlier prompts in host memory (up to ``budget_bytes``; 0 = off, the default) so that coming
+        back to a prompt - another chat, another role, a subagent with the same system prompt - restores its cache
+        instead of prefilling it again. The restored K/V are what a prefill computed (the last prompt token runs on its own, as in any session reuse).
+        Returns False for models that cannot rewind their state."""
+        self._check()
+        lib = self._need_abi5("desireeia_set_prefix_cache")
+        with self._lock:
+            err = lib.desireeia_set_prefix_cache(self._ctx, int(budget_bytes), int(min_tokens))
+        return err == Error.OK
+
+    def save_prefix_cache(self, directory) -> int:
+        """Write the kept prompts into ``directory`` (one file each) so they survive a restart. Returns how many."""
+        self._check()
+        lib = self._need_abi5("desireeia_save_prefix_cache")
+        n = c_int32()
+        with self._lock:
+            err = lib.desireeia_save_prefix_cache(self._ctx, os.fsencode(str(directory)), byref(n))
+        if err != Error.OK:
+            raise RuntimeError(f"Save prefix cache failed: {Error(err).name}")
+        return n.value
+
+    def load_prefix_cache(self, directory) -> int:
+        """Read back the prompts saved by ``save_prefix_cache`` that belong to this model. The store must be on
+        (``set_prefix_cache``): its budget limits what is loaded. Returns how many were added."""
+        self._check()
+        lib = self._need_abi5("desireeia_load_prefix_cache")
+        n = c_int32()
+        with self._lock:
+            err = lib.desireeia_load_prefix_cache(self._ctx, os.fsencode(str(directory)), byref(n))
+        if err != Error.OK:
+            raise RuntimeError(f"Load prefix cache failed: {Error(err).name}")
+        return n.value
+
+    def prefix_cache_info(self):
+        """(bytes held, entries, predicts that restored something, prompt tokens saved from prefill)."""
+        self._check()
+        lib = self._need_abi5("desireeia_get_prefix_cache_info")
+        b, e, h, r = c_uint64(), c_int32(), c_uint64(), c_uint64()
+        with self._lock:
+            err = lib.desireeia_get_prefix_cache_info(self._ctx, byref(b), byref(e), byref(h), byref(r))
+        return (b.value, e.value, h.value, r.value) if err == Error.OK else (0, 0, 0, 0)
+
+    def set_attention_probe(self, enabled: bool = True) -> bool:
+        """Keep, for every DECODED token, the attention weights of every layer and head (read with
+        ``attention``). Off by default; on, decode is a few percent slower and a prefill is not captured.
+        Returns False when this model cannot be probed."""
+        self._check()
+        lib = self._need_abi5("desireeia_set_attention_probe")
+        with self._lock:
+            err = lib.desireeia_set_attention_probe(self._ctx, 1 if enabled else 0)
+        return err == Error.OK
+
+    def attention_shape(self):
+        """(layers, heads, positions recorded, total positions) of the last token, or None."""
+        self._check()
+        lib = self._need_abi5("desireeia_get_attention_shape")
+        l, h, p, t = c_int32(), c_int32(), c_int32(), c_int32()
+        with self._lock:
+            err = lib.desireeia_get_attention_shape(self._ctx, byref(l), byref(h), byref(p), byref(t))
+        return (l.value, h.value, p.value, t.value) if err == Error.OK else None
+
+    def attention(self, layer: int, head: int = -1):
+        """Normalised attention weights (sum 1) of one layer over the positions of the last decoded token;
+        ``head=-1`` is the mean over the heads. None when that layer was not captured."""
+        shape = self.attention_shape()
+        if shape is None:
+            return None
+        lib = self._need_abi5("desireeia_get_attention")
+        w = (c_float * shape[2])()
+        n = c_int32()
+        with self._lock:
+            err = lib.desireeia_get_attention(self._ctx, int(layer), int(head), w, shape[2], byref(n))
+        if err != Error.OK:
+            return None
+        return list(w[: n.value])
 
     def get_sampling(self) -> SamplingOptions:
         """Get current sampling parameters."""

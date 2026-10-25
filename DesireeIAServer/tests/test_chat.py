@@ -150,3 +150,45 @@ def test_chat_empty_messages(client):
 def test_chat_stream_no_stream_flag(client):
     r = client.post("/v1/chat/completions", json=_ok())
     assert r.json()["object"] == "chat.completion"
+
+# ── token probabilities (logprobs / top_logprobs), chat completions ──
+
+def test_chat_logprobs_sync(client):
+    r = client.post("/v1/chat/completions", json={**_ok(), "logprobs": True, "top_logprobs": 2})
+    assert r.status_code == 200
+    lp = r.json()["choices"][0]["logprobs"]["content"]
+    assert [e["token"] for e in lp] == ["TokenA ", "TokenB "]          # one entry per generated token
+    assert lp[0]["logprob"] == -0.25
+    assert lp[0]["bytes"] == list("TokenA ".encode())
+    assert len(lp[0]["top_logprobs"]) == 2
+    assert lp[0]["top_logprobs"][0]["logprob"] >= lp[0]["top_logprobs"][1]["logprob"]
+
+
+def test_chat_logprobs_without_alternatives(client):
+    r = client.post("/v1/chat/completions", json={**_ok(), "logprobs": True})
+    lp = r.json()["choices"][0]["logprobs"]["content"]
+    assert len(lp) == 2 and lp[0]["top_logprobs"] == []
+
+
+def test_chat_without_logprobs_has_no_logprobs_field_and_tracking_is_off(client):
+    client.post("/v1/chat/completions", json={**_ok(), "logprobs": True})
+    r = client.post("/v1/chat/completions", json=_ok())              # the next request must not inherit it
+    assert "logprobs" not in r.json()["choices"][0]
+
+
+def test_chat_logprobs_stream(client):
+    with client.stream("POST", "/v1/chat/completions", json={**_ok(), "stream": True, "logprobs": True, "top_logprobs": 1}) as r:
+        events = [json.loads(line[6:]) for line in r.iter_lines() if line.startswith("data: ") and line != "data: [DONE]"]
+    entries = [c["choices"][0]["logprobs"]["content"][0] for c in events if c["choices"][0].get("logprobs")]
+    assert [e["token"] for e in entries] == ["TokenA ", "TokenB "]
+    assert all(len(e["top_logprobs"]) == 1 for e in entries)
+
+
+def test_top_logprobs_needs_logprobs_and_is_bounded(client):
+    assert client.post("/v1/chat/completions", json={**_ok(), "top_logprobs": 2}).status_code == 400
+    assert client.post("/v1/chat/completions", json={**_ok(), "logprobs": True, "top_logprobs": 99}).status_code == 400
+
+
+def test_legacy_completions_refuse_logprobs(client):
+    r = client.post("/v1/completions", json={"prompt": "hi", "logprobs": True})
+    assert r.status_code == 501 or r.status_code == 400 or r.status_code == 422

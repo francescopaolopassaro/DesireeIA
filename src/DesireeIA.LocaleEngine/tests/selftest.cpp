@@ -2703,6 +2703,41 @@ int main(int argc, char** argv) {
             if (st2.valid && st2.entropy < 1e-3f && st2.logprob > -1e-3f && st2.max_prob > 0.999f) { std::printf("  sampler confidence stats (peaked) OK\n"); passed++; }
             else { std::printf("  sampler confidence stats peaked FAIL: H=%f lp=%f\n", st2.entropy, st2.logprob); failed++; }
         }
+
+        // top candidates: the k most likely tokens of the distribution, best first, ln P over the vocabulary
+        {
+            Sampler s;
+            s.configure(make(0.0f, 0, 1.0f, 1));
+            s.set_track_stats(true);
+            s.set_track_top(3);
+            std::vector<float> l = {0.5f, 3.0f, -1.0f, 2.0f, 2.5f, 0.0f};
+            const int32_t chosen = s.sample(l, {});
+            const desireeia::TokenStats& st = s.last_stats();
+            double total = 0.0;
+            for (float v : {0.5f, 3.0f, -1.0f, 2.0f, 2.5f, 0.0f}) total += std::exp((double) v);
+            const bool order_ok = st.valid && st.top_n == 3 && st.top_id[0] == 1 && st.top_id[1] == 4 && st.top_id[2] == 3;
+            const bool lp_ok = st.top_n == 3 && approx(st.top_lp[0], (float) (3.0 - std::log(total)), 1e-4f) &&
+                               approx(st.top_lp[1], (float) (2.5 - std::log(total)), 1e-4f);
+            if (chosen == 1 && order_ok && lp_ok && approx(std::exp(st.top_lp[0]), st.max_prob, 1e-5f)) { std::printf("  sampler top candidates OK\n"); passed++; }
+            else { std::printf("  sampler top candidates FAIL: chosen=%d n=%d ids=%d,%d,%d\n", (int) chosen, st.top_n, st.top_id[0], st.top_id[1], st.top_id[2]); failed++; }
+            // asking for more than the cap is clamped, and fewer tokens than k gives fewer candidates
+            Sampler s2;
+            s2.configure(make(0.0f, 0, 1.0f, 1));
+            s2.set_track_stats(true);
+            s2.set_track_top(1000);
+            std::vector<float> l3 = {1.0f, 2.0f};
+            s2.sample(l3, {});
+            if (s2.track_top() == desireeia::TokenStats::kTopMax && s2.last_stats().top_n == 2) { std::printf("  sampler top candidates cap OK\n"); passed++; }
+            else { std::printf("  sampler top candidates cap FAIL\n"); failed++; }
+            // off by default: tracking alone records none
+            Sampler s3;
+            s3.configure(make(0.0f, 0, 1.0f, 1));
+            s3.set_track_stats(true);
+            std::vector<float> l4 = {1.0f, 2.0f, 3.0f};
+            s3.sample(l4, {});
+            if (s3.last_stats().valid && s3.last_stats().top_n == 0) { std::printf("  sampler top candidates off by default OK\n"); passed++; }
+            else { std::printf("  sampler top candidates default FAIL\n"); failed++; }
+        }
     }
 
     std::printf("passed=%d unsupported=%d failed=%d\n", passed, unsupported, failed);

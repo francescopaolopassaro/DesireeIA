@@ -282,6 +282,16 @@ internal static class NativeMethods
         IntPtr[]? toolNames, nuint nTools);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_json_schema(IntPtr ctx, byte[]? schemaJson);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_score_tokens(IntPtr ctx, int[] tokens, nuint nTokens, nuint fromIndex,
+        float[] outLogprob, float[]? outEntropy);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_logit_bias(IntPtr ctx, int[]? tokenIds, float[]? bias, nuint n);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_get_sampling(IntPtr ctx, out Sampling outParams);
 
     /// <summary>Corresponds to desireeia_sampling_ext in abi.h (ABI 4).</summary>
@@ -309,6 +319,33 @@ internal static class NativeMethods
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_get_token_stats(IntPtr ctx, out float logprob, out float entropy, out float maxProb);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_top_candidates(IntPtr ctx, int k);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_get_top_candidates(IntPtr ctx, [Out] int[] ids, [Out] float[] logprobs, int capacity, out int n);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_prefix_cache(IntPtr ctx, ulong budgetBytes, int minTokens);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_get_prefix_cache_info(IntPtr ctx, out ulong bytes, out int entries, out ulong hits, out ulong restoredTokens);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_save_prefix_cache(IntPtr ctx, [MarshalAs(UnmanagedType.LPUTF8Str)] string dir, out int written);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_load_prefix_cache(IntPtr ctx, [MarshalAs(UnmanagedType.LPUTF8Str)] string dir, out int loaded);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_attention_probe(IntPtr ctx, int enabled);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_get_attention_shape(IntPtr ctx, out int layers, out int heads, out int positions, out int total);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_get_attention(IntPtr ctx, int layer, int head, [Out] float[] weights, int capacity, out int n);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_load_lora_adapter(IntPtr ctx,

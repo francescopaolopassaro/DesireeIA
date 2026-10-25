@@ -79,6 +79,20 @@ public:
     }
     virtual void clear_lora() {}
 
+    // Attention probe (diagnostics, off by default): while on, the attention weights of the last
+    // DECODED token are kept per layer and head so a caller can look at where the model looked.
+    // Default: not supported. `read` writes the normalised weights over positions [0, n) of one
+    // layer (head = -1: mean over the heads) and fails when that layer was not captured.
+    virtual bool set_attention_probe(bool on) { (void) on; return false; }
+    virtual bool attention_probe_shape(uint32_t& layers, uint32_t& heads, uint32_t& positions, uint32_t& total) const {
+        layers = heads = positions = total = 0;
+        return false;
+    }
+    virtual bool attention_probe_read(uint32_t layer, int32_t head, float* out, int32_t capacity, int32_t& n) {
+        (void) layer; (void) head; (void) out; (void) capacity; n = 0;
+        return false;
+    }
+
     // Prerouter routing prediction. Default: not supported — only
     // DenseForward overrides these (MoE-only mechanism; BertForward/
     // SsmForward have no router to predict ahead of).

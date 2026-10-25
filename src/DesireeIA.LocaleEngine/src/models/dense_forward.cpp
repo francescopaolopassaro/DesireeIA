@@ -9,6 +9,7 @@
 #include "dense_forward.h"
 #include "moe_route.h"
 #include "../core/profile.h"
+#include "../core/i8gemm.h"
 #include "../quant/quant.h"
 #include "../kv/kv_quant.h"
 #include "../core/mem_lock.h"
@@ -37,6 +38,12 @@ namespace {
 // the future multiple models with different backends share a process,
 // this will need revisiting (a note for a future session, not a problem today).
 static int32_t g_active_backend = DESIREEIA_BACKEND_CPU;
+// Context length (positions already in the cache) from which the GPU decode uses the grouped attention kernel.
+static constexpr uint32_t kGroupedAttnFromPos = 96;
+#ifdef DESIREEIA_CUDA_ENABLED
+static std::atomic<int> g_cuda_models_live{0};
+static DenseForward* g_kv_owner = nullptr;     // the model whose rows are in the device KV buffers right now
+#endif
 #endif
 
 static float gelu_tanh(float v) {
@@ -399,6 +406,14 @@ static size_t row_bytes_of(const MatVec& m, size_t total_rows) {
 // batched matmul_f32 yet, so it simply calls matmul_f32 per column: no
 // regression (same cost as before), the batching gain only applies to the
 // quantized kernels.
+// Products that read the same input (q, k and v; gate and up) quantize it once on the CPU int8 path.
+struct SharedActs {
+    SharedActs(const float* x, size_t cols, size_t n_tok) { i8_share_acts_begin(x, cols, n_tok); }
+    ~SharedActs() { i8_share_acts_end(); }
+    SharedActs(const SharedActs&) = delete;
+    SharedActs& operator=(const SharedActs&) = delete;
+};
+
 static void matvec_batch(const MatVec& m, size_t r, size_t c, const float* x, size_t n_tok, float* y) {
 #ifdef DESIREEIA_CUDA_ENABLED
     // Same backend gate as matvec above. This still calls the per-token
@@ -822,6 +837,7 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
     cfg_.backend = backend;
 #ifdef DESIREEIA_CUDA_ENABLED
     g_active_backend = backend;
+    if (backend == DESIREEIA_BACKEND_CUDA && !cuda_counted_) { cuda_counted_ = true; g_cuda_models_live.fetch_add(1); }
 #endif
     // Never for MLA: see the note on kv_quantized_ in the header. head_dim
     // is repurposed there to the compressed kv_lora_rank+rope width, not a
@@ -1157,7 +1173,9 @@ DenseForward::~DenseForward() {
     // because another model loaded afterward will want its own (different
     // shapes). The device-resident weights of individual MatVecs free
     // themselves (shared_ptr, see MatVec::cuda_qs).
-    if (g_active_backend == DESIREEIA_BACKEND_CUDA) cuda_backend_shutdown();
+    // The backend is shared by every CUDA model of the process: it goes down with the last one, not with the first to be destroyed.
+    if (g_kv_owner == this) g_kv_owner = nullptr;
+    if (cuda_counted_ && g_cuda_models_live.fetch_sub(1) == 1) cuda_backend_shutdown();
 #endif
     if (!mlocked_) return;
     auto unlock_matvec = [](const MatVec& m) {
@@ -1210,10 +1228,20 @@ size_t DenseForward::kv_bytes_per_pos() const {
 bool DenseForward::export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v) {
     const size_t bpp = kv_bytes_per_pos();
     if (bpp == 0 || n > cache_cols_) return false;
+    claim_device_kv();
 #ifdef DESIREEIA_CUDA_ENABLED
-    // Decode on the fused path writes the device cache only: bring the host
-    // copy up to date before reading it.
+    // Decode on the fused path writes the device cache only, so on CUDA the device is the authority: read just the
+    // n positions of each layer from it (not the whole allocation, which for a long context is most of VRAM).
     if (kv_quantized_ && cuda_kv_ready_ && cache_capacity_ > 0 && g_active_backend == DESIREEIA_BACKEND_CUDA) {
+        k.resize((size_t) cfg_.n_layers * n * bpp);
+        v.resize(k.size());
+        bool ok = true;
+        for (uint32_t l = 0; l < cfg_.n_layers && ok; ++l) {
+            ok = cuda_kv_cache_read((size_t) l * cache_capacity_ * bpp, k.data() + (size_t) l * n * bpp,
+                                    v.data() + (size_t) l * n * bpp, n * bpp);
+        }
+        if (ok) return true;
+        // a failed partial read: fall through to the whole-cache download, as before
         cuda_kv_cache_download(k_cache_q_.data(), v_cache_q_.data(), k_cache_q_.size());
     }
 #endif
@@ -1230,16 +1258,17 @@ bool DenseForward::export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint
     return true;
 }
 
-bool DenseForward::import_kv(size_t n, const uint8_t* k, const uint8_t* v) {
+bool DenseForward::import_kv(size_t n, const uint8_t* k, const uint8_t* v, size_t src_n) {
     const size_t bpp = kv_bytes_per_pos();
     if (bpp == 0) return false;
     if (n > cache_capacity_) grow_cache(n);
     if (n > cache_capacity_) return false;
+    claim_device_kv();
     uint8_t* kb = kv_quantized_ ? k_cache_q_.data() : reinterpret_cast<uint8_t*>(k_cache_.data());
     uint8_t* vb = kv_quantized_ ? v_cache_q_.data() : reinterpret_cast<uint8_t*>(v_cache_.data());
     for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
         const size_t dst = (size_t) l * cache_capacity_ * bpp;
-        const size_t src = (size_t) l * n * bpp;
+        const size_t src = (size_t) l * src_n * bpp;
         std::memcpy(kb + dst, k + src, n * bpp);
         std::memcpy(vb + dst, v + src, n * bpp);
     }
@@ -1247,8 +1276,17 @@ bool DenseForward::import_kv(size_t n, const uint8_t* k, const uint8_t* v) {
     // The device cache is what attention reads on CUDA: bring it in line
     // with the host copy just filled (whole allocation, same as a growth).
     if (cuda_kv_ready_ && g_active_backend == DESIREEIA_BACKEND_CUDA) {
-        const size_t bytes = kv_quantized_ ? k_cache_q_.size() : k_cache_.size() * sizeof(float);
-        cuda_kv_ready_ = cuda_kv_cache_upload(kb, vb, bytes);
+        if (kv_quantized_) {
+            // Only the n positions just written, layer by layer (the rest of the allocation is unused).
+            bool ok = true;
+            for (uint32_t l = 0; l < cfg_.n_layers && ok; ++l) {
+                const size_t off = (size_t) l * cache_capacity_ * bpp;
+                ok = cuda_kv_cache_write(off, kb + off, vb + off, n * bpp);
+            }
+            if (!ok) cuda_kv_ready_ = cuda_kv_cache_upload(kb, vb, k_cache_q_.size());
+        } else {
+            cuda_kv_ready_ = cuda_kv_cache_upload(kb, vb, k_cache_.size() * sizeof(float));
+        }
     }
     kv_host_stale_ = false;                       // host and device now hold the same rows
 #endif
@@ -1656,6 +1694,105 @@ void DenseForward::attach_lora_deltas(const std::string& name, uint32_t rows, ui
         lw.scale = ad.alpha > 0.0f ? ad.user_scale * ad.alpha / (float) rank : ad.user_scale;
         out.lora.push_back(std::move(lw));
     }
+}
+
+// ── attention probe ─────────────────────────────────────────────────────────
+
+void DenseForward::probe_configure_() {
+    probe_dirty_ = false;
+    probe_src_.assign(cfg_.n_layers, (uint8_t) 0);
+    probe_gpu_ = false;
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (g_active_backend == DESIREEIA_BACKEND_CUDA && cuda_kv_ready_ && kv_quantized_ && cache_capacity_ > 0) {
+        const size_t pos_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
+        probe_gpu_ = cuda_attention_probe_configure(true, cfg_.n_layers, cfg_.n_head, kProbeMaxPos, cache_capacity_ * pos_bytes);
+    }
+#endif
+}
+
+bool DenseForward::set_attention_probe(bool on) {
+    // MLA keeps a different cache and attends in a different space: not covered.
+    if (on && quirks_.mla) return false;
+    attn_probe_on_ = on;
+    if (!on) {
+        probe_cpu_.clear();
+        probe_cpu_.shrink_to_fit();
+        probe_src_.clear();
+#ifdef DESIREEIA_CUDA_ENABLED
+        cuda_attention_probe_configure(false, 0, 0, 0, 0);
+#endif
+        probe_dirty_ = false;
+        return true;
+    }
+    probe_src_.assign(cfg_.n_layers, (uint8_t) 0);
+    probe_dirty_ = true;   // configured at the next step, when the device cache exists
+    return true;
+}
+
+bool DenseForward::attention_probe_shape(uint32_t& layers, uint32_t& heads, uint32_t& positions, uint32_t& total) const {
+    layers = cfg_.n_layers;
+    heads = cfg_.n_head;
+    total = probe_pos_ + 1;
+    positions = std::min<uint32_t>(total, kProbeMaxPos);
+    return attn_probe_on_ && std::any_of(probe_src_.begin(), probe_src_.end(), [](uint8_t v) { return v != 0; });
+}
+
+bool DenseForward::attention_probe_read(uint32_t layer, int32_t head, float* out, int32_t capacity, int32_t& n) {
+    n = 0;
+    const uint32_t H = cfg_.n_head;
+    if (!attn_probe_on_ || !out || layer >= cfg_.n_layers || layer >= probe_src_.size() || head < -1 || head >= (int32_t) H) return false;
+    const uint8_t src = probe_src_[layer];
+    if (src == 0) return false;
+    const uint32_t count = std::min<uint32_t>(probe_pos_ + 1, kProbeMaxPos);
+    if (capacity < (int32_t) count) return false;
+
+    std::vector<float> raw;     // device layers: raw scores [head][kProbeMaxPos]
+    const float* cpu = nullptr; // CPU layers: normalised weights
+    if (src == 1) {
+        if (probe_cpu_.empty()) return false;
+        cpu = probe_cpu_.data() + (size_t) layer * H * kProbeMaxPos;
+    } else {
+#ifdef DESIREEIA_CUDA_ENABLED
+        raw.resize((size_t) H * kProbeMaxPos);
+        if (!cuda_attention_probe_read(layer, raw.data())) return false;
+#else
+        return false;
+#endif
+    }
+
+    auto head_weights = [&](uint32_t h, float* dst) {
+        if (src == 1) {
+            const float* w = cpu + (size_t) h * kProbeMaxPos;
+            for (uint32_t i = 0; i < count; ++i) dst[i] = w[i];
+            return;
+        }
+        // softmax of the raw scores, the same arithmetic the decode attention uses (-inf = outside the window)
+        const float* r = raw.data() + (size_t) h * kProbeMaxPos;
+        float mx = -INFINITY;
+        for (uint32_t i = 0; i < count; ++i) mx = r[i] > mx ? r[i] : mx;
+        double sum = 0.0;
+        for (uint32_t i = 0; i < count; ++i) {
+            const float e = (r[i] == -INFINITY || mx == -INFINITY) ? 0.0f : std::exp(r[i] - mx);
+            dst[i] = e;
+            sum += e;
+        }
+        const float inv = sum > 0.0 ? (float) (1.0 / sum) : 0.0f;
+        for (uint32_t i = 0; i < count; ++i) dst[i] *= inv;
+    };
+
+    if (head >= 0) {
+        head_weights((uint32_t) head, out);
+    } else {
+        std::vector<float> tmp(count);
+        for (uint32_t i = 0; i < count; ++i) out[i] = 0.0f;
+        for (uint32_t h = 0; h < H; ++h) {
+            head_weights(h, tmp.data());
+            for (uint32_t i = 0; i < count; ++i) out[i] += tmp[i];
+        }
+        for (uint32_t i = 0; i < count; ++i) out[i] /= (float) H;
+    }
+    n = (int32_t) count;
+    return true;
 }
 
 bool DenseForward::load_lora(const std::string& lora_gguf_path, float scale, std::string& err) {
@@ -2194,6 +2331,7 @@ const LayerWeights* DenseForward::get_layer(ModelReader& rd, uint32_t il) {
 
 void DenseForward::grow_cache(size_t needed) {
     if (needed <= cache_capacity_) return;
+    probe_dirty_ = attn_probe_on_;   // the layer stride of the device cache is about to change
     const uint32_t kv_dim = cfg_.n_head_kv * cfg_.head_dim;
     const size_t cols = cache_capacity_ > 0 ? cache_capacity_ : 1;
     const size_t new_cols = std::max(needed, cols * 2);
@@ -2238,6 +2376,8 @@ void DenseForward::grow_cache(size_t needed) {
         cache_capacity_ = new_cols;
 #ifdef DESIREEIA_CUDA_ENABLED
         if (g_active_backend == DESIREEIA_BACKEND_CUDA) {
+            if (g_kv_owner != nullptr && g_kv_owner != this) { g_kv_owner->sync_host_kv(); cuda_drop_graphs(); }
+            g_kv_owner = this;
             const size_t bytes = k_cache_q_.size();
             cuda_kv_ready_ = cuda_kv_cache_reserve(bytes) &&
                               cuda_kv_cache_upload(k_cache_q_.data(), v_cache_q_.data(), bytes);
@@ -2432,6 +2572,20 @@ void DenseForward::mla_attn_layer(const LayerWeights* lw, uint32_t l, uint32_t p
 // the KV cache. Returns false - with x restored - when a layer has a shape
 // the device layer does not cover or a device call fails, so the caller
 // runs its host path instead.
+void DenseForward::claim_device_kv() {
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (g_active_backend != DESIREEIA_BACKEND_CUDA || !kv_quantized_ || cache_capacity_ == 0) return;
+    if (g_kv_owner == this) return;
+    if (g_kv_owner != nullptr) g_kv_owner->sync_host_kv();   // its rows come home first (only if the host copy is behind)
+    g_kv_owner = this;
+    cuda_drop_graphs();
+    const size_t bytes = k_cache_q_.size();
+    cuda_kv_ready_ = cuda_kv_cache_reserve(bytes) && cuda_kv_cache_upload(k_cache_q_.data(), v_cache_q_.data(), bytes);
+    kv_host_stale_ = false;
+    probe_dirty_ = attn_probe_on_;
+#endif
+}
+
 void DenseForward::sync_host_kv() {
     if (!kv_host_stale_) return;
     if (cuda_kv_ready_ && cache_capacity_ > 0) {
@@ -2632,6 +2786,18 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
 
     if (col0 + n_tokens > cache_capacity_) {
         grow_cache(col0 + n_tokens);
+    }
+#ifdef DESIREEIA_CUDA_ENABLED
+    // Grouped decode attention from ~100 tokens of context (see cuda_set_attention_long).
+    if (n_tokens == 1 && g_active_backend == DESIREEIA_BACKEND_CUDA) cuda_set_attention_long(col0 >= kGroupedAttnFromPos);
+#endif
+    claim_device_kv();
+    if (attn_probe_on_ && probe_dirty_) probe_configure_();
+    if (attn_probe_on_) {
+        // A prefill is not captured. A decode token: layers attended on the GPU are in the device buffer; a layer that
+        // runs on the CPU marks itself (1) when it stores its weights.
+        std::fill(probe_src_.begin(), probe_src_.end(), (uint8_t) (n_tokens == 1 && probe_gpu_ ? 2 : 0));
+        probe_pos_ = (uint32_t) (col0 + n_tokens - 1);
     }
 
     std::vector<float> x((size_t) n_tokens * n_embd);
@@ -2976,9 +3142,12 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 } });
                 attn_in_all = xn_attn.data();
             }
-            matvec_batch(lw->wq, q_dim, n_embd, attn_in_all, n_tokens, q_all.data());
-            matvec_batch(lw->wk, kv_dim, n_embd, attn_in_all, n_tokens, k_all.data());
-            matvec_batch(lw->wv, kv_dim, n_embd, attn_in_all, n_tokens, v_all.data());
+            {
+                SharedActs shared(attn_in_all, n_embd, n_tokens);
+                matvec_batch(lw->wq, q_dim, n_embd, attn_in_all, n_tokens, q_all.data());
+                matvec_batch(lw->wk, kv_dim, n_embd, attn_in_all, n_tokens, k_all.data());
+                matvec_batch(lw->wv, kv_dim, n_embd, attn_in_all, n_tokens, v_all.data());
+            }
 
             const float inv_d = 1.0f / sqrtf((float) cfg_.head_dim);
             const uint32_t heads_per_kv = n_head / cfg_.n_head_kv;
@@ -3288,8 +3457,11 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     }
                 }
             } else if (quirks_.ffn_gated) {
-                matvec_batch(lw->wff_up, cfg_.n_ff, n_embd, ffn_xn_all.data(), n_tokens, ffn_all.data());
-                matvec_batch(lw->wff_gate, cfg_.n_ff, n_embd, ffn_xn_all.data(), n_tokens, ffn_gate_all.data());
+                {
+                    SharedActs shared(ffn_xn_all.data(), n_embd, n_tokens);
+                    matvec_batch(lw->wff_up, cfg_.n_ff, n_embd, ffn_xn_all.data(), n_tokens, ffn_all.data());
+                    matvec_batch(lw->wff_gate, cfg_.n_ff, n_embd, ffn_xn_all.data(), n_tokens, ffn_gate_all.data());
+                }
                 for_tokens(true, [&](size_t p_begin, size_t p_end) { for (size_t p = p_begin; p < p_end; ++p) {
                     float* ffnp = ffn_all.data() + p * cfg_.n_ff;
                     float* ffngp = ffn_gate_all.data() + p * cfg_.n_ff;
@@ -3684,10 +3856,15 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     n_embd, q_dim, proj.data(),
                     kv_quantized_ ? 1 : 0, kv_q_row_bytes_) == DESIREEIA_OK) {
                 cuda_attn_done = true;
+                if (attn_probe_on_ && kv_quantized_ && l < probe_src_.size()) { probe_src_[l] = 2; probe_pos_ = pos; }
             }
             if (!cuda_attn_done) {
 #endif
             scores.assign((size_t) n_head * score_stride, 0.0f);
+            if (attn_probe_on_) {
+                if (probe_cpu_.empty()) probe_cpu_.assign((size_t) cfg_.n_layers * n_head * kProbeMaxPos, 0.0f);
+                if (l < probe_src_.size()) { probe_src_[l] = 1; probe_pos_ = pos; }
+            }
             parallel_units(n_head, [&](size_t h_begin, size_t h_end) {
             for (uint32_t h = (uint32_t) h_begin; h < (uint32_t) h_end; ++h) {
                 float* scores_h = scores.data() + (size_t) h * score_stride;
@@ -3730,6 +3907,12 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                         }
                     }
                     softmax_inplace(scores_h + cc_start, score_stride - cc_start);
+                    if (attn_probe_on_ && !probe_cpu_.empty()) {
+                        float* dst = probe_cpu_.data() + ((size_t) l * n_head + h) * kProbeMaxPos;
+                        const uint32_t keep = std::min<uint32_t>(pos + 1, kProbeMaxPos);
+                        std::fill(dst, dst + keep, 0.0f);
+                        for (uint32_t cc = cc_start; cc < keep; ++cc) dst[cc] = scores_h[cc];
+                    }
                     for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
                     for (uint32_t cc = cc_start; cc <= pos; ++cc) {
                         kv_axpy_q8_0(oh, vb + (size_t) cc * pos_bytes, cfg_.head_dim, scores_h[cc]);
@@ -3753,6 +3936,12 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     // (equivalent to a -inf score), and aren't even read by
                     // the V accumulation loop below.
                     softmax_inplace(scores_h + cc_start, score_stride - cc_start);
+                    if (attn_probe_on_ && !probe_cpu_.empty()) {
+                        float* dst = probe_cpu_.data() + ((size_t) l * n_head + h) * kProbeMaxPos;
+                        const uint32_t keep = std::min<uint32_t>(pos + 1, kProbeMaxPos);
+                        std::fill(dst, dst + keep, 0.0f);
+                        for (uint32_t cc = cc_start; cc < keep; ++cc) dst[cc] = scores_h[cc];
+                    }
                     for (uint32_t d = 0; d < cfg_.head_dim; ++d) oh[d] = 0.0f;
                     for (uint32_t cc = cc_start; cc <= pos; ++cc) {
                         axpy_f32(oh, vb + (size_t) cc * kv_dim, scores_h[cc], cfg_.head_dim);

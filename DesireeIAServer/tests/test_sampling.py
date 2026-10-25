@@ -39,19 +39,29 @@ def test_resolve_stop_list():
 
 
 def test_rejects_unsupported_sampling_fields():
-    for field in ("mirostat", "typical_p", "top_logprobs"):
+    for field in ("mirostat", "typical_p"):
         with pytest.raises(NotSupportedError):
             resolve({field: 0.1})
 
 
-def test_rejects_logprobs():
-    with pytest.raises(NotSupportedError):
-        resolve({"logprobs": 1})
+def test_logprobs_are_resolved_and_validated():
+    off = resolve({})
+    assert off.logprobs is False and off.top_logprobs == 0
+    p = resolve({"logprobs": True, "top_logprobs": 3})
+    assert p.logprobs is True and p.top_logprobs == 3
+    assert resolve({"logprobs": True}).top_logprobs == 0
+    for bad in ({"logprobs": True, "top_logprobs": 17}, {"logprobs": True, "top_logprobs": -1}, {"top_logprobs": 2},
+                {"logprobs": True, "top_logprobs": "x"}, {"logprobs": "yes"}):
+        with pytest.raises(InvalidRequestError):
+            resolve(bad)
 
 
-def test_rejects_multiple_choices():
+def test_several_answers_are_allowed_but_not_streamed():
+    assert resolve({"n": 3}).n == 3
     with pytest.raises(NotSupportedError):
-        resolve({"n": 2})
+        resolve({"n": 2, "stream": True})
+    with pytest.raises(InvalidRequestError):
+        resolve({"n": 99})
     with pytest.raises(NotSupportedError):
         resolve({"best_of": 3})
 

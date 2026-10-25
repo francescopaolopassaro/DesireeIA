@@ -53,10 +53,16 @@ struct SamplerExt {
 
 // Confidence of the last token drawn (see Sampler::set_track_stats).
 struct TokenStats {
+    static constexpr int kTopMax = 16;   // most candidates that can be recorded per token
     float logprob  = 0.0f;   // ln P(chosen) over the whole vocabulary
     float entropy  = 0.0f;   // entropy of the distribution, in nats
     float max_prob = 0.0f;   // probability of the most likely token
     bool  valid    = false;
+    // The most likely tokens of the same distribution, best first (only when
+    // Sampler::set_track_top asked for them): ids and ln P over the vocabulary.
+    int32_t top_n = 0;
+    int32_t top_id[kTopMax] = {};
+    float   top_lp[kTopMax] = {};
 };
 
 // Stateful sampler (the pseudo-random generator). Not thread-safe: one
@@ -77,9 +83,17 @@ public:
     // pass over the logits and keeps the sampling on the host.
     void set_track_stats(bool v) { track_ = v; last_stats_ = TokenStats{}; }
     bool track_stats() const { return track_; }
+    // The k most likely tokens of each distribution, recorded together with the
+    // confidence (so it needs set_track_stats; 0 = off, the default). Costs one
+    // more comparison per vocabulary entry per token and nothing when off.
+    void set_track_top(int k) { track_top_ = k < 0 ? 0 : (k > TokenStats::kTopMax ? TokenStats::kTopMax : k); }
+    int  track_top() const { return track_top_; }
     const TokenStats& last_stats() const { return last_stats_; }
     // The extras that the device draw cannot reproduce.
-    bool host_only() const { return ext_.min_p > 0.0f || ext_.dry_multiplier > 0.0f || track_; }
+    // Something outside the sampler needs every token handled on the host, one at a time (the attention probe
+    // reads the capture of the token that was just decoded, which the device-side draw would already have passed).
+    void set_force_host(bool v) { force_host_ = v; }
+    bool host_only() const { return ext_.min_p > 0.0f || ext_.dry_multiplier > 0.0f || track_ || force_host_; }
 
     // Picks the next token from the logits. `history` are the tokens
     // already present in the sequence (prompt + generated), used for the
@@ -123,6 +137,8 @@ private:
     size_t        gen_start_ = 0;
     bool          dry_suspended_ = false;
     bool          track_ = false;
+    int           track_top_ = 0;
+    bool          force_host_ = false;
     TokenStats    last_stats_;
     int32_t sample_impl_(std::vector<float>& logits, const std::vector<int32_t>& history);
     void apply_dry_(std::vector<float>& logits, const std::vector<int32_t>& history) const;

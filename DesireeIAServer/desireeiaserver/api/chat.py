@@ -14,7 +14,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
 
 from .. import toolcalling
-from ..generation import GenerationRunner, run_sync
+from ..generation import GenerationRunner, run_sync, run_sync_with_logprobs
 from ..metrics import metrics
 from ..sampling import CodegenParams, resolve
 from ..slots import Slot
@@ -191,17 +191,20 @@ def _producer_for(slot: Slot, messages: List[Tuple[str, str]], params: CodegenPa
 
 
 def _chat_chunk(request_id: str, created: int, model_id: str,
-                delta: str, finish_reason: str | None) -> dict:
+                delta: str, finish_reason: str | None, logprob: dict | None = None) -> dict:
+    choice = {
+        "index": 0,
+        "delta": {} if finish_reason is not None else {"content": delta},
+        "finish_reason": finish_reason,
+    }
+    if logprob is not None:
+        choice["logprobs"] = {"content": [logprob]}
     return {
         "id": request_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model_id,
-        "choices": [{
-            "index": 0,
-            "delta": {} if finish_reason is not None else {"content": delta},
-            "finish_reason": finish_reason,
-        }],
+        "choices": [choice],
     }
 
 
@@ -261,9 +264,9 @@ async def _chat_stream(runner: GenerationRunner, request_id: str, created: int,
                 final["timings"] = runner.tracker.timings()
                 metrics.record_generation(runner.tracker.prompt_n, runner.tracker.predicted_n)
                 yield sse(final)
-            elif step.piece:
+            elif step.piece or step.logprob is not None:
                 full_text += step.piece
-                yield sse(_chat_chunk(request_id, created, model_id, step.piece, None))
+                yield sse(_chat_chunk(request_id, created, model_id, step.piece, None, step.logprob))
         yield "data: [DONE]\n\n"
     finally:
         runner.cancel()
@@ -300,27 +303,45 @@ async def chat_completions(request: Request):
             headers=_STREAM_HEADERS,
         )
 
-    text, finish_reason, tracker = run_sync(producer)
-    metrics.record_generation(tracker.prompt_n, tracker.predicted_n)
-    tool_call = toolcalling.extract_tool_call(text) if tools_active else None
-    if tool_call is not None:
-        message = {"role": "assistant", "content": None, "tool_calls": [_tool_call_message(tool_call)]}
-        finish_reason = "tool_calls"
-        metrics.record_tool_call()
-    else:
-        message = {"role": "assistant", "content": text}
+    choices = []
+    usage = None
+    timings = None
+    for index in range(params.n):
+        if index > 0:
+            # The next draw of the same prompt: another seed when the caller fixed one, so the answers differ.
+            nth = replace(params, seed=params.seed + index) if params.seed is not None else params
+            producer = _producer_for(slot, engine_messages, nth)
+        text, finish_reason, tracker, lp_entries = run_sync_with_logprobs(producer)
+        metrics.record_generation(tracker.prompt_n, tracker.predicted_n)
+        tool_call = toolcalling.extract_tool_call(text) if tools_active else None
+        if tool_call is not None:
+            message = {"role": "assistant", "content": None, "tool_calls": [_tool_call_message(tool_call)]}
+            finish_reason = "tool_calls"
+            metrics.record_tool_call()
+        else:
+            message = {"role": "assistant", "content": text}
+        choice = {
+            "index": index,
+            "message": message,
+            "finish_reason": finish_reason,
+        }
+        if params.logprobs:
+            choice["logprobs"] = {"content": lp_entries}
+        choices.append(choice)
+        if usage is None:
+            usage, timings = tracker.usage(model_id), tracker.timings()
+        else:
+            # the prompt is counted once (the first draw prefilled it); every answer adds its own tokens
+            usage["completion_tokens"] += tracker.predicted_n
+            usage["total_tokens"] += tracker.predicted_n
     return {
         "id": request_id,
         "object": "chat.completion",
         "created": created,
         "model": model_id,
-        "choices": [{
-            "index": 0,
-            "message": message,
-            "finish_reason": finish_reason,
-        }],
-        "usage": tracker.usage(model_id),
-        "timings": tracker.timings(),
+        "choices": choices,
+        "usage": usage,
+        "timings": timings,
     }
 
 
@@ -337,6 +358,10 @@ def _normalize_prompt(payload: dict) -> str:
 async def completions(request: Request):
     payload = await _read_body(request)
     params = resolve(payload, allow_n_predict=True)
+    if params.logprobs:
+        # The legacy completions format returns probabilities in another shape; they are served by chat completions.
+        from .errors import NotSupportedError
+        raise NotSupportedError("'logprobs' is available on /v1/chat/completions, not on /v1/completions", param="logprobs")
     slot = request.app.state.slots.resolve(payload.get("model"))
 
     prompt = _normalize_prompt(payload)

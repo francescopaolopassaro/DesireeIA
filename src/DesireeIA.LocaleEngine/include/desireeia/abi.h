@@ -513,8 +513,10 @@ DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
 /* Version of this interface. Wrappers compare it with the one they were
  * written for and refuse an older engine with a clear message instead of a
  * missing-symbol crash. 2 = engine 0.1.2 (the functions below); 3 = engine
- * 0.2.0 (tool-call constraint, apply_chat_template_json, context memory). */
-#define DESIREEIA_ABI_VERSION 4
+ * 0.2.0 (tool-call constraint, apply_chat_template_json, context memory); 4 = engine 0.2.1
+ * (reasoning budget, min-p/DRY, token stats); 5 = engine 0.3.0 (top candidates per token,
+ * attention probe). */
+#define DESIREEIA_ABI_VERSION 5
 DESIREEIA_API int32_t desireeia_abi_version(void);
 
 /* Text of the last error: the context's own (a failed predict, a refused
@@ -569,6 +571,36 @@ DESIREEIA_API desireeia_error desireeia_set_tool_constraint(desireeia_ctx* ctx, 
                                                             const char* close_tag,
                                                             const char* const* tool_names, size_t n_tools);
 
+/* Scores text the model did not write (0.3.0): the log-probability of tokens[from_index .. n_tokens) given
+ * everything before each of them, and optionally the entropy of the model's distribution at each of those
+ * positions (nats). out_logprob (and out_entropy, may be NULL) have n_tokens - from_index entries; from_index
+ * must be at least 1 (the first token has nothing to be predicted from). Nothing is generated, the cache
+ * ends up holding the text (a following predict that starts with it reuses it) and any generation in
+ * progress is over. Use it to compare two versions of a prompt, to measure how surprised the model is by
+ * each token, to pick among labels, or to find the tokens that carry no information. Dense (attention)
+ * models only: DESIREEIA_ERR_NOT_SUPPORTED otherwise. Cost: one forward pass over the text, plus the
+ * output head for every scored position. */
+DESIREEIA_API desireeia_error desireeia_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
+                                                     size_t from_index, float* out_logprob, float* out_entropy);
+
+/* Adds bias[i] to the logit of token_ids[i] before every draw, for every following predict until changed
+ * (n = 0 clears it). Positive favours a token, a large negative (-100) forbids it. Draws on the host with the
+ * whole vocabulary, so a GPU pipeline is bypassed while a bias is set. */
+DESIREEIA_API desireeia_error desireeia_set_logit_bias(desireeia_ctx* ctx, const int32_t* token_ids, const float* bias,
+                                                       size_t n);
+
+/* Makes the whole output a document valid against a JSON schema (0.3.0). The sampler
+ * only picks tokens that keep the text a valid prefix of such a document, and only
+ * allows the end of generation once the document is complete, so the result always
+ * parses and always has the required keys and types. schema_json: a JSON schema, the
+ * word "json" (any JSON value) or NULL / "" to turn it off. It takes the place of the
+ * tool-call constraint while set and persists across predicts until changed.
+ * Returns DESIREEIA_ERR_PARSE (see desireeia_last_error) when the schema is not
+ * valid JSON or uses something unsupported. Supported: type (also lists),
+ * properties / required / additionalProperties, items / minItems / maxItems,
+ * minLength / maxLength, enum / const, anyOf / oneOf, $ref to "#/$defs/..." and "#". */
+DESIREEIA_API desireeia_error desireeia_set_json_schema(desireeia_ctx* ctx, const char* schema_json);
+
 /* ---- Sampling extras, reasoning budget, per-token confidence (ABI 4) ------
  * Separate from desireeia_sampling on purpose: that struct is passed by
  * pointer without a size, so growing it would break every wrapper built
@@ -612,6 +644,70 @@ DESIREEIA_API desireeia_error desireeia_set_reasoning_budget(desireeia_ctx* ctx,
 DESIREEIA_API desireeia_error desireeia_set_confidence_tracking(desireeia_ctx* ctx, int32_t enabled);
 DESIREEIA_API desireeia_error desireeia_get_token_stats(const desireeia_ctx* ctx, float* out_logprob,
                                                         float* out_entropy, float* out_max_prob);
+
+/* The k most likely tokens of the distribution the last token was drawn from
+ * (k <= 16, 0 = off, the default), best first, with their log-probability
+ * over the whole vocabulary: what the model considered besides what it wrote.
+ * Needs desireeia_set_confidence_tracking(1); costs one comparison per
+ * vocabulary entry per token while on, nothing while off. The probabilities
+ * are those of the sampling distribution (after penalties and temperature).
+ * get returns DESIREEIA_ERR_INVALID_ARG when nothing was recorded; `capacity`
+ * is the size of both arrays and *out_n receives how many were written. */
+DESIREEIA_API desireeia_error desireeia_set_top_candidates(desireeia_ctx* ctx, int32_t k);
+DESIREEIA_API desireeia_error desireeia_get_top_candidates(const desireeia_ctx* ctx, int32_t* out_ids,
+                                                           float* out_logprobs, int32_t capacity, int32_t* out_n);
+
+/* Prefix store: keeps the K/V of earlier prompts so that coming back to them skips their prefill.
+ * A chat app that serves several conversations, roles or subagents through one model shares a long
+ * system prompt (and often tool definitions) among them; the session cache only remembers the LAST
+ * prompt, so every switch prefills that shared part again. With a budget, the engine keeps the prompt
+ * it is about to overwrite (when at least min_tokens positions would be lost) in host memory, and a
+ * later prompt that starts with the same tokens gets that prefix back instead of a prefill: the
+ * restored K/V are exactly what a prefill computed. (As with any session reuse, the last prompt token is
+ * then run on its own, so generation can differ from a full prefill only by floating-point rounding
+ * at a near-tie.)
+ *   - budget_bytes = 0 (the default) is off: nothing is stored and nothing changes.
+ *   - Entries are used by the longest prefix they share with the new prompt; the least recently used
+ *     are dropped when the budget is exceeded. A prompt larger than the whole budget is not kept.
+ *   - min_tokens (at least 16, default 64) is the shortest prefix worth storing or restoring.
+ *   - Only prefilled positions are kept (as in the exact session mode). Models with recurrent state
+ *     cannot use it (the call fails). desireeia_last_reused_tokens counts restored tokens too.
+ *   - desireeia_get_prefix_cache_info reports the bytes held, the entries, how many predicts restored
+ *     something and how many prompt tokens that saved from prefill. */
+DESIREEIA_API desireeia_error desireeia_set_prefix_cache(desireeia_ctx* ctx, uint64_t budget_bytes, int32_t min_tokens);
+DESIREEIA_API desireeia_error desireeia_get_prefix_cache_info(desireeia_ctx* ctx, uint64_t* out_bytes, int32_t* out_entries,
+                                                              uint64_t* out_hits, uint64_t* out_restored_tokens);
+
+/* The prefix store on disk, so the prompts a chat app uses most (its system prompt) survive a restart.
+ * save writes one file per kept prompt into `dir` (created if missing); load reads back the ones that belong to THIS model
+ * and cache layout (files of another model or engine version are ignored) into the store, which must be switched on:
+ * its budget limits what is loaded. A missing directory loads nothing and is not an error. The last error text is available
+ * with desireeia_last_error. */
+DESIREEIA_API desireeia_error desireeia_save_prefix_cache(desireeia_ctx* ctx, const char* dir, int32_t* out_written);
+DESIREEIA_API desireeia_error desireeia_load_prefix_cache(desireeia_ctx* ctx, const char* dir, int32_t* out_loaded);
+
+/* Attention probe: where the model looked. While on, the attention weights of the last DECODED token are
+ * kept for every layer and head, and can be read back after each desireeia_next_token.
+ *   - Off by default. Switching it on makes decode slower (the fused whole-layer GPU path does not expose
+ *     the weights, so the layer-by-layer path is used) and keeps the draw on the host; switching it off
+ *     gives the normal speed back, bit for bit.
+ *   - What is captured: the decode steps (one token at a time). A prefill (a prompt) is not captured: the
+ *     first token after a prompt reports no attention, the ones after it do. When the session cache already
+ *     holds the prompt, the single token the engine still has to run is captured like a decode step.
+ *   - Layers whose attention runs on the GPU (quantized KV cache, the default) or on the CPU are covered;
+ *     a float KV cache on the GPU, and models with MLA, are not (the layer reports nothing).
+ *   - Positions beyond 16384 are not recorded (total says how many there were).
+ *   - desireeia_get_attention_shape fills layers, heads, the number of positions recorded for the
+ *     last token and the total positions; it fails when nothing was captured yet.
+ *   - desireeia_get_attention writes the normalised weights (they sum to 1) over the positions [0, n) of
+ *     one layer. head = -1 is the mean over the heads. `capacity` is the size of out_weights; it must be at
+ *     least the number of positions of the shape, else the call fails. Weights outside a layer's
+ *     sliding window are 0. */
+DESIREEIA_API desireeia_error desireeia_set_attention_probe(desireeia_ctx* ctx, int32_t enabled);
+DESIREEIA_API desireeia_error desireeia_get_attention_shape(desireeia_ctx* ctx, int32_t* out_layers, int32_t* out_heads,
+                                                            int32_t* out_positions, int32_t* out_total);
+DESIREEIA_API desireeia_error desireeia_get_attention(desireeia_ctx* ctx, int32_t layer, int32_t head, float* out_weights,
+                                                      int32_t capacity, int32_t* out_n);
 
 /* ---- Context memory (on-board RAG over SSD) -----------------------------
  * Keeps big tool payloads (files, uploads, command output, streams) on SSD

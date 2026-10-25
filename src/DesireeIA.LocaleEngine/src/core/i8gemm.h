@@ -18,8 +18,33 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace desireeia {
+
+// The activations of a product, quantized to int8 with one scale per 32. Several products of
+// a layer read the SAME input (q, k and v; gate and up): inside a share scope the first one
+// quantizes and the others reuse the result instead of doing it again.
+struct I8QuantActs {
+    std::vector<uint8_t> q;    // [n_tok][cols]   int8, or int8 + 128 when `shifted`
+    std::vector<float> d;      // [n_tok][nb]     scale of each 32
+    std::vector<float> s;      // [n_tok][nb]     exact float sum of each 32 (offset formats)
+    bool shifted = false;
+    bool has_sums = false;
+};
+
+struct I8ActShare {
+    const float* x = nullptr;
+    size_t cols = 0, n_tok = 0;
+    bool filled = false;
+    I8QuantActs acts;
+};
+
+// While a scope is open on this thread, products whose input is exactly (x, cols, n_tok)
+// share one quantization. The caller guarantees x does not change until the scope ends.
+void i8_share_acts_begin(const float* x, size_t cols, size_t n_tok);
+void i8_share_acts_end();
+I8ActShare* i8_share_acts_current();
 
 struct I8GemmJob {
     const uint8_t* data = nullptr;   // weights, `rows` rows of `row_bytes`

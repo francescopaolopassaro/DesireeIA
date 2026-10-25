@@ -83,6 +83,23 @@ class FakeLocalModel:
             self._counter += 1
             return value
 
+    # token probabilities (engine ABI 5): the last token drawn has -0.1 per id step, alternatives are its neighbours
+    def set_confidence_tracking(self, enabled: bool = True) -> None:
+        self.tracking = enabled
+
+    def set_top_candidates(self, k: int = 5) -> None:
+        self.top_k_tracked = k
+
+    def token_stats(self):
+        return (-0.25, 0.4, 0.78) if getattr(self, "tracking", False) else None
+
+    def top_candidates(self):
+        k = getattr(self, "top_k_tracked", 0)
+        return [(10 + i, -0.25 - 0.5 * i) for i in range(k)] or None
+
+    def token_bytes(self, token_id: int):
+        return self.PIECES.get(token_id, "?").encode("utf-8")
+
     def is_end_of_generation(self, token_id: int) -> bool:
         return token_id == self.EOS
 
@@ -91,6 +108,22 @@ class FakeLocalModel:
 
     def set_sampling(self, options) -> None:
         self._sampling = options
+
+    # JSON schema constraint, logit bias, scoring (engine 0.3.0)
+    def set_json_schema(self, schema=None) -> None:
+        if isinstance(schema, str) and schema.strip() == "BAD":
+            raise ValueError("JSON schema refused: PARSE: schema: unknown type 'bogus'")
+        self.json_schema = schema
+
+    def set_logit_bias(self, bias=None) -> None:
+        self.logit_bias = dict(bias) if bias else None
+
+    def score_text(self, text: str, prefix: str = ""):
+        words = text.split() or [text]
+        ids = list(range(100, 100 + len(words)))
+        # a continuation of "good" words is likelier than anything else, to make ranking testable
+        base = -0.5 if text.strip().startswith("good") else -2.0
+        return ids, [base] * len(ids), [1.5] * len(ids)
 
     def embed(self, tokens):
         return None

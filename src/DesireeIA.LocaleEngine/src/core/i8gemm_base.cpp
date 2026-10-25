@@ -99,6 +99,24 @@ Isa isa() {
 
 } // namespace
 
+namespace {
+thread_local I8ActShare g_share;
+thread_local bool g_share_on = false;
+}
+
+void i8_share_acts_begin(const float* x, size_t cols, size_t n_tok) {
+    g_share.x = x; g_share.cols = cols; g_share.n_tok = n_tok; g_share.filled = false;
+    g_share_on = true;
+}
+
+void i8_share_acts_end() {
+    g_share_on = false;
+    g_share.x = nullptr;
+    g_share.filled = false;
+}
+
+I8ActShare* i8_share_acts_current() { return g_share_on ? &g_share : nullptr; }
+
 bool i8_gemm_interleaved(const I8GemmJob& job) {
     switch (isa()) {
         case Isa::Vnni: i8_vnni::run(job); return true;

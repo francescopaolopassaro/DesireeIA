@@ -12,6 +12,7 @@
 #include "core/jinja.h"
 #include "core/sampler.h"
 #include "core/tool_grammar.h"
+#include "core/json_grammar.h"
 #include "core/thread_pool.h"
 #include "models/dense_forward.h"
 #include "models/ssm_forward.h"
@@ -79,6 +80,13 @@ struct EngineContext {
     // decoded piece of every vocabulary entry it filters on, built once on
     // first use (the mask needs every piece at every constrained step).
     ToolCallConstraint tool;
+    // Whole-output constraint from a JSON schema (core/json_grammar.h). When set it
+    // takes the place of the tool-call constraint: it uses the same piece tables.
+    JsonSchemaConstraint json;
+    // Masks already worked out for a document state (see JsonSchemaConstraint::state_key); cleared when the schema changes.
+    std::unordered_map<uint64_t, std::vector<uint8_t>> json_mask_cache;
+    // Per-token logit bias (desireeia_set_logit_bias): empty = off.
+    std::vector<std::pair<int32_t, float>> bias;
     std::vector<std::string> tool_pieces;
     std::vector<uint8_t> tool_is_eog;
     std::vector<uint8_t> tool_plain;   // piece is safe inside any JSON string
@@ -140,6 +148,23 @@ struct EngineContext {
     int session_mode = 1;
     size_t last_reused = 0;
 
+    // Prefix store (opt-in, desireeia_set_prefix_cache): the K/V of prompts that the live session is about to
+    // lose, kept in host memory so that coming back to them (another chat, another role, a subagent that starts
+    // from the same system prompt) restores the cache instead of prefilling it again. An entry is the K/V of
+    // exactly the tokens it lists, taken from a prefill - so what is restored is what a full prefill would have
+    // computed, bit for bit. Entries are found by the longest prefix they share with the new prompt, and the
+    // least recently used are dropped when the byte budget is exceeded. Budget 0 = off: nothing below runs.
+    struct PrefixEntry {
+        std::vector<int32_t> tokens;
+        std::vector<uint8_t> k, v;     // layer-major, tokens.size() positions per layer (the session image layout)
+        uint64_t stamp = 0;
+        size_t bytes() const { return k.size() + v.size() + tokens.size() * sizeof(int32_t); }
+    };
+    std::vector<PrefixEntry> prefix_store;
+    uint64_t prefix_budget = 0;
+    int32_t prefix_min_tokens = 64;    // shorter prefixes are not worth keeping
+    uint64_t prefix_clock = 0, prefix_hits = 0, prefix_restored_tokens = 0, prefix_saved_entries = 0;
+
     // Pipelined decode (CUDA): while the caller holds the token returned
     // last, the step that consumes it is already running and has drawn the
     // next token on the device. `pipe` says such a step is in flight;
@@ -193,6 +218,88 @@ static void invalidate_session(EngineContext* c) {
     c->kv_tokens.clear();
     c->kv_prefilled = 0;
     c->kv_valid = false;
+}
+
+// ---- prefix store ---------------------------------------------------------
+
+static size_t prefix_store_bytes(const EngineContext* c) {
+    size_t t = 0;
+    for (const auto& e : c->prefix_store) t += e.bytes();
+    return t;
+}
+
+static size_t common_prefix_len(const std::vector<int32_t>& a, const int32_t* b, size_t nb) {
+    const size_t lim = std::min(a.size(), nb);
+    size_t n = 0;
+    while (n < lim && a[n] == b[n]) ++n;
+    return n;
+}
+
+static void prefix_store_trim(EngineContext* c) {
+    while (!c->prefix_store.empty() && prefix_store_bytes(c) > c->prefix_budget) {
+        size_t lru = 0;
+        for (size_t i = 1; i < c->prefix_store.size(); ++i)
+            if (c->prefix_store[i].stamp < c->prefix_store[lru].stamp) lru = i;
+        c->prefix_store.erase(c->prefix_store.begin() + (std::ptrdiff_t) lru);
+    }
+}
+
+// Keeps the live session's prompt before a new prompt overwrites it. Only when something real would be lost
+// (more than `prefix_min_tokens` positions beyond what the new prompt reuses) and it is not already covered by
+// a stored entry that starts with the same tokens.
+static void prefix_store_save_live(EngineContext* c, size_t reuse) {
+    if (c->prefix_budget == 0 || !c->kv_valid) return;
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    if (!df || df->kv_bytes_per_pos() == 0) return;
+    const size_t n = std::min({c->kv_prefilled, c->kv_tokens.size(), df->cache_len()});
+    if (n < (size_t) c->prefix_min_tokens || n < reuse + (size_t) c->prefix_min_tokens) return;
+    for (auto& e : c->prefix_store) {
+        if (e.tokens.size() >= n && std::equal(c->kv_tokens.begin(), c->kv_tokens.begin() + (std::ptrdiff_t) n, e.tokens.begin())) {
+            e.stamp = ++c->prefix_clock;   // already kept (it, or something longer that starts the same way)
+            return;
+        }
+    }
+    EngineContext::PrefixEntry e;
+    e.tokens.assign(c->kv_tokens.begin(), c->kv_tokens.begin() + (std::ptrdiff_t) n);
+    if (!df->export_kv(n, e.k, e.v)) return;
+    if (e.bytes() > c->prefix_budget) return;   // a single prompt larger than the whole budget is not kept
+    e.stamp = ++c->prefix_clock;
+    // entries that are a prefix of the new one are redundant now
+    c->prefix_store.erase(std::remove_if(c->prefix_store.begin(), c->prefix_store.end(), [&](const EngineContext::PrefixEntry& o) {
+        return o.tokens.size() <= n && std::equal(o.tokens.begin(), o.tokens.end(), e.tokens.begin());
+    }), c->prefix_store.end());
+    c->prefix_store.push_back(std::move(e));
+    ++c->prefix_saved_entries;
+    prefix_store_trim(c);
+}
+
+// The longest stored prefix of `tokens` (leaving at least one token to prefill), or npos-like 0.
+static size_t prefix_store_find(const EngineContext* c, const int32_t* tokens, size_t n_tokens, size_t& entry) {
+    size_t best = 0;
+    entry = 0;
+    if (c->prefix_budget == 0 || n_tokens < 2) return 0;
+    for (size_t i = 0; i < c->prefix_store.size(); ++i) {
+        const size_t n = std::min(common_prefix_len(c->prefix_store[i].tokens, tokens, n_tokens), n_tokens - 1);
+        if (n > best) { best = n; entry = i; }
+    }
+    return best >= (size_t) c->prefix_min_tokens ? best : 0;
+}
+
+// Loads the first `m` positions of a stored entry into the cache.
+static bool prefix_store_restore(EngineContext* c, size_t entry, size_t m) {
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    if (!df || entry >= c->prefix_store.size()) return false;
+    auto& e = c->prefix_store[entry];
+    const size_t bpp = df->kv_bytes_per_pos();
+    const size_t N = e.tokens.size();
+    if (bpp == 0 || m == 0 || m > N) return false;
+    // layer-major layout: a shorter prefix is the first m positions of every layer, read in place
+    if (!df->import_kv(m, e.k.data(), e.v.data(), N)) return false;
+    c->kv_tokens.assign(e.tokens.begin(), e.tokens.begin() + (std::ptrdiff_t) m);
+    c->kv_prefilled = m;
+    c->kv_valid = true;
+    e.stamp = ++c->prefix_clock;
+    return true;
 }
 
 namespace {
@@ -763,13 +870,25 @@ static void tool_build_pieces(EngineContext* c, size_t vocab) {
 // rather than forcing an arbitrary token.
 static void tool_mask(EngineContext* c, std::vector<float>& logits) {
     if (c->tool_pieces.size() != logits.size()) tool_build_pieces(c, logits.size());
+    const bool use_json = c->json.constraining();
+    uint64_t json_key = 0;
+    if (use_json) {
+        json_key = c->json.state_key();
+        auto hit = c->json_mask_cache.find(json_key);
+        if (hit != c->json_mask_cache.end() && hit->second.size() == logits.size()) {
+            const std::vector<uint8_t>& cached = hit->second;
+            for (size_t id = 0; id < logits.size(); ++id) if (!cached[id]) logits[id] = -1e30f;
+            return;
+        }
+    }
+    auto allows = [&](const std::string& p, bool eog) { return use_json ? c->json.allows(p, eog) : c->tool.allows(p, eog); };
     // A piece whose first byte is rejected is rejected: 256 checks up front
     // skip the full automaton walk for almost the whole vocabulary.
     bool first_ok[256];
-    for (int b = 0; b < 256; ++b) first_ok[b] = c->tool.allows(std::string(1, static_cast<char>(b)), false);
+    for (int b = 0; b < 256; ++b) first_ok[b] = allows(std::string(1, static_cast<char>(b)), false);
     // Inside a free-form string (most of a call: argument values) a plain
     // piece is accepted without walking the automaton at all.
-    const bool plain_string = c->tool.in_plain_string();
+    const bool plain_string = use_json ? c->json.in_plain_string() : c->tool.in_plain_string();
     std::vector<uint8_t> keep(logits.size(), 0);
     size_t kept = 0;
     for (size_t id = 0; id < logits.size(); ++id) {
@@ -778,23 +897,34 @@ static void tool_mask(EngineContext* c, std::vector<float>& logits) {
         if (plain_string && c->tool_plain[id]) {
             ok = true;
         } else if (c->tool_is_eog[id]) {
-            ok = c->tool.allows(piece, true);
+            ok = allows(piece, true);
         } else {
-            ok = !piece.empty() && first_ok[static_cast<unsigned char>(piece[0])] && c->tool.allows(piece, false);
+            ok = !piece.empty() && first_ok[static_cast<unsigned char>(piece[0])] && allows(piece, false);
         }
         keep[id] = ok;
         kept += ok;
     }
     if (kept == 0) {
-        c->tool.give_up();
+        if (use_json) c->json.give_up(); else c->tool.give_up();
         return;
     }
     for (size_t id = 0; id < logits.size(); ++id) {
         if (!keep[id]) logits[id] = -1e30f;
     }
+    if (use_json) {
+        if (c->json_mask_cache.size() >= 48) c->json_mask_cache.clear();   // bounded: a vocabulary-sized mask each
+        c->json_mask_cache.emplace(json_key, std::move(keep));
+    }
 }
 
 static void tool_accept(EngineContext* c, int32_t token) {
+    if (c->json.configured()) {
+        if (c->eog_ids.count(token)) return;
+        std::string piece;
+        if (c->has_tok) c->tok.piece(token, piece);
+        c->json.accept(piece);
+        return;
+    }
     if (!c->tool.configured()) return;
     if (c->eog_ids.count(token)) {
         c->tool.accept(std::string());
@@ -803,6 +933,12 @@ static void tool_accept(EngineContext* c, int32_t token) {
     std::string piece;
     if (c->has_tok) c->tok.piece(token, piece);
     c->tool.accept(piece);
+}
+
+static void bias_apply(const EngineContext* c, std::vector<float>& logits) {
+    for (const auto& kv : c->bias) {
+        if (kv.first >= 0 && (size_t) kv.first < logits.size()) logits[(size_t) kv.first] += kv.second;
+    }
 }
 
 // ---- reasoning budget -------------------------------------------------
@@ -852,7 +988,7 @@ static void rb_accept(EngineContext* c, int32_t token) {
 // Called with the token just drawn: past the budget it is replaced by the
 // closing tag (one token per call), so the thinking ends here.
 static void rb_apply(EngineContext* c, int32_t& token) {
-    if (!rb_active(c) || c->tool.constraining()) return;
+    if (!rb_active(c) || c->tool.constraining() || c->json.constraining()) return;
     if (c->rb_state == 1 && c->rb_forced.empty() && c->rb_count >= c->rb_max) {
         for (int32_t id : c->tok.encode(c->rb_close + "\n\n", false)) c->rb_forced.push_back(id);
         if (c->st.log) c->st.log(1, "reasoning budget reached: closing the thinking block");
@@ -865,7 +1001,93 @@ static void rb_apply(EngineContext* c, int32_t& token) {
 }
 
 static bool tool_needs_host(const EngineContext* c) {
-    return rb_active(c) || (c->tool.configured() && (c->tool.constraining() || c->tool.armed()));
+    return rb_active(c) || !c->bias.empty() || c->json.constraining() || (c->tool.configured() && (c->tool.constraining() || c->tool.armed()));
+}
+
+bool engine_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n, size_t from,
+                         float* out_logprob, float* out_entropy) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || !tokens || !out_logprob) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    DenseForward* df = c->gf ? dynamic_cast<DenseForward*>(c->gf) : nullptr;
+    if (!df || !c->st.reader || from < 1 || from >= n) return false;
+    c->cancel.store(false, std::memory_order_relaxed);
+    // A scoring pass is not part of a generation: whatever was in flight is over, and the cache is about to hold
+    // this text (kept in kv_tokens at the end, so a following predict can reuse its head).
+    c->has_session = false;
+    c->pending.clear();
+    const size_t reuse = reusable_prefix(c, tokens, from);      // context positions [0, from - 1)
+    if (reuse > 0) df->truncate_cache(reuse);
+    else c->gf->reset_cache();
+    invalidate_session(c);
+
+    const size_t last = n - 1;                                  // tokens [0, last) are consumed; token i + 1 is scored by row i
+    size_t pos = reuse;
+    std::vector<float> scratch, all;
+    auto fail = [&](const char* what) {
+        c->st.last_error = c->gf->was_cancelled() ? "scoring cancelled" : what;
+        if (!c->gf->was_cancelled() && !c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
+        if (c->st.log) c->st.log(3, c->st.last_error.c_str());
+        c->gf->reset_cache();
+        return false;
+    };
+    if (pos < from - 1) {
+        if (!c->gf->step(*c->st.reader, tokens + pos, from - 1 - pos, scratch)) return fail("dense forward: scoring prefill failed");
+        pos = from - 1;
+    }
+    constexpr size_t kChunk = 64;                               // 64 rows of the whole vocabulary at a time
+    while (pos < last) {
+        const size_t m = std::min(kChunk, last - pos);
+        if (!c->gf->step(*c->st.reader, tokens + pos, m, scratch, &all)) return fail("dense forward: scoring failed");
+        if (all.size() % m != 0) return fail("dense forward: scoring returned an unexpected shape");
+        const size_t V = all.size() / m;
+        const size_t base = pos;
+        parallel_units(m, [&](size_t r0, size_t r1) {
+            for (size_t r = r0; r < r1; ++r) {
+                const float* x = all.data() + r * V;
+                float mx = x[0];
+                for (size_t i = 1; i < V; ++i) mx = std::max(mx, x[i]);
+                double sum = 0.0, wsum = 0.0;
+                for (size_t i = 0; i < V; ++i) {
+                    const double e = std::exp((double) x[i] - (double) mx);
+                    sum += e;
+                    wsum += e * ((double) x[i] - (double) mx);
+                }
+                const double lse = std::log(sum);                // log-sum-exp relative to mx
+                const int32_t target = tokens[base + r + 1];
+                const size_t o = base + r + 1 - from;
+                out_logprob[o] = (target >= 0 && (size_t) target < V) ? (float) (((double) x[target] - (double) mx) - lse) : -INFINITY;
+                if (out_entropy) out_entropy[o] = (float) (lse - wsum / sum);   // nats
+            }
+        });
+        pos += m;
+    }
+    c->kv_tokens.assign(tokens, tokens + last);
+    c->kv_prefilled = last;
+    c->kv_valid = true;
+    return true;
+}
+
+// Logit bias: added to the logits of the listed tokens before every draw (host path, whole vocabulary).
+bool engine_set_logit_bias(desireeia_ctx* ctx, const int32_t* ids, const float* bias, size_t n) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || (n && (!ids || !bias))) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    c->bias.clear();
+    for (size_t i = 0; i < n; ++i) c->bias.emplace_back(ids[i], bias[i]);
+    return true;
+}
+
+bool engine_set_json_schema(desireeia_ctx* ctx, const std::string& schema, std::string& error) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    c->json_mask_cache.clear();
+    if (!c->json.configure(schema, error)) return false;
+    return true;
 }
 
 bool engine_set_tool_constraint(desireeia_ctx* ctx, const std::string& open_tag, const std::string& close_tag,
@@ -891,7 +1113,26 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     // Session: keep the K/V of the prefix shared with the previous call and
     // prefill only what is new; with no shared prefix this is the old full
     // reset + prefill.
-    const size_t reuse = reusable_prefix(c, tokens, n_tokens);
+    size_t reuse = reusable_prefix(c, tokens, n_tokens);
+    if (c->prefix_budget > 0 && c->session_mode != 0) {
+        // The live prompt is about to be overwritten: keep it if it is worth it, then see whether the prefix store
+        // holds more of the NEW prompt than the live session does.
+        prefix_store_save_live(c, reuse);
+        size_t entry = 0;
+        const size_t stored = prefix_store_find(c, tokens, n_tokens, entry);
+        if (stored > reuse) {
+            const size_t live_cached = c->kv_valid ? reuse : 0;
+            c->gf->reset_cache();
+            if (prefix_store_restore(c, entry, stored)) {
+                reuse = stored;
+                ++c->prefix_hits;
+                c->prefix_restored_tokens += stored - live_cached;
+            } else {
+                invalidate_session(c);
+                reuse = 0;
+            }
+        }
+    }
     if (reuse > 0) static_cast<DenseForward*>(c->gf)->truncate_cache(reuse);
     else c->gf->reset_cache();
     c->last_reused = reuse;
@@ -914,9 +1155,12 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     // first generated token must not repeat what's already written.
     c->history.assign(tokens, tokens + n_tokens);
     c->tool.reset();
+    c->json.reset();
     c->sampler.set_generation_start(n_tokens);
     c->sampler.set_dry_suspended(false);
     rb_reset(c, tokens, n_tokens);
+    if (!c->bias.empty()) bias_apply(c, logits);
+    if (c->json.constraining()) tool_mask(c, logits);
     out_token = c->sampler.sample(logits, c->history);
     rb_apply(c, out_token);
     tool_accept(c, out_token);
@@ -1067,7 +1311,8 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     // vocabulary); the token drawn is the same.
     int got = 0;
     // The mask needs the whole vocabulary, not just the top candidates.
-    const bool masking = c->tool.constraining();
+    const bool constrained = c->tool.constraining() || c->json.constraining();
+    const bool masking = constrained || !c->bias.empty();
     const uint32_t kk = masking ? 0 : c->sampler.candidates_needed(c->history);
     if (kk) got = c->gf->step_candidates(*c->st.reader, &tk, 1, kk, c->cand_ids, c->cand_vals, logits);
     const bool ok = got == 0 ? c->gf->step(*c->st.reader, &tk, 1, logits) : got > 0;
@@ -1081,8 +1326,11 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     }
     // The token just consumed is now in the cache too.
     if (c->kv_valid) c->kv_tokens.push_back(tk);
-    if (masking && got != 1) tool_mask(c, logits);
-    c->sampler.set_dry_suspended(c->tool.constraining());
+    if (masking && got != 1) {
+        bias_apply(c, logits);
+        if (constrained) tool_mask(c, logits);
+    }
+    c->sampler.set_dry_suspended(c->tool.constraining() || c->json.constraining());
     out_token = got == 1 ? c->sampler.sample_candidates(c->cand_ids, c->cand_vals, c->history)
                          : c->sampler.sample(logits, c->history);
     rb_apply(c, out_token);
@@ -1172,6 +1420,80 @@ bool engine_get_token_stats(const desireeia_ctx* ctx, float& logprob, float& ent
     entropy = t.entropy;
     max_prob = t.max_prob;
     return true;
+}
+
+bool engine_set_top_candidates(desireeia_ctx* ctx, int32_t k) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || k < 0 || k > TokenStats::kTopMax) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    c->sampler.set_track_top((int) k);
+    return true;
+}
+
+bool engine_get_top_candidates(const desireeia_ctx* ctx, int32_t* ids, float* logprobs, int32_t capacity, int32_t& n) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(const_cast<desireeia_ctx*>(ctx));
+    if (!c || !ids || !logprobs || capacity < 0) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    const TokenStats& t = c->sampler.last_stats();
+    if (!t.valid || t.top_n <= 0) return false;
+    n = std::min<int32_t>(t.top_n, capacity);
+    for (int32_t i = 0; i < n; ++i) { ids[i] = t.top_id[i]; logprobs[i] = t.top_lp[i]; }
+    return true;
+}
+
+bool engine_set_prefix_cache(desireeia_ctx* ctx, uint64_t budget_bytes, int32_t min_tokens) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    if (budget_bytes > 0 && !dynamic_cast<DenseForward*>(c->gf)) return false;   // recurrent state cannot be rewound to a position
+    c->prefix_budget = budget_bytes;
+    c->prefix_min_tokens = min_tokens < 16 ? 16 : min_tokens;
+    if (budget_bytes == 0) {
+        c->prefix_store.clear(); c->prefix_store.shrink_to_fit();
+        c->prefix_hits = c->prefix_restored_tokens = c->prefix_saved_entries = 0;   // off = a clean slate
+    }
+    else prefix_store_trim(c);
+    return true;
+}
+
+bool engine_prefix_cache_info(desireeia_ctx* ctx, uint64_t& bytes, int32_t& entries, uint64_t& hits, uint64_t& restored_tokens) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    bytes = prefix_store_bytes(c);
+    entries = (int32_t) c->prefix_store.size();
+    hits = c->prefix_hits;
+    restored_tokens = c->prefix_restored_tokens;
+    return true;
+}
+
+bool engine_set_attention_probe(desireeia_ctx* ctx, bool enabled) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    if (!c->gf) return false;
+    if (!c->gf->set_attention_probe(enabled)) return false;
+    c->sampler.set_force_host(enabled);   // no draw ahead of the probe: each token is read before the next is decoded
+    return true;
+}
+
+bool engine_attention_shape(desireeia_ctx* ctx, uint32_t& layers, uint32_t& heads, uint32_t& positions, uint32_t& total) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (!c->gf) return false;
+    return c->gf->attention_probe_shape(layers, heads, positions, total);
+}
+
+bool engine_attention_read(desireeia_ctx* ctx, uint32_t layer, int32_t head, float* out, int32_t capacity, int32_t& n) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (!c->gf) return false;
+    return c->gf->attention_probe_read(layer, head, out, capacity, n);
 }
 
 bool engine_get_sampling(const desireeia_ctx* ctx, desireeia_sampling& out) {
@@ -1379,6 +1701,97 @@ bool engine_session_save(desireeia_ctx* ctx, const char* path, size_t n_prefix, 
     // (MoveFileEx with REPLACE_EXISTING on Windows).
     std::filesystem::rename(tmp_p, std::filesystem::u8path(path), ec);
     if (ec) { std::filesystem::remove(tmp_p, ec); err = "cannot rename to " + std::string(path); return false; }
+    return true;
+}
+
+// ---- prefix store on disk -------------------------------------------------
+// One file per kept prompt, in the session image layout (so the same checks apply: magic, version, model identity and
+// cache layout), named after a hash of its tokens. Lets the most used prompts (a chat app's system prompt) survive a restart.
+
+static uint64_t prefix_tokens_hash(const std::vector<int32_t>& t) {
+    uint64_t h = 1469598103934665603ull;
+    for (int32_t v : t) { h ^= (uint32_t) v; h *= 1099511628211ull; }
+    return h;
+}
+
+bool engine_prefix_cache_save(desireeia_ctx* ctx, const char* dir, int32_t& written, std::string& err) {
+    written = 0;
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || !dir) { err = "invalid argument"; return false; }
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    const DenseForward* df = dynamic_cast<const DenseForward*>(c->gf);
+    if (!df || df->kv_bytes_per_pos() == 0) { err = "this model's cache cannot be saved"; return false; }
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::u8path(dir), ec);
+    if (ec) { err = "cannot create " + std::string(dir); return false; }
+    const uint64_t id = model_identity(c, df);
+    const uint64_t bpp = df->kv_bytes_per_pos();
+    for (const auto& e : c->prefix_store) {
+        const uint64_t n64 = e.tokens.size();
+        char name[64];
+        std::snprintf(name, sizeof(name), "%016llx.dskv", (unsigned long long) prefix_tokens_hash(e.tokens));
+        const std::string path = (std::filesystem::u8path(dir) / name).u8string();
+        const std::string tmp = path + ".tmp";
+        std::FILE* f = open_utf8(tmp, "wb");
+        if (!f) { err = "cannot create " + tmp; return false; }
+        bool ok = std::fwrite(&kSessionMagic, 4, 1, f) == 1 && std::fwrite(&kSessionVersion, 4, 1, f) == 1 &&
+                  std::fwrite(&id, 8, 1, f) == 1 && std::fwrite(&bpp, 8, 1, f) == 1 && std::fwrite(&n64, 8, 1, f) == 1 &&
+                  std::fwrite(e.tokens.data(), sizeof(int32_t), e.tokens.size(), f) == e.tokens.size() &&
+                  std::fwrite(e.k.data(), 1, e.k.size(), f) == e.k.size() && std::fwrite(e.v.data(), 1, e.v.size(), f) == e.v.size();
+        ok = (std::fclose(f) == 0) && ok;
+        if (!ok) { std::filesystem::remove(std::filesystem::u8path(tmp), ec); err = "write failed: " + tmp; return false; }
+        std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(path), ec);
+        if (ec) { std::filesystem::remove(std::filesystem::u8path(tmp), ec); err = "cannot rename to " + path; return false; }
+        ++written;
+    }
+    return true;
+}
+
+bool engine_prefix_cache_load(desireeia_ctx* ctx, const char* dir, int32_t& loaded, std::string& err) {
+    loaded = 0;
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || !dir) { err = "invalid argument"; return false; }
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    const DenseForward* df = dynamic_cast<const DenseForward*>(c->gf);
+    if (!df || df->kv_bytes_per_pos() == 0) { err = "this model's cache cannot be restored"; return false; }
+    if (c->prefix_budget == 0) { err = "the prefix store is off: set a budget first"; return false; }
+    std::error_code ec;
+    const auto root = std::filesystem::u8path(dir);
+    if (!std::filesystem::is_directory(root, ec)) return true;   // nothing saved yet is not an error
+    const uint64_t id = model_identity(c, df);
+    const uint64_t want_bpp = df->kv_bytes_per_pos();
+    const size_t layers = c->st.meta.n_layers;
+    for (const auto& de : std::filesystem::directory_iterator(root, ec)) {
+        if (de.path().extension() != ".dskv") continue;
+        std::FILE* f = open_utf8(de.path().u8string(), "rb");
+        if (!f) continue;
+        uint32_t magic = 0, version = 0;
+        uint64_t fid = 0, bpp = 0, n = 0;
+        bool ok = std::fread(&magic, 4, 1, f) == 1 && std::fread(&version, 4, 1, f) == 1 && std::fread(&fid, 8, 1, f) == 1 &&
+                  std::fread(&bpp, 8, 1, f) == 1 && std::fread(&n, 8, 1, f) == 1;
+        // Files of another model, another cache layout or another engine version are left alone, not an error.
+        ok = ok && magic == kSessionMagic && version == kSessionVersion && fid == id && bpp == want_bpp && n > 0 && n < (1ull << 24);
+        EngineContext::PrefixEntry e;
+        if (ok) {
+            e.tokens.resize((size_t) n);
+            e.k.resize(layers * (size_t) n * (size_t) bpp);
+            e.v.resize(e.k.size());
+            ok = std::fread(e.tokens.data(), sizeof(int32_t), e.tokens.size(), f) == e.tokens.size() &&
+                 std::fread(e.k.data(), 1, e.k.size(), f) == e.k.size() && std::fread(e.v.data(), 1, e.v.size(), f) == e.v.size();
+        }
+        std::fclose(f);
+        if (!ok || e.bytes() > c->prefix_budget) continue;
+        bool known = false;
+        for (const auto& o : c->prefix_store)
+            if (o.tokens.size() >= e.tokens.size() && std::equal(e.tokens.begin(), e.tokens.end(), o.tokens.begin())) { known = true; break; }
+        if (known) continue;
+        e.stamp = ++c->prefix_clock;
+        c->prefix_store.push_back(std::move(e));
+        ++loaded;
+        prefix_store_trim(c);
+    }
     return true;
 }
 
@@ -1762,9 +2175,12 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
     }
     c->history.assign(tokens, tokens + n_tokens);
     c->tool.reset();
+    c->json.reset();
     c->sampler.set_generation_start(n_tokens);
     c->sampler.set_dry_suspended(false);
     rb_reset(c, tokens, n_tokens);
+    if (!c->bias.empty()) bias_apply(c, logits);
+    if (c->json.constraining()) tool_mask(c, logits);
     out_token = c->sampler.sample(logits, c->history);
     rb_apply(c, out_token);
     tool_accept(c, out_token);

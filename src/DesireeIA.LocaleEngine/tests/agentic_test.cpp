@@ -15,6 +15,7 @@
 
 #include "core/jinja.h"
 #include "core/tool_grammar.h"
+#include "core/json_grammar.h"
 #include "memory/context_memory.h"
 
 #include <chrono>
@@ -45,6 +46,134 @@ static std::string slurp(const fs::path& p) {
     std::stringstream ss;
     ss << in.rdbuf();
     return ss.str();
+}
+
+
+// ---- JSON schema constraint ---------------------------------------------
+
+// Feeds `text` one byte at a time, as one-byte pieces: false at the first byte the schema refuses.
+static bool jfeed(JsonSchemaConstraint& c, const std::string& text) {
+    for (char ch : text) {
+        const std::string piece(1, ch);
+        if (!c.allows(piece, false)) return false;
+        c.accept(piece);
+    }
+    return true;
+}
+
+static bool jcomplete(const JsonSchemaConstraint& c) { return c.allows(std::string(), true); }
+
+static JsonSchemaConstraint jmake(const char* schema) {
+    JsonSchemaConstraint c;
+    std::string err;
+    const bool ok = c.configure(schema, err);
+    CHECK(ok, schema);
+    if (!ok) std::printf("    %s\n", err.c_str());
+    c.reset();
+    return c;
+}
+
+static void test_json_grammar() {
+    std::printf("--- JSON schema constraint ---\n");
+    const char* person = R"({"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"},)"
+                         R"("tags":{"type":"array","items":{"type":"string"},"maxItems":2},)"
+                         R"("role":{"enum":["admin","user"]}},"required":["name","age"]})";
+    {
+        auto c = jmake(person);
+        CHECK(!c.allows("x", false), "a document starts with {");
+        CHECK(!jcomplete(c), "no end before the document");
+        CHECK(jfeed(c, R"({"name":"Ann","age":31,"tags":["a","b"],"role":"admin"})"), "a valid document is accepted");
+        CHECK(jcomplete(c), "end allowed once the document is complete");
+        CHECK(!jfeed(c, "x"), "nothing but blanks after the document");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(jfeed(c, "{\n  \"age\": 7,\n  \"name\": \"Bo \\\"x\\\" \\u00e9\"\n}"), "any key order, blanks and escapes");
+        CHECK(jcomplete(c), "pretty document complete");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(jfeed(c, R"({"age":1)") && !c.allows("}", false), "a required key missing blocks the closing brace");
+        CHECK(!c.allows(",\"age\"", false), "a key cannot repeat");
+        CHECK(jfeed(c, R"(,"name":"z")") && c.allows("}", false), "once required keys are there it can close");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(!jfeed(c, R"({"zip")"), "a key outside properties is refused");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(!jfeed(c, R"({"name":1)"), "a number where a string is required is refused");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(jfeed(c, R"({"age":1)") && !jfeed(c, "."), "an integer takes no decimal point");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(!jfeed(c, R"({"tags":["a","b","c")"), "maxItems stops the third element");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(!jfeed(c, R"({"role":"adx")"), "an enum value must be one of the listed");
+        auto d = jmake(person);
+        CHECK(jfeed(d, R"({"role":"us)") && d.allows("er\"", false), "an enum value is completed token by token");
+    }
+    {
+        auto c = jmake(R"({"type":"number"})");
+        CHECK(jfeed(c, "-12.5e+3"), "a root number");
+        CHECK(jcomplete(c), "a root number ends with the generation");
+        auto d = jmake(R"({"type":"number"})");
+        CHECK(jfeed(d, "0") && !d.allows("1", false), "no leading zeros");
+        auto e = jmake(R"({"type":"number"})");
+        CHECK(jfeed(e, "1.") && !jcomplete(e), "a number cut after the point is not complete");
+    }
+    {
+        auto c = jmake(R"({"anyOf":[{"type":"string"},{"type":"null"},{"type":"integer"}]})");
+        CHECK(jfeed(c, "null") && jcomplete(c), "anyOf takes the null branch");
+        auto d = jmake(R"({"anyOf":[{"type":"string"},{"type":"null"},{"type":"integer"}]})");
+        CHECK(jfeed(d, "42") && jcomplete(d), "anyOf takes the integer branch");
+        auto e = jmake(R"({"type":["string","null"]})");
+        CHECK(jfeed(e, "\"hi\"") && jcomplete(e), "a type list takes the string branch");
+        CHECK(!jmake(R"({"type":["string","null"]})").allows("t", false), "a type list refuses true");
+    }
+    {
+        const char* tree = R"({"$defs":{"node":{"type":"object","properties":{"v":{"type":"integer"},)"
+                           R"("kids":{"type":"array","items":{"$ref":"#/$defs/node"}}},"required":["v"]}},"$ref":"#/$defs/node"})";
+        auto c = jmake(tree);
+        CHECK(jfeed(c, R"({"v":1,"kids":[{"v":2,"kids":[]},{"v":3}]})") && jcomplete(c), "a recursive schema through $ref");
+        auto d = jmake(tree);
+        CHECK(!jfeed(d, R"({"v":1,"kids":[{"w":2)"), "the recursive node enforces its own keys");
+    }
+    {
+        auto c = jmake("json");
+        CHECK(jfeed(c, R"([1,{"a":[true,null,"x"],"b":-2.5e1}, "s"])") && jcomplete(c), "any JSON value");
+        auto d = jmake("json");
+        CHECK(!jfeed(d, "[1,]"), "a trailing comma is not JSON");
+        auto e = jmake("json");
+        CHECK(!jfeed(e, "{'a':1}"), "single quotes are not JSON");
+    }
+    {
+        auto c = jmake(R"({"type":"string","minLength":2,"maxLength":3})");
+        CHECK(jfeed(c, "\"a") && !c.allows("\"", false), "minLength blocks an early close");
+        CHECK(jfeed(c, "bc") && !c.allows("d", false) && c.allows("\"", false), "maxLength stops a fourth character");
+    }
+    {
+        auto c = jmake(R"({"type":"object","properties":{"a":{"type":"boolean"}},"additionalProperties":true})");
+        CHECK(jfeed(c, R"({"a":true,"free":[1,2],"more":"x"})") && jcomplete(c), "extra keys when additionalProperties allows");
+    }
+    {
+        auto c = jmake(person);
+        CHECK(c.allows("{\"na", false) && c.allows("{\"age\":", false), "multi-byte pieces are checked byte by byte");
+        CHECK(!c.allows("{\"age\":\"", false), "a multi-byte piece that breaks the schema is refused");
+    }
+    {
+        JsonSchemaConstraint c;
+        std::string err;
+        CHECK(!c.configure(R"({"type":"bogus"})", err) && !err.empty(), "an unknown type is refused with a message");
+        CHECK(!c.configure("{not json", err), "text that is not JSON is refused");
+        CHECK(c.configure("", err) && !c.configured(), "an empty schema turns it off");
+    }
 }
 
 // ---- tool-call constraint -----------------------------------------------
@@ -219,6 +348,7 @@ static void test_context_memory() {
 
 int main() {
     test_tool_grammar();
+    test_json_grammar();
     test_jinja_language();
     test_jinja_fixtures();
     test_context_memory();

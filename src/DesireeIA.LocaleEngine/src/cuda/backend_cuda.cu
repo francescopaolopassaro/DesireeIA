@@ -554,7 +554,7 @@ __global__ void attention_kernel_q8(const float* __restrict__ q,
 // and the key range is split over `nsplit` blocks per head (merged by
 // attn_dec_merge_kernel) so every SM has work.
 constexpr int kAdecWarps = 8;
-constexpr int kAdecMaxSplit = 16;
+constexpr int kAdecMaxSplit = 32;
 constexpr int kAdecMaxBlk = 8;                // head_dim up to 256
 
 __global__ void __launch_bounds__(kAdecWarps * 32) attn_dec_part_kernel(
@@ -657,6 +657,242 @@ __global__ void attn_dec_merge_kernel(const float* __restrict__ part, float* __r
     }
 }
 
+
+// ---------------------------------------------------------------------
+// Decode attention, one block per KV head (grouped-query attention done once).
+//
+// The kernel above gives every QUERY head its own block, so a model with 8 query
+// heads per KV head (MiniCPM5 2B, Qwen2.5 3B) reads and dequantizes the same K and V
+// rows 8 times, and a warp walks the keys one at a time with a five-step shuffle
+// reduction per key. Profiled on a 7.2k-token context it was compute-bound
+// (72% of the SM's issue slots, 4% of DRAM bandwidth): 490 us per layer.
+//
+// Here a block owns one KV head and a slice of the keys and serves all HPK query heads:
+//   * the queries of the group sit in shared memory (read as broadcasts);
+//   * scores: one KEY per thread - the thread walks the key's Q8_0 row alone, so
+//     there is no cross-lane reduction, and each int8 is unpacked once for all HPK heads;
+//   * softmax per head by warps, online across tiles of kA2Tile keys (running max
+//     and sum in shared memory, the accumulators rescaled when the max grows);
+//   * values: one DIMENSION per thread, two key parities per block, each V byte
+//     dequantized once and added to HPK accumulators.
+// The output is the same partial (max, sum, unnormalised sum) per head and split
+// that attn_dec_merge_kernel already merges.
+constexpr int kA2Threads = 256;
+constexpr int kA2Tile = 256;
+constexpr uint32_t kA2MaxHeadDim = 256;
+
+template <int HPK>
+__global__ void __launch_bounds__(kA2Threads) attn_dec2_part_kernel(
+        const float* __restrict__ q, const uint8_t* __restrict__ kcache, const uint8_t* __restrict__ vcache,
+        float* __restrict__ part, uint32_t head_dim, size_t row_bytes, size_t pos_bytes, size_t layer_off,
+        const uint32_t* __restrict__ dyn, float inv_d, uint32_t nsplit) {
+    extern __shared__ float sm[];
+    float* q_s = sm;                          // [HPK][head_dim], already multiplied by inv_d
+    float* sc = q_s + (size_t) HPK * head_dim;   // [HPK][kA2Tile] scores, then probabilities
+    float* st = sc + HPK * kA2Tile;           // [HPK][3]: running max, running sum, alpha of the tile
+
+    const uint32_t pos = dyn[0], cc_start = dyn[1];
+    const uint32_t hkv = blockIdx.x, sp = blockIdx.y;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t nblk = head_dim / 32;
+
+    for (uint32_t i = tid; i < (uint32_t) HPK * head_dim; i += kA2Threads)
+        q_s[i] = q[(size_t) hkv * HPK * head_dim + i] * inv_d;
+    if (tid < HPK) { st[tid * 3] = -INFINITY; st[tid * 3 + 1] = 0.0f; st[tid * 3 + 2] = 0.0f; }
+
+    const uint32_t total = pos + 1 - cc_start;
+    const uint32_t per = (total + nsplit - 1) / nsplit;
+    const uint32_t beg = cc_start + sp * per;
+    const uint32_t end = min(pos + 1, beg + per);
+    const uint8_t* kb = kcache + layer_off + (size_t) hkv * row_bytes;
+    const uint8_t* vb = vcache + layer_off + (size_t) hkv * row_bytes;
+
+    const uint32_t grp = tid / 128, dl = tid % 128;      // value phase: 2 key parities x 128 dimension lanes
+    float acc[HPK][2];
+    #pragma unroll
+    for (int h = 0; h < HPK; ++h) { acc[h][0] = 0.0f; acc[h][1] = 0.0f; }
+
+    for (uint32_t tile0 = beg; tile0 < end; tile0 += kA2Tile) {
+        const uint32_t n = min((uint32_t) kA2Tile, end - tile0);
+        __syncthreads();                                   // the previous tile is done with sc / st
+
+        // ---- scores: thread = key ----
+        if (tid < n) {
+            const uint8_t* kr = kb + (size_t) (tile0 + tid) * pos_bytes;
+            float dots[HPK];
+            #pragma unroll
+            for (int h = 0; h < HPK; ++h) dots[h] = 0.0f;
+            for (uint32_t b = 0; b < nblk; ++b) {
+                const uint8_t* blk = kr + b * 34;
+                const float s = __half2float(*reinterpret_cast<const __half*>(blk));
+                float part_sum[HPK];
+                #pragma unroll
+                for (int h = 0; h < HPK; ++h) part_sum[h] = 0.0f;
+                #pragma unroll 4
+                for (int j = 0; j < 32; j += 2) {
+                    const uint16_t w = *reinterpret_cast<const uint16_t*>(blk + 2 + j);   // blocks start on even bytes
+                    const float a0 = (float) (int8_t) (w & 0xff), a1 = (float) (int8_t) (w >> 8);
+                    #pragma unroll
+                    for (int h = 0; h < HPK; ++h)
+                        part_sum[h] += q_s[h * head_dim + b * 32 + j] * a0 + q_s[h * head_dim + b * 32 + j + 1] * a1;
+                }
+                #pragma unroll
+                for (int h = 0; h < HPK; ++h) dots[h] += s * part_sum[h];
+            }
+            #pragma unroll
+            for (int h = 0; h < HPK; ++h) sc[h * kA2Tile + tid] = dots[h];
+        } else {
+            #pragma unroll
+            for (int h = 0; h < HPK; ++h) sc[h * kA2Tile + tid] = -INFINITY;
+        }
+        __syncthreads();
+
+        // ---- softmax: warp w takes heads w, w+8, ... ----
+        const uint32_t warp = tid / 32, lane = tid % 32;
+        for (uint32_t h = warp; h < (uint32_t) HPK; h += kA2Threads / 32) {
+            float mx = -INFINITY;
+            #pragma unroll
+            for (int i = 0; i < kA2Tile / 32; ++i) mx = fmaxf(mx, sc[h * kA2Tile + lane + 32 * i]);
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffff, mx, o));
+            const float m_old = st[h * 3];
+            const float m_new = fmaxf(m_old, mx);
+            const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+            float sum = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < kA2Tile / 32; ++i) {
+                const uint32_t idx = lane + 32 * i;
+                const float p = (idx < n) ? __expf(sc[h * kA2Tile + idx] - m_new) : 0.0f;
+                sc[h * kA2Tile + idx] = p;
+                sum += p;
+            }
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffff, sum, o);
+            if (lane == 0) { st[h * 3 + 1] = st[h * 3 + 1] * alpha + sum; st[h * 3] = m_new; st[h * 3 + 2] = alpha; }
+        }
+        __syncthreads();
+
+        // ---- values: thread = dimension, two key parities ----
+        #pragma unroll
+        for (int h = 0; h < HPK; ++h) { const float a = st[h * 3 + 2]; acc[h][0] *= a; acc[h][1] *= a; }
+        for (uint32_t k = grp; k < n; k += 2) {
+            const uint8_t* vr = vb + (size_t) (tile0 + k) * pos_bytes;
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t d = dl + 128 * i;
+                if (d < head_dim) {
+                    const uint8_t* blk = vr + (d / 32) * 34;
+                    const float v = __half2float(*reinterpret_cast<const __half*>(blk)) * (float) reinterpret_cast<const int8_t*>(blk + 2)[d % 32];
+                    #pragma unroll
+                    for (int h = 0; h < HPK; ++h) acc[h][i] += sc[h * kA2Tile + k] * v;
+                }
+            }
+        }
+    }
+
+    // ---- combine the two key parities and write the partials ----
+    __syncthreads();
+    float* red = q_s;                                      // [HPK][head_dim] is free now
+    if (grp == 1) {
+        #pragma unroll
+        for (int h = 0; h < HPK; ++h)
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) { const uint32_t d = dl + 128 * i; if (d < head_dim) red[h * head_dim + d] = acc[h][i]; }
+    }
+    __syncthreads();
+    if (grp == 0) {
+        #pragma unroll
+        for (int h = 0; h < HPK; ++h) {
+            float* out = part + ((size_t) (hkv * HPK + h) * nsplit + sp) * (head_dim + 2);
+            #pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const uint32_t d = dl + 128 * i;
+                if (d < head_dim) out[2 + d] = acc[h][i] + red[h * head_dim + d];
+            }
+            if (dl == 0) { out[0] = st[h * 3]; out[1] = st[h * 3 + 1]; }
+        }
+    }
+}
+
+template <int HPK>
+static void launch_attn_dec2(const float* q, const uint8_t* kc, const uint8_t* vc, float* part, uint32_t n_kv, uint32_t nsplit,
+                             uint32_t head_dim, size_t row_bytes, size_t pos_bytes, size_t layer_off, const uint32_t* dyn,
+                             float inv_d, cudaStream_t stream) {
+    const size_t smem = ((size_t) HPK * head_dim + (size_t) HPK * kA2Tile + HPK * 3) * sizeof(float);
+    attn_dec2_part_kernel<HPK><<<dim3(n_kv, nsplit), kA2Threads, smem, stream>>>(
+        q, kc, vc, part, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, nsplit);
+}
+
+// Dispatch on the group size; false when this shape is not covered (the caller falls back to the per-head kernel).
+static bool attention_decode_q8_grouped(const float* q, const uint8_t* kc, const uint8_t* vc, float* part, uint32_t n_head,
+                                        uint32_t head_dim, uint32_t heads_per_kv, size_t row_bytes, size_t pos_bytes,
+                                        size_t layer_off, const uint32_t* dyn, float inv_d, uint32_t nsplit, cudaStream_t stream) {
+    if (head_dim % 32 != 0 || head_dim > kA2MaxHeadDim || heads_per_kv < 1 || heads_per_kv > 16 || n_head % heads_per_kv != 0) return false;
+    const uint32_t n_kv = n_head / heads_per_kv;
+    switch (heads_per_kv) {
+        case 1:  launch_attn_dec2<1>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 2:  launch_attn_dec2<2>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 3:  launch_attn_dec2<3>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 4:  launch_attn_dec2<4>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 5:  launch_attn_dec2<5>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 6:  launch_attn_dec2<6>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 7:  launch_attn_dec2<7>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 8:  launch_attn_dec2<8>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 9:  launch_attn_dec2<9>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 10: launch_attn_dec2<10>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 11: launch_attn_dec2<11>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 12: launch_attn_dec2<12>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 13: launch_attn_dec2<13>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 14: launch_attn_dec2<14>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        case 15: launch_attn_dec2<15>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+        default: launch_attn_dec2<16>(q, kc, vc, part, n_kv, nsplit, head_dim, row_bytes, pos_bytes, layer_off, dyn, inv_d, stream); break;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// Attention probe (opt-in diagnostics, never launched unless switched on).
+//
+// The raw attention scores of ONE decode token - q . k * inv_d - against every
+// cached key, per head, in the same arithmetic as attn_dec_part_kernel. The
+// softmax is left to the reader (it needs the whole row, and the reader wants
+// it per head anyway). Keys before cc_start (sliding window) are written as
+// -inf; keys after pos are not touched. One warp handles 8 consecutive keys,
+// blocks past `pos` leave at once, so the grid can be sized for max_pos.
+constexpr uint32_t kProbeKeysPerWarp = 8;
+
+__global__ void __launch_bounds__(kAdecWarps * 32) attn_probe_kernel(
+        const float* __restrict__ q, const uint8_t* __restrict__ kcache, float* __restrict__ out,
+        uint32_t head_dim, uint32_t heads_per_kv, size_t row_bytes, size_t pos_bytes, size_t layer_off,
+        const uint32_t* __restrict__ dyn, float inv_d, uint32_t max_pos) {
+    const uint32_t pos = dyn[0], cc_start = dyn[1];
+    const uint32_t h = blockIdx.x;
+    const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const uint32_t key0 = blockIdx.y * (kAdecWarps * kProbeKeysPerWarp) + warp * kProbeKeysPerWarp;
+    if (key0 > pos || key0 >= max_pos) return;
+    const uint32_t nblk = head_dim / 32;
+    const uint8_t* kb = kcache + layer_off + (size_t) (h / heads_per_kv) * row_bytes;
+    float qv[kAdecMaxBlk];
+    #pragma unroll
+    for (int i = 0; i < kAdecMaxBlk; ++i) qv[i] = i < (int) nblk ? q[(size_t) h * head_dim + i * 32 + lane] * inv_d : 0.0f;
+    for (uint32_t k = 0; k < kProbeKeysPerWarp; ++k) {
+        const uint32_t key = key0 + k;
+        if (key > pos || key >= max_pos) break;
+        const uint8_t* kr = kb + (size_t) key * pos_bytes;
+        float dot = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < kAdecMaxBlk; ++i) {
+            if (i < (int) nblk) {
+                const uint8_t* blk = kr + i * 34;
+                dot += __half2float(*reinterpret_cast<const __half*>(blk)) * qv[i] *
+                       (float) reinterpret_cast<const int8_t*>(blk + 2)[lane];
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor_sync(0xffffffff, dot, o);
+        if (lane == 0) out[(size_t) h * max_pos + key] = key < cc_start ? -INFINITY : dot;
+    }
+}
 
 // Decode attention on the Q8_0 cache: the split kernel when its scratch is
 // there and the head fits, otherwise attention_kernel_q8. Graph-safe: the
@@ -2491,10 +2727,40 @@ bool scratch_reserve(size_t nb, size_t rows) {
 // hybrid sliding-window model rotating 64 dims on full layers and 256 on
 // local ones) grows d_rope on a LATER layer than the one that captured
 // its graph first.
+// Attention probe: device buffer of raw scores [layer][head][position] (opt-in, see attn_probe_kernel).
+// Declared here because attention_decode_q8 - the one place every GPU decode path goes through, the
+// captured per-layer graphs included - launches the probe kernel when it is on.
+namespace {
+struct AttnProbeState {
+    bool on = false;
+    uint32_t n_layers = 0, n_head = 0, max_pos = 0;
+    size_t layer_stride = 0;   // bytes of one layer in the device KV cache
+    float* d_buf = nullptr;
+} g_probe;
+}
+
+// The grouped decode attention pays off from a context of ~100 tokens on and costs about 1-4% below it (its fixed
+// per-block work is larger), so DenseForward tells the backend which side of that line the next decode step is on. The
+// captured graphs bake the kernel in, hence they are dropped when the side changes (once, when a context grows past the line).
+static bool g_attn_long = false;
+
 static void attention_decode_q8(const float* q, const uint8_t* kc, const uint8_t* vc, float* out,
                                 uint32_t n_head, uint32_t head_dim, uint32_t heads_per_kv, size_t row_bytes,
                                 size_t pos_bytes, size_t layer_off, const uint32_t* dyn, float inv_d,
                                 cudaStream_t stream) {
+    // Opt-in probe of the attention weights: one bool test when off. Launched before the real attention so it
+    // reads the same q; inside a captured graph it is just one more node (graphs are dropped when the probe is
+    // switched on or off, see cuda_attention_probe_configure).
+    if (g_probe.on && g_probe.d_buf && n_head == g_probe.n_head && head_dim % 32 == 0 &&
+        head_dim <= 32 * kAdecMaxBlk && g_probe.layer_stride > 0) {
+        const uint32_t layer = (uint32_t) (layer_off / g_probe.layer_stride);
+        if (layer < g_probe.n_layers) {
+            const uint32_t keys_per_block = kAdecWarps * kProbeKeysPerWarp;
+            attn_probe_kernel<<<dim3(n_head, (g_probe.max_pos + keys_per_block - 1) / keys_per_block), kAdecWarps * 32, 0, stream>>>(
+                q, kc, g_probe.d_buf + (size_t) layer * n_head * g_probe.max_pos,
+                head_dim, heads_per_kv, row_bytes, pos_bytes, layer_off, dyn, inv_d, g_probe.max_pos);
+        }
+    }
     static const bool split_on = std::getenv("DESIREEIA_CUDA_NO_ATTN_SPLIT") == nullptr;
     const size_t q_dim = (size_t) n_head * head_dim;
     if (split_on && head_dim % 32 == 0 && head_dim <= 32 * kAdecMaxBlk && g_scratch.d_apart &&
@@ -2505,7 +2771,30 @@ static void attention_decode_q8(const float* q, const uint8_t* kc, const uint8_t
                 cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || n <= 0) return 1u;
             return (uint32_t) n;
         }();
-        uint32_t nsplit = (2 * sms + n_head - 1) / n_head;
+        // Blocks wanted per SM across the whole grid (heads x splits). DESIREEIA_CUDA_ATTN_SPLIT_X overrides it (tuning).
+        static const uint32_t split_x = [] {
+            const char* e = std::getenv("DESIREEIA_CUDA_ATTN_SPLIT_X");
+            const int v = e ? std::atoi(e) : 2;
+            return (uint32_t) (v < 1 ? 1 : (v > 16 ? 16 : v));
+        }();
+        // The grouped kernel (one block per KV head) is the default; DESIREEIA_CUDA_ATTN_V1=1 keeps the per-head one (A/B and fallback).
+        static const bool grouped_on = std::getenv("DESIREEIA_CUDA_ATTN_V1") == nullptr;
+        if (grouped_on && g_attn_long && heads_per_kv >= 1 && n_head % heads_per_kv == 0) {
+            const uint32_t n_kv = n_head / heads_per_kv;
+            static const uint32_t blocks_x = [] {
+                const char* e = std::getenv("DESIREEIA_CUDA_ATTN_BLOCKS_X");
+                const int v = e ? std::atoi(e) : 2;
+                return (uint32_t) (v < 1 ? 1 : (v > 16 ? 16 : v));
+            }();
+            uint32_t ns2 = (blocks_x * sms + n_kv - 1) / n_kv;
+            ns2 = ns2 < 1 ? 1 : (ns2 > (uint32_t) kAdecMaxSplit ? (uint32_t) kAdecMaxSplit : ns2);
+            if (attention_decode_q8_grouped(q, kc, vc, g_scratch.d_apart, n_head, head_dim, heads_per_kv, row_bytes, pos_bytes,
+                                            layer_off, dyn, inv_d, ns2, stream)) {
+                attn_dec_merge_kernel<<<n_head, 128, 0, stream>>>(g_scratch.d_apart, out, head_dim, ns2);
+                return;
+            }
+        }
+        uint32_t nsplit = (split_x * sms + n_head - 1) / n_head;
         nsplit = nsplit < 1 ? 1 : (nsplit > (uint32_t) kAdecMaxSplit ? (uint32_t) kAdecMaxSplit : nsplit);
         attn_dec_part_kernel<<<dim3(n_head, nsplit), kAdecWarps * 32, 0, stream>>>(
             q, kc, vc, g_scratch.d_apart, head_dim, heads_per_kv, row_bytes, pos_bytes, layer_off, dyn, inv_d, nsplit);
@@ -3738,12 +4027,59 @@ bool cuda_kv_cache_upload(const void* k_host, const void* v_host, size_t total_b
 // Mirrors a single position (k and v of a layer). Async on the shared
 // stream: ordering with the attention kernel that reads it is guaranteed
 // by the stream, so no synchronization is needed here.
+// The opposite of cuda_kv_cache_write for a byte range: device -> host, waiting for the copy.
+bool cuda_kv_cache_read(size_t byte_off, void* k, void* v, size_t bytes) {
+    if (!g_scratch.d_kcache || byte_off + bytes > g_scratch.kv_bytes) return false;
+    cudaStream_t stream = scratch_stream();
+    cudaMemcpyAsync(k, g_scratch.d_kcache + byte_off, bytes, cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(v, g_scratch.d_vcache + byte_off, bytes, cudaMemcpyDeviceToHost, stream);
+    return cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
 bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v, size_t bytes) {
     if (!g_scratch.d_kcache || byte_off + bytes > g_scratch.kv_bytes) return false;
     cudaStream_t stream = scratch_stream();
     cudaMemcpyAsync(g_scratch.d_kcache + byte_off, k, bytes, cudaMemcpyHostToDevice, stream);
     cudaMemcpyAsync(g_scratch.d_vcache + byte_off, v, bytes, cudaMemcpyHostToDevice, stream);
     return true;
+}
+
+void cuda_set_attention_long(bool long_context) {
+    if (long_context == g_attn_long) return;
+    g_attn_long = long_context;
+    invalidate_graphs();
+}
+
+// The captured graphs bake in one model's weights and the KV buffers' contents: dropped when another model takes over the device.
+void cuda_drop_graphs() { invalidate_graphs(); }
+
+bool cuda_attention_probe_configure(bool enabled, uint32_t n_layers, uint32_t n_head, uint32_t max_pos, size_t layer_stride_bytes) {
+    // The captured graphs bake the probe node (or its absence) and the layer stride in: drop them on any change.
+    if (enabled != g_probe.on || (enabled && layer_stride_bytes != g_probe.layer_stride)) invalidate_graphs();
+    if (!enabled) {
+        g_probe.on = false;
+        if (g_probe.d_buf) { cudaFree(g_probe.d_buf); g_probe.d_buf = nullptr; }
+        return true;
+    }
+    if (n_layers == 0 || n_head == 0 || max_pos == 0 || layer_stride_bytes == 0) return false;
+    const size_t need = (size_t) n_layers * n_head * max_pos;
+    if (g_probe.d_buf && (g_probe.n_layers != n_layers || g_probe.n_head != n_head || g_probe.max_pos != max_pos)) {
+        cudaFree(g_probe.d_buf); g_probe.d_buf = nullptr;
+    }
+    if (!g_probe.d_buf && cudaMalloc(&g_probe.d_buf, need * sizeof(float)) != cudaSuccess) { g_probe.on = false; return false; }
+    g_probe.n_layers = n_layers; g_probe.n_head = n_head; g_probe.max_pos = max_pos;
+    g_probe.layer_stride = layer_stride_bytes;
+    g_probe.on = true;
+    return true;
+}
+
+// Copies one layer's raw scores [n_head][max_pos] to the host. Waits for the work already queued on the engine's stream.
+bool cuda_attention_probe_read(uint32_t layer, float* host_out) {
+    if (!g_probe.d_buf || layer >= g_probe.n_layers || !host_out) return false;
+    cudaStream_t stream = scratch_stream();
+    const size_t n = (size_t) g_probe.n_head * g_probe.max_pos;
+    if (cudaMemcpyAsync(host_out, g_probe.d_buf + (size_t) layer * n, n * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess) return false;
+    return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 
 // Attention + output projection in a single episode: q goes up once,

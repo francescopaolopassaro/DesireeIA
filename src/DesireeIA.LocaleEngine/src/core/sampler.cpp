@@ -49,6 +49,29 @@ void Sampler::compute_stats_(const std::vector<float>& logits, int32_t chosen) {
     last_stats_.entropy  = (float) (lse - wsum / sum);
     last_stats_.max_prob = (float) (1.0 / sum);
     last_stats_.valid = true;
+
+    // The k most likely tokens, best first: one pass, a sorted array of k kept
+    // by insertion (a vocabulary entry beats the current k-th only rarely, so
+    // the inner loop almost never runs).
+    const int k = std::min<int>(track_top_, TokenStats::kTopMax);
+    if (k > 0) {
+        float   bv[TokenStats::kTopMax];
+        int32_t bi[TokenStats::kTopMax];
+        int cnt = 0;
+        for (size_t i = 0; i < n; ++i) {
+            const float v = logits[i];
+            if (cnt == k && v <= bv[k - 1]) continue;
+            int j = cnt < k ? cnt++ : k - 1;
+            while (j > 0 && bv[j - 1] < v) { bv[j] = bv[j - 1]; bi[j] = bi[j - 1]; --j; }
+            bv[j] = v;
+            bi[j] = (int32_t) i;
+        }
+        last_stats_.top_n = cnt;
+        for (int j = 0; j < cnt; ++j) {
+            last_stats_.top_id[j] = bi[j];
+            last_stats_.top_lp[j] = (float) (((double) bv[j] - (double) mx) - lse);
+        }
+    }
 }
 
 void Sampler::apply_dry_(std::vector<float>& logits, const std::vector<int32_t>& history) const {

@@ -570,6 +570,143 @@ public sealed class LocalModel : IDisposable
         return err == NativeMethods.Error.Ok ? (lp, en, mp) : null;
     }
 
+    /// <summary>
+    /// The k most likely tokens (k up to 16, 0 = off, the default) of the distribution each token is drawn from, recorded
+    /// together with the confidence: what the model considered besides what it wrote. Needs
+    /// <see cref="SetConfidenceTracking"/>; costs nothing while off. Read them with <see cref="GetTopCandidates"/>.
+    /// </summary>
+    public void SetTopCandidates(int k)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (k < 0 || k > 16) throw new ArgumentOutOfRangeException(nameof(k), "k must be between 0 and 16.");
+        CheckExtras5(() => NativeMethods.desireeia_set_top_candidates(_context, k), "Set top candidates");
+    }
+
+    /// <summary>The recorded candidates of the last drawn token, best first: token id and ln P over the whole vocabulary. Null when nothing was recorded.</summary>
+    public (int TokenId, float LogProb)[]? GetTopCandidates()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var ids = new int[16];
+        var lps = new float[16];
+        NativeMethods.Error err;
+        int n;
+        try { err = NativeMethods.desireeia_get_top_candidates(_context, ids, lps, ids.Length, out n); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok || n <= 0) return null;
+        var res = new (int, float)[n];
+        for (int i = 0; i < n; i++) res[i] = (ids[i], lps[i]);
+        return res;
+    }
+
+    /// <summary>
+    /// Prefix store: keeps the K/V of earlier prompts in host memory (up to <paramref name="budgetBytes"/>), so that coming back to a
+    /// prompt — another chat, another role, a subagent that starts from the same system prompt — restores its cache instead of
+    /// prefilling it again. The restored K/V are exactly what a prefill computed (the last prompt token runs on its own, as in any session reuse). 0 (the default) is off.
+    /// <paramref name="minTokens"/> (at least 16) is the shortest prefix worth keeping. Returns false for models that cannot rewind
+    /// their state (recurrent ones). <see cref="LastReusedTokens"/> counts restored tokens too.
+    /// </summary>
+    public bool SetPrefixCache(ulong budgetBytes, int minTokens = 64)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        try { err = NativeMethods.desireeia_set_prefix_cache(_context, budgetBytes, minTokens); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Prefix store: needs a native engine with ABI 5 or newer."); }
+        return err == NativeMethods.Error.Ok;
+    }
+
+    /// <summary>
+    /// Writes the kept prompts into <paramref name="directory"/> (one file each) so they survive a restart. Returns how many were written.
+    /// </summary>
+    public int SavePrefixCache(string directory)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        int n;
+        try { err = NativeMethods.desireeia_save_prefix_cache(_context, directory, out n); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Prefix store: needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Save prefix cache failed: {err}");
+        return n;
+    }
+
+    /// <summary>
+    /// Reads back the prompts saved by <see cref="SavePrefixCache"/> that belong to this model (files of another model or engine
+    /// version are ignored). The store must be on (<see cref="SetPrefixCache"/>): its budget limits what is loaded. Returns how many were added.
+    /// </summary>
+    public int LoadPrefixCache(string directory)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        int n;
+        try { err = NativeMethods.desireeia_load_prefix_cache(_context, directory, out n); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Prefix store: needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Load prefix cache failed: {err}");
+        return n;
+    }
+
+    /// <summary>Bytes held, entries, how many predicts restored something, and how many prompt tokens that saved from prefill.</summary>
+    public (ulong Bytes, int Entries, ulong Hits, ulong RestoredTokens) GetPrefixCacheInfo()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        ulong b, h, r;
+        int e;
+        try { err = NativeMethods.desireeia_get_prefix_cache_info(_context, out b, out e, out h, out r); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Prefix store: needs a native engine with ABI 5 or newer."); }
+        return err == NativeMethods.Error.Ok ? (b, e, h, r) : (0, 0, 0, 0);
+    }
+
+    /// <summary>
+    /// Attention probe: while on, the attention weights of the last DECODED token are kept for every layer and head and can
+    /// be read with <see cref="GetAttention"/> after each token. Off by default; on, decode is a few percent slower and the
+    /// draw stays on the host. A prefill is not captured. Returns false when this model cannot be probed (e.g. MLA).
+    /// </summary>
+    public bool SetAttentionProbe(bool enabled)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        try { err = NativeMethods.desireeia_set_attention_probe(_context, enabled ? 1 : 0); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Attention probe: needs a native engine with ABI 5 or newer."); }
+        return err == NativeMethods.Error.Ok;
+    }
+
+    /// <summary>Layers, heads, the positions recorded for the last token and the total positions (more than recorded past 16384). Null when nothing was captured.</summary>
+    public (int Layers, int Heads, int Positions, int TotalPositions)? GetAttentionShape()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        int l, h, p, t;
+        try { err = NativeMethods.desireeia_get_attention_shape(_context, out l, out h, out p, out t); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Attention probe: needs a native engine with ABI 5 or newer."); }
+        return err == NativeMethods.Error.Ok ? (l, h, p, t) : null;
+    }
+
+    /// <summary>
+    /// The normalised attention weights (they sum to 1) of one layer over the positions of the last decoded token.
+    /// <paramref name="head"/> -1 is the mean over the heads. Null when that layer was not captured.
+    /// </summary>
+    public float[]? GetAttention(int layer, int head = -1)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var shape = GetAttentionShape();
+        if (shape is null) return null;
+        var w = new float[shape.Value.Positions];
+        NativeMethods.Error err;
+        int n;
+        try { err = NativeMethods.desireeia_get_attention(_context, layer, head, w, w.Length, out n); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Attention probe: needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok) return null;
+        if (n != w.Length) Array.Resize(ref w, n);
+        return w;
+    }
+
+    private static void CheckExtras5(Func<NativeMethods.Error> call, string what)
+    {
+        NativeMethods.Error err;
+        try { err = call(); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException($"{what}: needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"{what} failed: {err}");
+    }
+
     private static void CheckExtras(Func<NativeMethods.Error> call, string what)
     {
         NativeMethods.Error err;
@@ -584,6 +721,52 @@ public sealed class LocalModel : IDisposable
     /// {"name": &lt;tool&gt;, "arguments": {...}} followed by <paramref name="closeTag"/>.
     /// <paramref name="toolNames"/> null turns it off; empty accepts any name.
     /// </summary>
+    /// <summary>
+    /// Scores text the model did not write: the log-probability of <c>tokens[fromIndex..]</c> given everything before each
+    /// of them, and the entropy (nats) of the model's distribution at each of those positions. Nothing is generated.
+    /// Use it to compare two versions of a prompt, to see how surprised the model is by each token, or to pick a label.
+    /// </summary>
+    public (float[] LogProb, float[] Entropy) ScoreTokens(IReadOnlyList<int> tokens, int fromIndex = 1)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (fromIndex < 1 || fromIndex >= tokens.Count) throw new ArgumentOutOfRangeException(nameof(fromIndex));
+        var ids = tokens.ToArray();
+        var lp = new float[ids.Length - fromIndex];
+        var en = new float[ids.Length - fromIndex];
+        NativeMethods.Error err;
+        try { err = NativeMethods.desireeia_score_tokens(_context, ids, (nuint)ids.Length, (nuint)fromIndex, lp, en); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Scoring: needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Score tokens failed: {err}");
+        return (lp, en);
+    }
+
+    /// <summary>Adds a bias to the logit of the given tokens before every draw (an empty map clears it; -100 forbids a token).</summary>
+    public void SetLogitBias(IReadOnlyDictionary<int, float>? bias)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var ids = bias is null ? Array.Empty<int>() : bias.Keys.ToArray();
+        var vals = bias is null ? Array.Empty<float>() : bias.Values.ToArray();
+        NativeMethods.Error err;
+        try { err = NativeMethods.desireeia_set_logit_bias(_context, ids.Length == 0 ? null : ids, vals.Length == 0 ? null : vals, (nuint)ids.Length); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Logit bias: needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Set logit bias failed: {err}");
+    }
+
+    public void SetJsonSchema(string? schemaJson)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        byte[]? bytes = null;
+        if (!string.IsNullOrWhiteSpace(schemaJson))
+        {
+            bytes = new byte[System.Text.Encoding.UTF8.GetByteCount(schemaJson) + 1];
+            System.Text.Encoding.UTF8.GetBytes(schemaJson, 0, schemaJson.Length, bytes, 0);
+        }
+        NativeMethods.Error err;
+        try { err = NativeMethods.desireeia_set_json_schema(_context, bytes); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("JSON schema constraint: needs a native engine with ABI 5 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new ArgumentException($"JSON schema refused: {err}");
+    }
+
     public void SetToolConstraint(IReadOnlyList<string>? toolNames, string openTag = "<tool_call>",
         string closeTag = "</tool_call>")
     {

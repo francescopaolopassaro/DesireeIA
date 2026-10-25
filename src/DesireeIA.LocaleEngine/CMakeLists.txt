@@ -46,6 +46,7 @@ add_library(DesireeIALocaleEngine SHARED
     src/core/ctx.cpp
     src/core/sampler.cpp
     src/core/tool_grammar.cpp
+    src/core/json_grammar.cpp
     src/core/chat_template.cpp
     src/core/jinja.cpp
     src/core/arch_tags.cpp
@@ -177,6 +178,15 @@ if(DESIREEIA_BUILD_TESTS)
     #   desireeia_session_test <modello.gguf>   (senza argomento viene saltato).
     add_executable(desireeia_session_test tests/session_test.cpp)
     target_link_libraries(desireeia_session_test PRIVATE DesireeIALocaleEngine)
+
+    # Velocita' di decode e sonde dei token su un modello reale:
+    #   desireeia_probe_test <modello.gguf> [speed|stats|topk|attn|check] [token] [giri]
+    add_executable(desireeia_probe_test tests/probe_test.cpp)
+    target_link_libraries(desireeia_probe_test PRIVATE DesireeIALocaleEngine)
+    target_compile_definitions(desireeia_probe_test PRIVATE PROBE_HAS_TOPK PROBE_HAS_ATTN PROBE_HAS_PREFIX)
+    # The same source without the new probes: only uses ABI 4 symbols, so it also runs against an older engine (A/B of speed).
+    add_executable(desireeia_speed_test tests/probe_test.cpp)
+    target_link_libraries(desireeia_speed_test PRIVATE DesireeIALocaleEngine)
 
     # Microbenchmark dei soli kernel: serve a confrontare due varianti in
     # secondi invece che minuti, perche' le misure end-to-end su portatile

@@ -17,10 +17,11 @@ UNSUPPORTED_FIELDS = (
     "mirostat_eta",
     "mirostat_tau",
     "typical_p",
-    "top_logprobs",
 )
 
 _BIG_CAP = 32768
+# `n` answers to one prompt are drawn one after the other (the prompt is prefilled once, the rest reuses it).
+MAX_CHOICES = 8
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,12 @@ class CodegenParams:
     # Names of the tools the request declares: the engine then constrains
     # every <tool_call> block at token level to a valid call of one of them.
     tool_names: Optional[Tuple[str, ...]] = None
+    # Token probabilities (chat completions): `logprobs` asks for the log-probability of every generated token,
+    # `top_logprobs` (0-16) for that many of the alternatives the model considered at each step.
+    logprobs: bool = False
+    top_logprobs: int = 0
+    # OpenAI-style `logit_bias`: token id -> bias added to that token's logit (-100 forbids it, 100 forces it).
+    logit_bias: Optional[Tuple[Tuple[int, float], ...]] = None
 
     def generation_max_tokens(self, settings: Settings) -> int:
         if self.max_tokens is not None and self.max_tokens > 0:
@@ -106,13 +113,46 @@ def _response_format(body: dict) -> Optional[dict]:
     return value
 
 
+def _logit_bias(body: dict) -> Optional[Tuple[Tuple[int, float], ...]]:
+    raw = body.get("logit_bias")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise InvalidRequestError("field 'logit_bias' must be an object of token id -> bias", param="logit_bias")
+    if len(raw) > 300:
+        raise InvalidRequestError("field 'logit_bias' takes at most 300 tokens", param="logit_bias")
+    pairs = []
+    for key, value in raw.items():
+        try:
+            token = int(key)
+        except (TypeError, ValueError):
+            raise InvalidRequestError(f"logit_bias key {key!r} is not a token id", param="logit_bias")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not -100 <= value <= 100:
+            raise InvalidRequestError("logit_bias values must be numbers from -100 to 100", param="logit_bias")
+        if token < 0:
+            raise InvalidRequestError("logit_bias token ids must not be negative", param="logit_bias")
+        pairs.append((token, float(value)))
+    return tuple(pairs) or None
+
+
 def resolve(body, *, allow_n_predict: bool = False) -> CodegenParams:
     for key in UNSUPPORTED_FIELDS:
         if key in body:
             raise NotSupportedError(f"sampling field {key!r} is not supported by the DesireeIA engine", param=key)
 
-    if "logprobs" in body and body["logprobs"]:
-        raise NotSupportedError("the engine does not expose token probabilities; 'logprobs' is not supported", param="logprobs")
+    raw_lp = body.get("logprobs", False)
+    if raw_lp is None:
+        raw_lp = False
+    if not isinstance(raw_lp, (bool, int)):
+        raise InvalidRequestError("field 'logprobs' must be a boolean", param="logprobs")
+    want_logprobs = bool(raw_lp)
+    top_lp = body.get("top_logprobs", 0)
+    if top_lp is None:
+        top_lp = 0
+    if isinstance(top_lp, bool) or not isinstance(top_lp, int) or top_lp < 0 or top_lp > 16:
+        raise InvalidRequestError("field 'top_logprobs' must be an integer from 0 to 16", param="top_logprobs")
+    if top_lp and not want_logprobs:
+        raise InvalidRequestError("'top_logprobs' needs 'logprobs' to be true", param="top_logprobs")
 
     stream = body.get("stream", False)
     if not isinstance(stream, bool):
@@ -121,8 +161,10 @@ def resolve(body, *, allow_n_predict: bool = False) -> CodegenParams:
     n = body.get("n", 1)
     if isinstance(n, bool) or not isinstance(n, int) or n < 1:
         raise InvalidRequestError("field 'n' must be a positive integer", param="n")
-    if n != 1:
-        raise NotSupportedError("multiple choices ('n') are not supported by the engine", param="n")
+    if n > MAX_CHOICES:
+        raise InvalidRequestError(f"field 'n' must be at most {MAX_CHOICES}", param="n")
+    if n != 1 and stream:
+        raise NotSupportedError("multiple choices ('n') cannot be streamed: ask for them without 'stream'", param="n")
 
     best_of = body.get("best_of", 1)
     if isinstance(best_of, bool) or not isinstance(best_of, int) or best_of < 1:
@@ -153,4 +195,7 @@ def resolve(body, *, allow_n_predict: bool = False) -> CodegenParams:
         echo=echo,
         n=n,
         response_format=_response_format(body),
+        logprobs=want_logprobs,
+        top_logprobs=top_lp,
+        logit_bias=_logit_bias(body),
     )

@@ -372,8 +372,39 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
         lib.desireeia_get_token_stats.argtypes = [c_void_p, POINTER(c_float), POINTER(c_float), POINTER(c_float)]
         lib.desireeia_get_token_stats.restype = c_int32
 
+    # ABI 5 extras: top candidates per token and the attention probe (absent on an older engine)
+    if hasattr(lib, "desireeia_set_top_candidates"):
+        lib.desireeia_set_top_candidates.argtypes = [c_void_p, c_int32]
+        lib.desireeia_set_top_candidates.restype = c_int32
+        lib.desireeia_get_top_candidates.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_float), c_int32, POINTER(c_int32)]
+        lib.desireeia_get_top_candidates.restype = c_int32
+        lib.desireeia_set_prefix_cache.argtypes = [c_void_p, c_uint64, c_int32]
+        lib.desireeia_set_prefix_cache.restype = c_int32
+        lib.desireeia_get_prefix_cache_info.argtypes = [c_void_p, POINTER(c_uint64), POINTER(c_int32), POINTER(c_uint64), POINTER(c_uint64)]
+        lib.desireeia_get_prefix_cache_info.restype = c_int32
+        lib.desireeia_save_prefix_cache.argtypes = [c_void_p, c_char_p, POINTER(c_int32)]
+        lib.desireeia_save_prefix_cache.restype = c_int32
+        lib.desireeia_load_prefix_cache.argtypes = [c_void_p, c_char_p, POINTER(c_int32)]
+        lib.desireeia_load_prefix_cache.restype = c_int32
+        lib.desireeia_set_attention_probe.argtypes = [c_void_p, c_int32]
+        lib.desireeia_set_attention_probe.restype = c_int32
+        lib.desireeia_get_attention_shape.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_int32), POINTER(c_int32), POINTER(c_int32)]
+        lib.desireeia_get_attention_shape.restype = c_int32
+        lib.desireeia_get_attention.argtypes = [c_void_p, c_int32, c_int32, POINTER(c_float), c_int32, POINTER(c_int32)]
+        lib.desireeia_get_attention.restype = c_int32
+
     lib.desireeia_set_tool_constraint.argtypes = [c_void_p, c_char_p, c_char_p, POINTER(c_char_p), c_uint64]
     lib.desireeia_set_tool_constraint.restype = c_int32
+
+    if hasattr(lib, "desireeia_score_tokens"):
+        lib.desireeia_score_tokens.argtypes = [c_void_p, POINTER(c_int32), c_uint64, c_uint64,
+                                               POINTER(c_float), POINTER(c_float)]
+        lib.desireeia_score_tokens.restype = c_int32
+        lib.desireeia_set_logit_bias.argtypes = [c_void_p, POINTER(c_int32), POINTER(c_float), c_uint64]
+        lib.desireeia_set_logit_bias.restype = c_int32
+    if hasattr(lib, "desireeia_set_json_schema"):
+        lib.desireeia_set_json_schema.argtypes = [c_void_p, c_char_p]
+        lib.desireeia_set_json_schema.restype = c_int32
 
     lib.desireeia_get_sampling.argtypes = [c_void_p, POINTER(Sampling)]
     lib.desireeia_get_sampling.restype = c_int32

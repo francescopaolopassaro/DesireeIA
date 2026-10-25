@@ -22,6 +22,28 @@ class PredictionStep:
     piece: str = ""
     finish_reason: Optional[str] = None
     final: bool = False
+    # Probability of the token this step belongs to (OpenAI `logprobs.content` entry), when the request asked for it.
+    logprob: Optional[dict] = None
+
+
+def _token_text(model, token_id: int) -> tuple:
+    text = model.token_piece(token_id) or ""
+    raw = model.token_bytes(token_id) if hasattr(model, "token_bytes") else None
+    return text, (list(raw) if raw else list(text.encode("utf-8")))
+
+
+def logprob_entry(model, token_id: int, top: int) -> Optional[dict]:
+    """The `logprobs.content` entry of the token just drawn: its log-probability and, if asked, the alternatives."""
+    stats = model.token_stats()
+    if stats is None:
+        return None
+    text, raw = _token_text(model, token_id)
+    entry = {"token": text, "logprob": stats[0], "bytes": raw, "top_logprobs": []}
+    if top > 0:
+        for alt_id, alt_lp in (model.top_candidates() or [])[:top]:
+            alt_text, alt_raw = _token_text(model, alt_id)
+            entry["top_logprobs"].append({"token": alt_text, "logprob": alt_lp, "bytes": alt_raw})
+    return entry
 
 
 def build_prompt_ids(model, messages, add_assistant: bool = True):
@@ -32,7 +54,9 @@ def build_prompt_ids(model, messages, add_assistant: bool = True):
     return ids
 
 
-def iter_prediction(model, ids, generation, tracker: TokenTracker, cancelled: threading.Event):
+def iter_prediction(model, ids, generation, tracker: TokenTracker, cancelled: threading.Event,
+                    logprobs_top: Optional[int] = None):
+    """`logprobs_top`: None = no probabilities; 0 = the probability of each token; N = also N alternatives."""
     from desireeia.generation import StopSequenceScanner
 
     scanner = StopSequenceScanner(generation.stop_sequences)
@@ -52,9 +76,10 @@ def iter_prediction(model, ids, generation, tracker: TokenTracker, cancelled: th
             break
         tracker.predicted_n += 1
         piece = model.token_piece(token) or ""
+        entry = logprob_entry(model, token, logprobs_top) if logprobs_top is not None else None
         emit, stopped = scanner.feed(piece)
-        if emit:
-            yield PredictionStep(piece=emit)
+        if emit or entry is not None:
+            yield PredictionStep(piece=emit, logprob=entry)
         if stopped:
             finish = "stop"
             break
@@ -115,18 +140,31 @@ class GenerationRunner:
             self._thread.join(timeout=3)
 
 
+def run_sync_with_logprobs(producer) -> tuple:
+    """Run a producer to completion on the current thread.
+
+    Returns (text, finish_reason, tracker, logprob_entries).
+    """
+    cancelled = threading.Event()
+    tracker = TokenTracker()
+    pieces: list[str] = []
+    entries: list[dict] = []
+    finish = "stop"
+    for step in producer(cancelled, tracker):
+        if step.final:
+            finish = step.finish_reason or "stop"
+            continue
+        if step.piece:
+            pieces.append(step.piece)
+        if step.logprob is not None:
+            entries.append(step.logprob)
+    return "".join(pieces), finish, tracker, entries
+
+
 def run_sync(producer) -> tuple:
     """Run a producer to completion on the current thread.
 
     Returns (text, finish_reason, tracker).
     """
-    cancelled = threading.Event()
-    tracker = TokenTracker()
-    pieces: list[str] = []
-    finish = "stop"
-    for step in producer(cancelled, tracker):
-        if step.final:
-            finish = step.finish_reason or "stop"
-        elif step.piece:
-            pieces.append(step.piece)
-    return "".join(pieces), finish, tracker
+    text, finish, tracker, _entries = run_sync_with_logprobs(producer)
+    return text, finish, tracker

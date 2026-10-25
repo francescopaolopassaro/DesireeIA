@@ -29,6 +29,7 @@ threshold, checked by a background sweep the app's lifespan starts.
 
 from __future__ import annotations
 
+import json
 import threading
 import time
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -36,7 +37,7 @@ from typing import Dict, Iterator, List, Optional, Tuple
 from . import engine as engine_mod
 from . import toolcalling
 from . import models_store
-from .api.errors import NotFoundError, UnavailableError
+from .api.errors import InvalidRequestError, NotFoundError, NotSupportedError, UnavailableError
 from .config import Settings
 from .generation import PredictionStep, build_prompt_ids, iter_prediction
 from .sampling import CodegenParams
@@ -182,6 +183,26 @@ class Slot:
 
     # -- generation ----------------------------------------------------------
 
+    def score(self, prompt: str, texts: List[str]):
+        """Score each text as a continuation of `prompt`: [(token_ids, logprobs, entropies)]. Takes the slot like a
+        generation does (scoring rewrites the KV cache), so it is refused with SlotBusy while one is running."""
+        model = self.ensure_loaded()
+        with self._gate:
+            if self._busy:
+                raise SlotBusy()
+            self._busy = True
+        try:
+            with self._inference_lock:
+                self.touch()
+                out = []
+                for text in texts:
+                    out.append(model.score_text(text, prompt))
+                return out
+        finally:
+            with self._gate:
+                self._busy = False
+            self.touch()
+
     def info(self) -> Optional[dict]:
         if self._state != SlotState.LOADED or self._model is None:
             return None
@@ -256,12 +277,83 @@ class SlotPrediction:
                 # An engine older than ABI 4 does not have them: not an error for a request that does not use them.
                 if env.min_p or env.dry_multiplier or env.reasoning_budget:
                     raise
+        # Token probabilities persist on the model across requests too: set them for THIS request (on only when asked).
+        self._logprobs_top = self._configure_logprobs(model)
         # Always (re)set: the constraint persists on the model across
         # requests, so a request without tools must turn it back off.
         if hasattr(model, "set_tool_constraint"):
             names = self._params.tool_names
             model.set_tool_constraint(list(names) if names is not None else None,
                                       toolcalling.TOOL_CALL_OPEN, toolcalling.TOOL_CALL_CLOSE)
+        self._configure_json_schema(model)
+        self._configure_logit_bias(model)
+
+    def _configure_logit_bias(self, model) -> None:
+        """Persists on the model across requests like the other engine settings: always (re)set."""
+        if not hasattr(model, "set_logit_bias"):
+            return
+        bias = self._params.logit_bias
+        try:
+            model.set_logit_bias(dict(bias) if bias else None)
+        except RuntimeError:
+            if bias:
+                raise NotSupportedError("this engine does not support 'logit_bias' (needs a 0.3.0 native engine)",
+                                        param="logit_bias")
+
+    def _json_schema_text(self) -> Optional[str]:
+        """The schema the engine must enforce for this request, or None. `json_object` means any JSON object;
+        `json_schema` carries the schema itself (OpenAI shape: response_format.json_schema.schema)."""
+        fmt = self._params.response_format
+        if not isinstance(fmt, dict):
+            return None
+        kind = fmt.get("type")
+        if kind == "json_object":
+            return '{"type":"object"}'
+        if kind == "json_schema":
+            holder = fmt.get("json_schema")
+            schema = holder.get("schema") if isinstance(holder, dict) else None
+            if isinstance(schema, dict):
+                return json.dumps(schema, ensure_ascii=False)
+            if isinstance(schema, str) and schema.strip():
+                return schema
+            return "json"
+        return None
+
+    def _configure_json_schema(self, model) -> None:
+        """The constraint persists on the model across requests: always (re)set, so a request without a
+        response_format turns it back off. An engine without it still gets the instruction in the prompt."""
+        if not hasattr(model, "set_json_schema"):
+            return
+        text = self._json_schema_text()
+        try:
+            model.set_json_schema(text)
+        except ValueError as exc:
+            raise InvalidRequestError(f"response_format.json_schema.schema cannot be enforced: {exc}",
+                                      param="response_format")
+        except RuntimeError:
+            # A native engine older than 0.3.0 has no schema constraint: the prompt instruction is all there is.
+            if text is not None:
+                pass
+
+    def _configure_logprobs(self, model):
+        """None = no probabilities for this request; otherwise how many alternatives to record per token."""
+        want = self._params.logprobs
+        top = self._params.top_logprobs if want else 0
+        if hasattr(model, "set_confidence_tracking"):
+            try:
+                model.set_confidence_tracking(want)
+                if hasattr(model, "set_top_candidates"):
+                    model.set_top_candidates(top)
+                elif top:
+                    raise RuntimeError("top_logprobs needs a native engine with ABI 5 or newer")
+            except RuntimeError as exc:
+                if want:
+                    from .api.errors import NotSupportedError
+                    raise NotSupportedError(f"token probabilities are not available: {exc}", param="logprobs")
+        elif want:
+            from .api.errors import NotSupportedError
+            raise NotSupportedError("this engine does not expose token probabilities", param="logprobs")
+        return top if want else None
 
     def _build_generation(self, model) -> None:
         options = engine_mod.generate_options(
@@ -284,7 +376,8 @@ class SlotPrediction:
                 generation = self._build_generation(model)
                 try:
                     ids = build_prompt_ids(model, self._messages)
-                    yield from iter_prediction(model, ids, generation, tracker, cancelled)
+                    yield from iter_prediction(model, ids, generation, tracker, cancelled,
+                                               logprobs_top=getattr(self, "_logprobs_top", None))
                 finally:
                     if self._slot._default_sampling is not None:
                         try:

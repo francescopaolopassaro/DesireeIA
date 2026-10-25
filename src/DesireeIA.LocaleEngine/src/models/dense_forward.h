@@ -377,7 +377,9 @@ public:
     size_t kv_bytes_per_pos() const;
     bool kv_quantized() const { return kv_quantized_; }
     bool export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v);
-    bool import_kv(size_t n, const uint8_t* k, const uint8_t* v);
+    bool import_kv(size_t n, const uint8_t* k, const uint8_t* v) { return import_kv(n, k, v, n); }
+    // The first n positions of buffers laid out layer by layer with src_n positions per layer (src_n >= n).
+    bool import_kv(size_t n, const uint8_t* k, const uint8_t* v, size_t src_n);
     size_t cache_len() const { return cache_cols_; }
 
     // Vision/multimodal support: overrides the embedding lookup for one
@@ -432,6 +434,12 @@ public:
     // this scope.
     bool load_lora(const std::string& lora_gguf_path, float scale, std::string& err) override;
     void clear_lora() override;
+
+    // Attention probe (see IForwardEngine). Off = untouched code paths. On, the GPU decode (fused graphs
+    // included) adds one small kernel per layer and the draw stays on the host.
+    bool set_attention_probe(bool on) override;
+    bool attention_probe_shape(uint32_t& layers, uint32_t& heads, uint32_t& positions, uint32_t& total) const override;
+    bool attention_probe_read(uint32_t layer, int32_t head, float* out, int32_t capacity, int32_t& n) override;
 
     // Prerouter routing prediction: predicts, from layer L's own data,
     // which experts layer L+1 is likely to route to, and fires the same
@@ -641,6 +649,11 @@ private:
     // grow_cache download on their own).
     bool kv_host_stale_ = false;
     void sync_host_kv();
+    // Several models in one process share ONE set of device buffers (KV cache, scratch). Whoever is about to use them calls
+    // this first: if another model held them, its rows are pulled home (when the host copy is behind) and this model's rows
+    // are uploaded in their place. A no-op for the model that already owns them, so a single model pays nothing.
+    void claim_device_kv();
+    bool cuda_counted_ = false;           // counted in the number of live CUDA models (the backend shuts down with the last one)
     // Set while the batch (prefill) path is filling a layer: write_kv_cache
     // then updates the host cache only and skips the per-position device
     // mirror, because the batch path uploads the whole range in ONE copy
@@ -652,6 +665,9 @@ private:
     // Filled by the DESIREEIA_CUDA_VERIFY debugging path only.
     std::vector<float> verify_proj_gpu_;
     uint32_t verify_layer_ = 0;
+#endif
+#ifndef DESIREEIA_CUDA_ENABLED
+    void claim_device_kv() {}               // no device buffers to hand over in a CPU-only build
 #endif
     // Whether MoE layers keep their experts stacked and quantized inside the
     // layer (fast, but only sound while layers stay resident) or go one
@@ -666,6 +682,16 @@ private:
     std::vector<float> v_cache_;
     size_t cache_capacity_ = 0;
     size_t cache_cols_ = 0;
+
+    // Attention probe state (diagnostics). Positions beyond kProbeMaxPos are not recorded.
+    static constexpr uint32_t kProbeMaxPos = 16384;
+    bool attn_probe_on_ = false;
+    bool probe_dirty_ = false;               // the device buffer must be (re)configured before the next step
+    uint32_t probe_pos_ = 0;                 // position of the token the capture belongs to
+    std::vector<float> probe_cpu_;           // [layer][head][kProbeMaxPos] normalised weights, CPU-captured layers
+    std::vector<uint8_t> probe_src_;         // per layer: 0 nothing, 1 CPU buffer, 2 device buffer
+    bool probe_gpu_ = false;                 // the device probe is configured (quantized KV cache on CUDA)
+    void probe_configure_();
 
     // Q8_0-quantized KV cache, used instead of k_cache_/v_cache_ when
     // kv_quantized_ is set (see open()'s kv_quantized parameter). Roughly

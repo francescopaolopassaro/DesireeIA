@@ -380,6 +380,11 @@ size_t engine_context_size(const desireeia_ctx* ctx);
 uint32_t engine_context_length_trained(const desireeia_ctx* ctx);
 // Token-level tool-call constraint (core/tool_grammar.h); empty open_tag
 // turns it off.
+// JSON-schema constraint on the whole output; an empty schema turns it off. false + error when the schema is unusable.
+bool engine_set_json_schema(desireeia_ctx* ctx, const std::string& schema, std::string& error);
+// Teacher-forced log-probability (and entropy, nats) of tokens[from .. n) given what precedes them.
+bool engine_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n, size_t from, float* out_logprob, float* out_entropy);
+bool engine_set_logit_bias(desireeia_ctx* ctx, const int32_t* ids, const float* bias, size_t n);
 bool engine_set_tool_constraint(desireeia_ctx* ctx, const std::string& open_tag, const std::string& close_tag,
                                 const std::vector<std::string>& tool_names);
 // Full OpenAI-shaped messages (tool role, assistant tool_calls) and tool
@@ -412,6 +417,19 @@ bool engine_set_reasoning_budget(desireeia_ctx* ctx, int32_t max_tokens, const s
                                  const std::string& close_tag);
 bool engine_set_confidence_tracking(desireeia_ctx* ctx, bool enabled);
 bool engine_get_token_stats(const desireeia_ctx* ctx, float& logprob, float& entropy, float& max_prob);
+// The k most likely tokens of the last drawn token (needs confidence tracking). k = 0 turns it off.
+bool engine_set_top_candidates(desireeia_ctx* ctx, int32_t k);
+bool engine_get_top_candidates(const desireeia_ctx* ctx, int32_t* ids, float* logprobs, int32_t capacity, int32_t& n);
+// Prefix store: K/V of earlier prompts kept in host memory (budget 0 = off).
+bool engine_set_prefix_cache(desireeia_ctx* ctx, uint64_t budget_bytes, int32_t min_tokens);
+// The kept prompts on disk (one file each) and back; load needs the store switched on (its budget caps what is read).
+bool engine_prefix_cache_save(desireeia_ctx* ctx, const char* dir, int32_t& written, std::string& err);
+bool engine_prefix_cache_load(desireeia_ctx* ctx, const char* dir, int32_t& loaded, std::string& err);
+bool engine_prefix_cache_info(desireeia_ctx* ctx, uint64_t& bytes, int32_t& entries, uint64_t& hits, uint64_t& restored_tokens);
+// Attention probe: where the model looked when it decoded the last token (see desireeia_set_attention_probe).
+bool engine_set_attention_probe(desireeia_ctx* ctx, bool enabled);
+bool engine_attention_shape(desireeia_ctx* ctx, uint32_t& layers, uint32_t& heads, uint32_t& positions, uint32_t& total);
+bool engine_attention_read(desireeia_ctx* ctx, uint32_t layer, int32_t head, float* out, int32_t capacity, int32_t& n);
 
 // LoRA adapters (Recover-LoRA). Forwards to IForwardEngine::load_lora/
 // clear_lora — DESIREEIA_ERR_NOT_SUPPORTED-equivalent (returns false) for
@@ -604,6 +622,12 @@ DESIREEIA_INTERNAL bool cuda_kv_cache_download(void* k_host, void* v_host,
                                               size_t total_bytes);
 DESIREEIA_INTERNAL bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v,
                                            size_t bytes);
+// Drops every captured graph (another model is taking over the device).
+DESIREEIA_INTERNAL void cuda_drop_graphs();
+// Tells the decode attention which kernel to use for the next step: grouped (long contexts) or per head (short ones).
+DESIREEIA_INTERNAL void cuda_set_attention_long(bool long_context);
+// Device -> host for a byte range (waits): snapshot of the first positions of each layer without moving the rest.
+DESIREEIA_INTERNAL bool cuda_kv_cache_read(size_t byte_off, void* k, void* v, size_t bytes);
 
 // Causal attention (GQA) + output projection in a single episode: q goes
 // up once, attention reads the KV cache already on device and its output
@@ -737,6 +761,11 @@ struct CudaLayerBatchArgs {
 DESIREEIA_INTERNAL int cuda_layer_forward_batch(const CudaLayerBatchArgs& args);
 DESIREEIA_INTERNAL int cuda_prefill_chunk_tokens();
 
+// Attention probe (diagnostics): raw decode scores per [layer][head][position] in a device buffer.
+// configure(false, ...) frees it. read copies one layer's [n_head][max_pos] block to the host.
+DESIREEIA_INTERNAL bool cuda_attention_probe_configure(bool enabled, uint32_t n_layers, uint32_t n_head, uint32_t max_pos,
+                                                       size_t layer_stride_bytes);
+DESIREEIA_INTERNAL bool cuda_attention_probe_read(uint32_t layer, float* host_out);
 DESIREEIA_INTERNAL int cuda_attention_out(const void* d_wo_qs, const void* d_wo_scale,
                                          const float* q, uint32_t n_head, uint32_t heads_per_kv,
                                          uint32_t head_dim, uint32_t kv_dim,

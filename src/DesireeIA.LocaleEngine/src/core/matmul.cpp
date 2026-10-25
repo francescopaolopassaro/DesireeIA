@@ -515,10 +515,19 @@ void unpack_row(I8Src src, const uint8_t* row, size_t cols, int8_t* q, float* a,
     case I8Src::Q4_0: {
         const block_q4_0* x = reinterpret_cast<const block_q4_0*>(row);
         for (size_t b = 0; b < cols / 32; ++b) {
+#if defined(__AVX2__)
+            {
+                const __m128i v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[b].qs));
+                const __m128i m = _mm_set1_epi8(0x0F), e = _mm_set1_epi8(8);
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(q + b * 32), _mm_sub_epi8(_mm_and_si128(v, m), e));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(q + b * 32 + 16), _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16(v, 4), m), e));
+            }
+#else
             for (int j = 0; j < 16; ++j) {
                 q[b * 32 + j] = (int8_t) ((x[b].qs[j] & 0x0F) - 8);
                 q[b * 32 + j + 16] = (int8_t) ((x[b].qs[j] >> 4) - 8);
             }
+#endif
             a[2 * b] = a[2 * b + 1] = desireeia_fp16_to_fp32(x[b].d);
         }
         break;
@@ -551,6 +560,24 @@ void unpack_row(I8Src src, const uint8_t* row, size_t cols, int8_t* q, float* a,
                 get_scale_min_k4(2 * j + 1, scales, &sc, &mn);
                 a[2 * b1] = a[2 * b1 + 1] = d * sc;
                 m[2 * b1] = m[2 * b1 + 1] = dmin * mn;
+#if defined(__AVX2__)
+                {
+                    const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql));
+                    const __m256i m = _mm256_set1_epi8(0x0F);
+                    __m256i lo = _mm256_and_si256(v, m);
+                    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), m);
+                    if (five) {
+                        const __m256i hv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+                        const __m256i zero = _mm256_setzero_si256(), sixteen = _mm256_set1_epi8(16);
+                        const __m256i z1 = _mm256_cmpeq_epi8(_mm256_and_si256(hv, _mm256_set1_epi8((char) u1)), zero);
+                        const __m256i z2 = _mm256_cmpeq_epi8(_mm256_and_si256(hv, _mm256_set1_epi8((char) u2)), zero);
+                        lo = _mm256_add_epi8(lo, _mm256_andnot_si256(z1, sixteen));
+                        hi = _mm256_add_epi8(hi, _mm256_andnot_si256(z2, sixteen));
+                    }
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + b0 * 32), lo);
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + b1 * 32), hi);
+                }
+#else
                 for (int l = 0; l < 32; ++l) {
                     int lo = ql[l] & 0x0F, hi = ql[l] >> 4;
                     if (five) {
@@ -560,6 +587,7 @@ void unpack_row(I8Src src, const uint8_t* row, size_t cols, int8_t* q, float* a,
                     q[b0 * 32 + l] = (int8_t) lo;
                     q[b1 * 32 + l] = (int8_t) hi;
                 }
+#endif
                 ql += 32;
                 u1 <<= 2; u2 <<= 2;
             }
@@ -576,12 +604,30 @@ void unpack_row(I8Src src, const uint8_t* row, size_t cols, int8_t* q, float* a,
             const int8_t* sc = x->scales;
             for (int n = 0; n < 2; ++n) {            // 128 weights = four 32-blocks
                 const size_t b = i * 8 + n * 4;
+#if defined(__AVX2__)
+                {
+                    const __m256i qa = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql));
+                    const __m256i qb = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ql + 32));
+                    const __m256i hv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qh));
+                    const __m256i m4 = _mm256_set1_epi8(0x0F), m2 = _mm256_set1_epi8(3), off = _mm256_set1_epi8(32);
+                    auto hi2 = [&](int sh) { return _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(hv, sh), m2), 4); };
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + (b + 0) * 32),
+                        _mm256_sub_epi8(_mm256_or_si256(_mm256_and_si256(qa, m4), hi2(0)), off));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + (b + 1) * 32),
+                        _mm256_sub_epi8(_mm256_or_si256(_mm256_and_si256(qb, m4), hi2(2)), off));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + (b + 2) * 32),
+                        _mm256_sub_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qa, 4), m4), hi2(4)), off));
+                    _mm256_storeu_si256(reinterpret_cast<__m256i*>(q + (b + 3) * 32),
+                        _mm256_sub_epi8(_mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(qb, 4), m4), hi2(6)), off));
+                }
+#else
                 for (int l = 0; l < 32; ++l) {
                     q[(b + 0) * 32 + l] = (int8_t) (((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32);
                     q[(b + 1) * 32 + l] = (int8_t) (((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
                     q[(b + 2) * 32 + l] = (int8_t) (((ql[l +  0] >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32);
                     q[(b + 3) * 32 + l] = (int8_t) (((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32);
                 }
+#endif
                 for (int k = 0; k < 8; ++k) a[2 * b + k] = d * sc[k];
                 ql += 64; qh += 32; sc += 8;
             }

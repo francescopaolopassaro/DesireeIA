@@ -69,7 +69,7 @@ namespace {
 #define DESIREEIA_EMIT(level, msg) emit_impl(__FILE__, __LINE__, __func__, (level), (msg))
 
 DESIREEIA_API const char* desireeia_version(void) {
-    return "0.2.1";
+    return "0.3.0";
 }
 
 DESIREEIA_API desireeia_error desireeia_set_logger(desireeia_log_cb cb, void* user) {
@@ -832,6 +832,42 @@ DESIREEIA_API desireeia_error desireeia_set_tool_constraint(desireeia_ctx* ctx, 
     ABI_GUARD_END
 }
 
+// ---- JSON schema constraint ----------------------------------------------
+
+DESIREEIA_API desireeia_error desireeia_set_json_schema(desireeia_ctx* ctx, const char* schema_json) {
+    ABI_GUARD_BEGIN
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    std::string error;
+    if (!desireeia::engine_set_json_schema(ctx, schema_json ? schema_json : "", error)) {
+        tl_last_error = error;
+        return DESIREEIA_ERR_PARSE;
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+// ---- scoring and logit bias -------------------------------------------------
+
+DESIREEIA_API desireeia_error desireeia_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
+                                                     size_t from_index, float* out_logprob, float* out_entropy) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !tokens || !out_logprob || from_index < 1 || from_index >= n_tokens) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_score_tokens(ctx, tokens, n_tokens, from_index, out_logprob, out_entropy)) {
+        return DESIREEIA_ERR_NOT_SUPPORTED;
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_set_logit_bias(desireeia_ctx* ctx, const int32_t* token_ids, const float* bias,
+                                                       size_t n) {
+    ABI_GUARD_BEGIN
+    if (!ctx || (n && (!token_ids || !bias))) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_logit_bias(ctx, token_ids, bias, n)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
 // ---- sampling extras, reasoning budget, confidence ----------------------
 
 DESIREEIA_API desireeia_error desireeia_set_sampling_ext(desireeia_ctx* ctx, const desireeia_sampling_ext* params) {
@@ -874,6 +910,90 @@ DESIREEIA_API desireeia_error desireeia_get_token_stats(const desireeia_ctx* ctx
     ABI_GUARD_BEGIN
     if (!ctx || !out_logprob || !out_entropy || !out_max_prob) return DESIREEIA_ERR_INVALID_ARG;
     if (!desireeia::engine_get_token_stats(ctx, *out_logprob, *out_entropy, *out_max_prob)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_set_top_candidates(desireeia_ctx* ctx, int32_t k) {
+    ABI_GUARD_BEGIN
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_top_candidates(ctx, k)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_get_top_candidates(const desireeia_ctx* ctx, int32_t* out_ids,
+                                                           float* out_logprobs, int32_t capacity, int32_t* out_n) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !out_ids || !out_logprobs || !out_n) return DESIREEIA_ERR_INVALID_ARG;
+    int32_t n = 0;
+    if (!desireeia::engine_get_top_candidates(ctx, out_ids, out_logprobs, capacity, n)) return DESIREEIA_ERR_INVALID_ARG;
+    *out_n = n;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_set_prefix_cache(desireeia_ctx* ctx, uint64_t budget_bytes, int32_t min_tokens) {
+    ABI_GUARD_BEGIN
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_prefix_cache(ctx, budget_bytes, min_tokens)) return DESIREEIA_ERR_NOT_SUPPORTED;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_get_prefix_cache_info(desireeia_ctx* ctx, uint64_t* out_bytes, int32_t* out_entries,
+                                                              uint64_t* out_hits, uint64_t* out_restored_tokens) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !out_bytes || !out_entries || !out_hits || !out_restored_tokens) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_prefix_cache_info(ctx, *out_bytes, *out_entries, *out_hits, *out_restored_tokens)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_save_prefix_cache(desireeia_ctx* ctx, const char* dir, int32_t* out_written) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !dir || !out_written) return DESIREEIA_ERR_INVALID_ARG;
+    std::string err;
+    if (!desireeia::engine_prefix_cache_save(ctx, dir, *out_written, err)) return session_error(__func__, err);
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_load_prefix_cache(desireeia_ctx* ctx, const char* dir, int32_t* out_loaded) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !dir || !out_loaded) return DESIREEIA_ERR_INVALID_ARG;
+    std::string err;
+    if (!desireeia::engine_prefix_cache_load(ctx, dir, *out_loaded, err)) return session_error(__func__, err);
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_set_attention_probe(desireeia_ctx* ctx, int32_t enabled) {
+    ABI_GUARD_BEGIN
+    if (!ctx) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_attention_probe(ctx, enabled != 0)) return DESIREEIA_ERR_NOT_SUPPORTED;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_get_attention_shape(desireeia_ctx* ctx, int32_t* out_layers, int32_t* out_heads,
+                                                            int32_t* out_positions, int32_t* out_total) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !out_layers || !out_heads || !out_positions || !out_total) return DESIREEIA_ERR_INVALID_ARG;
+    uint32_t l = 0, h = 0, p = 0, t = 0;
+    if (!desireeia::engine_attention_shape(ctx, l, h, p, t)) return DESIREEIA_ERR_INVALID_ARG;
+    *out_layers = (int32_t) l; *out_heads = (int32_t) h; *out_positions = (int32_t) p; *out_total = (int32_t) t;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_get_attention(desireeia_ctx* ctx, int32_t layer, int32_t head, float* out_weights,
+                                                      int32_t capacity, int32_t* out_n) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !out_weights || !out_n || layer < 0 || capacity < 0) return DESIREEIA_ERR_INVALID_ARG;
+    int32_t n = 0;
+    if (!desireeia::engine_attention_read(ctx, (uint32_t) layer, head, out_weights, capacity, n)) return DESIREEIA_ERR_INVALID_ARG;
+    *out_n = n;
     return DESIREEIA_OK;
     ABI_GUARD_END
 }

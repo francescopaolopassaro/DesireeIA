@@ -1,5 +1,139 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.3.0 · PyPI `desireeia` 0.3.0 · `desireeia-server` 0.3.0 · engine 0.3.0 (ABI 5)
+
+What the model considered besides what it wrote, and where it looked when it wrote it.
+Both are diagnostics: **off by default, additive, and with them off the engine is not
+slower** — measured below. Wrappers built for ABI 3 or 4 keep working against this engine;
+the new calls say "needs ABI 5" on an older one.
+
+### Added — output valid against a JSON schema
+
+- `desireeia_set_json_schema(ctx, schema_json)`: the whole output becomes a document valid against the schema. A byte-level automaton follows the generated text (one stack per live alternative, so `anyOf` / `oneOf` / type lists need no backtracking); a token is allowed when its decoded piece keeps at least one stack alive, and the end of generation only when the document is complete. The answer always parses and always has the required keys and types.
+- Supported: `type` (also as a list), `properties` / `required` / `additionalProperties`, `items` / `minItems` / `maxItems`, `minLength` / `maxLength`, `enum` / `const`, `anyOf` / `oneOf`, a single-entry `allOf`, `$ref` to `#` and `#/$defs/...` / `#/definitions/...` (recursion included), and `"json"` for any JSON value. Accepted but not enforced: `pattern`, `format`, `minimum` / `maximum`, `uniqueItems`, `prefixItems`. An object that lists `properties` takes only those keys unless `additionalProperties` allows more (at most 64 properties per object).
+- Masks are cached by automaton state, and a free-text string takes the plain-piece fast path. Measured on four models: every answer parsed with all the required keys; tokens per second fall by about a quarter while a schema is set (the draw is on the host), Gemma 3 4B with its 262k-token vocabulary more.
+- `SetJsonSchema` (C#), `set_json_schema` (Python). `desireeia-server`: `response_format` (`json_object`, `json_schema`) is enforced by the engine; a schema it cannot enforce is a 400 on `response_format`.
+
+### Added — scoring text the model did not write
+
+- `desireeia_score_tokens(ctx, tokens, n, from_index, out_logprob, out_entropy)`: the log-probability of `tokens[from_index..]` given what precedes each, and the entropy (nats) of the distribution at each position. Nothing is generated; the cache ends up holding the text so a following predict that starts with it reuses it. Dense (attention) models.
+- `ScoreTokens` (C#), `score_tokens` / `score_text` (Python); `desireeia-server`: `POST /v1/score` with `text` (tokens, log-probabilities, entropy, total, mean, perplexity) or `candidates` (ranked by likelihood).
+
+### Added — logit bias and several answers
+
+- `desireeia_set_logit_bias(ctx, ids, bias, n)`: added to those tokens' logits before every draw; `-100` forbids a token. `SetLogitBias` (C#), `set_logit_bias` (Python), the OpenAI `logit_bias` field in the server.
+- `desireeia-server`: `n` up to 8 on `/v1/chat/completions` (not streamed): the prompt is prefilled once, the answers are drawn one after the other, the usage counts the prompt once.
+
+### Faster — prompt processing on the CPU
+
+- Weights are unpacked and interleaved with vector instructions (an 8×8 transpose of 32-bit words, nibble and bit-plane decode of Q4_0 / Q4_K / Q5_K / Q6_K): the per-call unpack costs a third to a half of what it did, which is most of a short prompt. Bit-identical results.
+- The chain of dependent dot-product instructions in the Q4_K / Q5_K / Q8_0 kernel is split in two (the ports were idle waiting for the previous result), the shift correction is the accumulators' starting value, tokens are taken in tiles whose activations stay in the L2, and the q / k / v and gate / up products quantize their shared input once. Same integers, same tokens, same probabilities on four models; a 16-row kernel was tried and dropped (slower with this compiler's register allocation).
+
+### Added — top candidates per token
+
+- `desireeia_set_top_candidates(ctx, k)` / `desireeia_get_top_candidates(...)`: with
+  confidence tracking on, the `k` (0–16) most likely tokens of the distribution each token was
+  drawn from, best first, with their log-probability over the whole vocabulary. The first is the
+  chosen token at temperature 0 and its probability equals `max_prob`.
+- `SetTopCandidates` / `GetTopCandidates` (C#), `set_top_candidates` / `top_candidates` (Python).
+- Costs one comparison per vocabulary entry per token **only while on**; nothing while off.
+
+### Added — attention probe
+
+- `desireeia_set_attention_probe`, `desireeia_get_attention_shape`, `desireeia_get_attention`:
+  while on, the attention weights of the last **decoded** token are kept for every layer and head
+  and read back after each token (per head, or `head = -1` for the mean over the heads; they sum to 1;
+  outside a sliding window they are 0). Up to 16384 positions are recorded.
+- Works on the GPU (quantized KV cache, the default — one small extra kernel per layer, also inside the
+  captured whole-layer graphs) and on the CPU. A float KV cache on the GPU and MLA models are not covered
+  (the layer reports nothing). A prefill is not captured.
+- `SetAttentionProbe` / `GetAttentionShape` / `GetAttention` (C#), `set_attention_probe` /
+  `attention_shape` / `attention` (Python).
+- Turning it on keeps the token draw on the host (no draw ahead of the probe). Output is identical with the
+  probe on or off.
+
+### Faster — decode attention for grouped-query models
+
+- The GPU decode attention gave every query head its own block, so a model with several query heads per KV head read and dequantized the same
+  keys and values once per head. Profiled at a 7.2k-token context (MiniCPM5 2B, 8 query heads per KV head) it was compute-bound: 72% of the
+  SM's issue slots, 4% of the memory bandwidth, 490 us per layer. The new kernel handles a whole KV head per block — queries in shared memory,
+  one key per thread for the scores, one dimension per thread for the values, online softmax per tile — and writes the same partials the
+  existing merge kernel reads.
+- Decode tokens per second at 7.2–7.6k tokens of context: MiniCPM5 2B **29 → 50 (+69%)**, Qwen2.5-Coder 3B 27 → 41 (+49%), Spark-X2.5 4B 41 → 47 (+14%),
+  Gemma 3 4B 50 → 52 (+4%); at 1.8–1.9k tokens +23%, +15%, +5%, +3%. (One cold-start reading of the new binary, 55.9 tok/s on a short MiniCPM prompt, did not reproduce in twelve further readings: 66.2 against 66.1.) Short prompts are unchanged: the new kernel is used from 96 tokens of context
+  on (the graphs are recaptured once, when a context grows past that line), the old one below.
+- A different arithmetic order, so a long greedy generation can diverge from 0.2.1 at a near-tie; both kernels are equally close to the CPU path
+  (mean chosen-token log-probability difference 0.0096 and 0.0097). `DESIREEIA_CUDA_ATTN_V1=1` selects the old kernel.
+
+### Added — several models in one process
+
+- Two or more models can now live on the GPU in the same process and be used turn by turn (a Lead and a subagent, a chat model and a coding
+  model). They share one set of device buffers; the model that is about to run takes them, its KV rows are uploaded and the previous owner's are
+  pulled home when its host copy is behind. A single model pays nothing (a pointer comparison). The CUDA backend now shuts down with the LAST
+  model, not with the first one destroyed.
+- Checked token for token: two models alternating one token at a time produce exactly what each produces alone, and the first keeps working after the
+  second is destroyed (`desireeia_probe_test <model> two`, `DSR_MODEL2`).
+- Not covered: running them at the same instant from several threads, and mixing a CPU-only model with a GPU one in the same process (the backend is chosen per process).
+
+### Added — prefix store (several prompts kept warm)
+
+- `desireeia_set_prefix_cache(ctx, budget_bytes, min_tokens)` / `desireeia_get_prefix_cache_info`: the session cache remembers only
+  the LAST prompt, so a chat app that serves several conversations, roles or subagents through one model prefilled their shared
+  system prompt again at every switch. With a budget, the engine keeps the prompt it is about to overwrite in host memory
+  (when at least `min_tokens` positions would be lost) and gives a later prompt the longest prefix it shares with any kept one
+  back, instead of a prefill. Least recently used entries are dropped when the budget is exceeded.
+- **Off by default** (budget 0): nothing is stored and nothing changes. The restored K/V are exactly what a prefill computed;
+  as in any session reuse the last prompt token then runs on its own, so generation can differ from a full prefill only by
+  floating-point rounding at a near-tie.
+- `SetPrefixCache` / `GetPrefixCacheInfo` (C#), `set_prefix_cache` / `prefix_cache_info` (Python).
+- Measured (Spark-X2.5 4B, RTX 1000 Ada 6 GB): coming back to a prompt of 1169 tokens prefilled in 562 ms with the live session
+  alone and in 110 ms with the store; at 7629 tokens **3481 ms against 270 ms**. The price is paid when a prompt is
+  replaced: about +175 ms to keep a 7.6k-token prompt (1 GB of host memory for two such prompts).
+- The store can be written to disk (`desireeia_save_prefix_cache`, `desireeia_load_prefix_cache`; `SavePrefixCache` / `LoadPrefixCache`, `save_prefix_cache` / `load_prefix_cache`): one file per kept prompt, checked against the model and cache layout on load, so a chat app's system prompt survives a restart.
+- Saving and restoring a session image (and the store) now moves only the positions in use between the GPU and the host,
+  layer by layer, instead of the whole allocation.
+
+### Added — token probabilities in `desireeia-server` (0.3.0)
+
+- `/v1/chat/completions` accepts `logprobs: true` and `top_logprobs` (0–16): every choice carries
+  `logprobs.content[]` with `token`, `logprob`, `bytes` and `top_logprobs` — in the response and, one entry per chunk, in the stream.
+  The server used to refuse the field. `/v1/completions` (the legacy shape) still refuses it, with a message pointing to chat completions.
+- Needs an engine with ABI 5; on an older one the request fails with a clear "not supported" error.
+- Probabilities are tracked only for requests that ask for them (the setting is reset for the next request).
+
+### Measured (RTX 1000 Ada 6 GB laptop, old and new engine alternated, 20 s rest between runs)
+
+| Model | Prompt | Old engine | New engine, features off |
+|---|---|---|---|
+| Spark-X2.5 4B Q4_K_M | 32 tokens | 55.4 / 55.8 tok/s | 56.0 / 55.9 tok/s |
+| Spark-X2.5 4B Q4_K_M | 792 tokens (prefill ~400 ms) | 50.3 / 50.1 tok/s | 50.5 / 50.4 tok/s |
+| Qwen2.5-Coder 3B Q8_0 | 46 tokens | 50.2 / 50.2 tok/s | 50.1 / 50.1 tok/s |
+| Gemma 3 4B Q4_K_M | 24 tokens | 58.4 / 58.6 tok/s | 58.3 / 58.2 tok/s |
+| MiniCPM5 2B Q8_0 | 24 / 1824 / 7224 tokens | 67.0 / 50.1 / 29.3 tok/s | 66.9 / 50.0 / 29.2 tok/s |
+
+Longer prompts (Spark-X2.5 4B, same GPU, new engine): prefill stays linear at about 2200 tokens/s — 1932 tokens in 0.9 s,
+3832 in 1.7 s, 7632 in 3.5 s — and decode slows from 55 to 49, 46 and 41 tok/s at those contexts.
+
+Features on (Spark 4B): top candidates 54.0 vs 54.1 tok/s with confidence tracking alone; attention probe 52.2 tok/s
+against 55.2 (about −5%).
+
+### Checked
+
+- Native self test 82 cases (3 new: top candidates), agentic test 131, session test, on the GPU build and on a CPU-only build;
+  server 193 tests (7 new: probabilities); Python 56; C# 44.
+- `desireeia_probe_test <model> check`: top candidates sorted and consistent, attention rows normalised on every
+  sampled layer and head, generated tokens identical with the features on and off — Spark 4B, Gemma 3 4B (sliding-window layers),
+  Qwen2.5-Coder 3B, MiniCPM 2B; GPU and CPU agree on where the model looked.
+- The C# test classes that load a model now share one xUnit collection: the CUDA backend
+  holds one global scratch/KV cache, so two models cannot run on the GPU in the same process at once).
+
+### Notes
+
+- New benchmarks: `desireeia_probe_test <model> [speed|stats|topk|attn|check|dump]` and `desireeia_speed_test` (the same
+  source without the new calls, so it also runs against an older engine). `DSR_REPEAT=N` lengthens the prompt, `DSR_BACKEND=cpu`
+  forces the CPU.
+- Prefill ideas collected for the next releases are in `docs/performance_plan.md` ("Prefill: nuovi punti").
+
 ## NuGet `DesireeIA` 0.2.1 · PyPI `desireeia` 0.2.1 · `desireeia-server` 0.2.1 · engine 0.2.1 (ABI 4)
 
 Found by running small local models as an agent, and what their logs showed:

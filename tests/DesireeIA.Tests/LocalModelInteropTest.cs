@@ -10,6 +10,8 @@ using Xunit;
 
 namespace DesireeIA.Tests;
 
+// One model on the GPU at a time: the CUDA backend keeps a single global scratch/KV cache, so test classes that load a model share one xUnit collection (they run one after the other).
+[Collection("native-model")]
 public class LocalModelInteropTest
 {
     private static bool NativeAvailable()

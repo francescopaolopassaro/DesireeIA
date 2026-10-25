@@ -1,5 +1,5 @@
 # DesireeIA
-![Version 0.2.1](https://img.shields.io/badge/version-v0.2.1-blue)
+![Version 0.3.0](https://img.shields.io/badge/version-v0.3.0-blue)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
 **A local inference engine built for agents.** A native C++17 core with a stable C ABI, official packages for .NET (NuGet) and Python (PyPI), and an OpenAI-compatible server — where the things an agent needs are part of the engine itself, down to the token, instead of glue code around it.
@@ -54,9 +54,28 @@ DesireeIA is designed to provide high-performance AI integration tailored for pr
 - [x] Advanced hallucination mitigation and model tuning for Spark
 - [x] Multi-language bindings (Python SDK + OpenAI-compatible server, see "Python server" below)
 - [x] Agentic engine (0.2.0): context memory on SSD, token-level tool calls, native Jinja chat templates
+- [x] Token probabilities and the most likely alternatives of every token (0.3.0): `SetTopCandidates`, `GetTopCandidates`
+- [x] Attention probe: where the model looked, per layer and head, on the GPU and the CPU (0.3.0)
+- [x] Prefix store: several prompts kept warm, so going back to one skips its prefill — 3.5 s become 0.27 s at 7.6k tokens (0.3.0)
+- [x] `logprobs` / `top_logprobs` in the OpenAI-compatible server, streaming included (0.3.0)
+- [x] Saving and restoring a session moves only the positions in use between GPU and host
+- [x] Speed measured at 2k, 4k and 8k tokens on three model families, and an old-engine/new-engine speed check on every change
 - [ ] Tool-call constraint driven by each tool's JSON schema (required fields, types)
 - [ ] Project-wide context memory (index a whole folder, symbol-aware outlines)
 - [ ] Comprehensive API documentation and deployment guides
+- [x] Several models in one process on the GPU, used turn by turn (0.3.0): the device buffers change hands, each model produces what it produces alone
+- [ ] Speculative decoding with a small draft model (two models in one process now work; it needs a draft that shares the target's vocabulary)
+- [ ] Speculative decoding without a draft model: the n-gram lookup and the batched verification exist in the engine but are off — measured slower on prompts that do not repeat, so they need a gate on the recent acceptance rate before they can be on by default
+- [ ] A prefix tree for the prefix store: two prompts that share a long head are kept whole today, so the head is stored twice (the longest common prefix is already found and restored)
+- [ ] Several requests in one forward pass (continuous batching): one sequence per context today; the server runs parallel replicas of a model instead
+- [ ] AVX-512 kernels (the capability is detected; no AVX-512 machine here to verify them on)
+- [ ] CPU and GPU models in the same process (the backend is chosen per process)
+- [x] Decode attention rebuilt for grouped-query models: MiniCPM5 2B at 7.2k tokens 29 → **50 tok/s (+69%)**, Qwen2.5-Coder 3B 27 → 41, Spark-X2.5 4B 41 → 47 (0.3.0)
+- [x] The prefix store persists on disk, so a chat app's system prompt survives a restart (0.3.0)
+- [x] Output valid against a JSON schema, guaranteed by the sampler (`SetJsonSchema`, `response_format` in the server) (0.3.0)
+- [x] Scoring of text the model did not write: log-probability and entropy per token, ranking of candidates (`ScoreTokens`, `POST /v1/score`) (0.3.0)
+- [x] Logit bias per request (`SetLogitBias`, `logit_bias` in the server) and `n` answers per prompt (0.3.0)
+- [x] Prompt decoding rebuilt for the CPU: weights unpacked with vector instructions, dot-product chains split, activations quantized once per layer input — same tokens, same probabilities (0.3.0)
 
 ---
 
@@ -97,6 +116,31 @@ Small reasoning models can spend the whole token allowance thinking, or repeat o
 - **Token confidence** — `SetConfidenceTracking(true)`, then `GetTokenStats()` after each token: log-probability, entropy of the whole distribution, probability of the most likely token. A flat distribution marks a guess (an invented file name, a made-up word).
 
 `desireeia-server` reads `reasoning_budget`, `min_p` and `dry_multiplier` from the request body.
+
+### What the model considered, and where it looked (0.3.0)
+
+Two diagnostics, both off by default and free when off:
+
+- **Top candidates** — `SetTopCandidates(5)` (needs `SetConfidenceTracking(true)`), then `GetTopCandidates()` after each token: the five most likely tokens of the distribution it was drawn from, with their log-probabilities.
+- **Attention probe** — `SetAttentionProbe(true)`, then `GetAttentionShape()` and `GetAttention(layer, head)` after each decoded token: the normalised attention weights over the positions, per head or averaged (`head = -1`). About 5% slower on the GPU while on; the generated text is identical.
+
+Python: `set_top_candidates` / `top_candidates`, `set_attention_probe` / `attention_shape` / `attention`.
+
+### Several prompts kept warm — the prefix store (0.3.0)
+
+The session cache remembers the last prompt only. `SetPrefixCache(1UL << 30)` keeps the prompts a new one replaces (up to that many bytes of host memory), so going back to another conversation, role or subagent that starts from the same long system prompt skips its prefill: 3.5 s become 0.27 s on a 7.6k-token prompt. Off by default; `GetPrefixCacheInfo()` says what it saved. Python: `set_prefix_cache` / `prefix_cache_info`.
+
+`desireeia-server` now answers `logprobs` / `top_logprobs` on `/v1/chat/completions` (OpenAI shape, streaming included).
+
+### Output you can count on, text you can measure, tokens you can steer (0.3.0)
+
+Three calls that make the engine usable as a building block, not only as a chat backend. All of them are off or empty by default and cost nothing while unused.
+
+- **JSON schema** — `SetJsonSchema(schema)` / `set_json_schema(schema)` makes the whole output a document valid against the schema. The sampler only draws tokens that keep the text a valid prefix of one, and only lets the generation end once the document is complete, so the answer always parses and always has the required keys and types, even from a 2B model that would not have managed it alone. Supported: `type` (also as a list), `properties` / `required` / `additionalProperties`, `items` / `minItems` / `maxItems`, `minLength` / `maxLength`, `enum` / `const`, `anyOf` / `oneOf`, `$ref` to `#` and `#/$defs/...` (recursive schemas included). `"json"` means any JSON value; `null` turns it off. An object that lists `properties` accepts only those keys unless `additionalProperties` says otherwise. Not enforced (accepted, ignored): `pattern`, `format`, `minimum` / `maximum`. The mask is computed from a byte-level automaton, so it does not depend on the tokenizer. Measured on four models, every answer parsed with all required keys; the price is the host-side draw: about a quarter fewer tokens per second than free text while a schema is set (MiniCPM5 2B 65 → 51, Spark-X2.5 4B 53 → 40, Qwen2.5-Coder 3B 49 → 37; Gemma 3 4B, with a 262k-token vocabulary, 55 → 29).
+- **Scoring** — `ScoreTokens(tokens, fromIndex)` / `score_tokens` / `score_text(text, prefix)` return the log-probability of each token of a text the model did not write, and the entropy of its distribution at that position, without generating anything. Compare two versions of a prompt, see which tokens surprise the model, pick a label by the likelihood of each option. The server exposes it as `POST /v1/score`: `{"prompt": "...", "text": "..."}` gives tokens, log-probabilities, entropy, total, mean and perplexity; `{"prompt": "...", "candidates": ["yes", "no"]}` ranks the candidates.
+- **Logit bias** — `SetLogitBias({tokenId: bias})` / `set_logit_bias`: added to those tokens' logits before every draw (`-100` forbids a token). `desireeia-server` reads the OpenAI `logit_bias` field.
+
+`desireeia-server` also honours `response_format` (`json_object` and `json_schema`) with the engine's schema constraint instead of a prompt instruction, and answers `n` > 1 (up to 8, not streamed): the prompt is prefilled once and the answers are drawn one after the other.
 
 ### Every model's own chat template
 
@@ -661,6 +705,7 @@ appears here only when the feature is absent from their repository.
 | Web server installable with `pip install desireeia-server` | yes | no (distributed as binaries) |
 | One command to start, stop and check the server in the background, same on Windows, Linux and macOS (`desireeia-server-ctl`) | yes | no |
 | Context memory in the engine: files and tool output kept on SSD outside the prompt and KV cache, searched and edited by line range, written back to the source file | yes | no |
+| Attention weights of the token just decoded — per layer and head, normalised — through one library call (`GetAttention`), on the GPU and the CPU | yes (0.3.0) | no call in `llama.h`; the way in is a graph-evaluation callback (`cb_eval`) that has to know the graph's tensors |
 
 Both ship an OpenAI-compatible HTTP server with a web UI; that is common
 ground, not a difference.
@@ -712,14 +757,74 @@ On the same power budget DesireeIA also does more work per watt: on Gemma 3
 llama.cpp's 69, which on a power-capped laptop GPU is what decides sustained
 speed and battery life.
 
+**Nothing got slower, and what got faster (0.3.0)** — the previous engine and the new one, alternated on the same laptop with a 20-second rest
+between runs, new features off. Decode tokens per second, median of four readings:
+
+| Model | Short prompt | 1.8–1.9k tokens | 7.2–7.6k tokens |
+|---|---:|---:|---:|
+| MiniCPM5 2B Q8_0 — previous engine | 66.1 | 49.5 | 29.3 |
+| MiniCPM5 2B Q8_0 — new engine | 66.2 | **61.0 (+23%)** | **49.5 (+69%)** |
+| Qwen2.5-Coder 3B Q8_0 — previous engine | 50.0 | 39.7 | 27.1 |
+| Qwen2.5-Coder 3B Q8_0 — new engine | 50.1 | **45.5 (+15%)** | **40.5 (+49%)** |
+| Spark-X2.5 4B Q4_K_M — previous engine | 54.7 | 47.9 | 41.2 |
+| Spark-X2.5 4B Q4_K_M — new engine | 54.8 | **50.5 (+5%)** | **46.9 (+14%)** |
+| Gemma 3 4B Q4_K_M — previous engine | 56.7 | 50.0 | 50.0 |
+| Gemma 3 4B Q4_K_M — new engine | 56.9 | **51.3 (+3%)** | **52.1 (+4%)** |
+
+Short prompts are unchanged to within the noise of the laptop (the new decode attention starts at 96 tokens of context and the old kernel
+stays below that line); prefill is untouched. Why it moved: the old decode attention gave every query head its own block, so a model with
+eight query heads per KV head dequantized the same keys eight times; profiled at 7.2k tokens it was compute-bound at 72% of the SM's issue
+slots while using 4% of the memory bandwidth. The new kernel serves a whole KV head per block (queries in shared memory, one key per thread
+for the scores, one dimension per thread for the values) and is a different arithmetic order, so a long greedy generation can diverge from
+the previous engine at a near-tie; against the CPU path both are equally close.
+
+**Going back to a prompt** (Spark-X2.5 4B, prefix store on — time to the first token of the second visit):
+
+| Prompt | Live session only | Prefix store | Faster by |
+|---|---:|---:|---:|
+| 1,169 tokens | 562 ms | **110 ms** | 5.1x |
+| 7,629 tokens | 3,481 ms | **270 ms** | **12.9x** |
+
+The same scenario on Gemma 3 4B restores a 1,461-token prompt in 67 ms, Qwen2.5-Coder 3B in 66 ms and MiniCPM5 2B in 57 ms (their first prefill
+of that prompt took 3.5, 5.4 and 4.0 s with the cold start included). Keeping a prompt costs about 175 ms extra at 7.6k tokens, once, when it is replaced.
+
+**Long contexts** (new engine, prefix store off):
+
+| Model | Context | Prefill | Decode |
+|---|---:|---:|---:|
+| Spark-X2.5 4B | 1,932 tokens | 910 ms (2,120 tok/s) | 50.5 tok/s |
+| Spark-X2.5 4B | 7,632 tokens | 3,450 ms (2,210 tok/s) | 46.9 tok/s |
+| MiniCPM5 2B | 1,824 tokens | 460 ms (3,950 tok/s) | 61.0 tok/s |
+| MiniCPM5 2B | 7,224 tokens | 2,040 ms (3,540 tok/s) | 49.5 tok/s |
+| Qwen2.5-Coder 3B | 7,245 tokens | 2,520 ms (2,870 tok/s) | 40.5 tok/s |
+
+Prefill stays linear in the prompt length — no quadratic drop up to 7.6k tokens. The diagnostics cost nothing while off; on, token probabilities
+cost about 2% (54.0 against 55.3 tok/s on Spark-X2.5 4B), the top candidates nothing more, and the attention probe about 5% (52.2 tok/s).
+
 **CPU only** (no GPU used — the path every Mac and non-NVIDIA PC takes):
 
-| Model | Prefill 512 (tok/s) | Generation (tok/s) |
-|---|---:|---:|
-| Spark-X2.5 4B Q4_K_M | 89 | 17 |
-| Gemma 3 4B Q4_K_M | 106 | 18 |
-| Qwen2.5-Coder 3B Q8_0 | 134 | 13 |
-| MiniCPM5 2B Q8_0 | 184 | 16 |
+| Model | Prefill, ~500 tokens, 0.2.1 | Prefill, ~500 tokens, **0.3.0** | Generation (tok/s) |
+|---|---:|---:|---:|
+| Spark-X2.5 4B Q4_K_M | 70 | **96** (+37%) | 17 |
+| Gemma 3 4B Q4_K_M | 92 | **118** (+28%) | 18 |
+| Qwen2.5-Coder 3B Q8_0 | 107 | **140** (+31%) | 13 |
+| MiniCPM5 2B Q8_0 | 120 | **218** (+82%) | 16 |
+
+Both columns were measured on the same laptop in the same hour, the old and the new engine alternated, median of three
+readings (first round after a 30-second rest, so the CPU is warm: the figures an idle machine gives are higher, and the
+laptop throttles — the old engine's earlier published figures of 89 / 106 / 134 / 184 were taken cooler). The average of
+the four models is **143 tok/s**. Same tokens and same log-probabilities as 0.2.1 on every model, on the CPU and on the GPU.
+
+Long prompts, where attention grows with the square of the length (same method): MiniCPM5 2B at 7,224 tokens **86 → 111–126 tok/s**,
+Spark-X2.5 4B at 7,632 tokens **48 → 85–88 tok/s** (one reading of the old engine). A 150–170-token prompt is not faster
+(about 60–70 tok/s on Spark either way): a cost of about a second per pass that does not depend on the length is still
+to be found.
+
+What changed: weights are unpacked with vector instructions, the chain of dependent dot products in the Q4_K / Q5_K / Q8_0 kernel
+is split, the activations are quantized once per layer input and with vector instructions, the shift correction is the accumulators'
+starting value, tokens go through in tiles that stay in the L2, and the prefill attention takes two rows at a time with the
+output kept in registers. Tried and dropped (slower or worse): a 16-row kernel, scales applied once per 256 weights,
+weights packed ahead at load time (5.6 GB more for Spark-X2.5).
 
 Output is checked against the previous engine path on every change: the
 answers either match token for token or differ only where two next tokens
