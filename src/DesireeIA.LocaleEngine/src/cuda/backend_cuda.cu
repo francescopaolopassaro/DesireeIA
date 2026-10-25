@@ -4073,12 +4073,17 @@ bool cuda_attention_probe_configure(bool enabled, uint32_t n_layers, uint32_t n_
     return true;
 }
 
-// Copies one layer's raw scores [n_head][max_pos] to the host. Waits for the work already queued on the engine's stream.
-bool cuda_attention_probe_read(uint32_t layer, float* host_out) {
-    if (!g_probe.d_buf || layer >= g_probe.n_layers || !host_out) return false;
+// Copies the first `count` raw scores of every head of one layer to the host, packed as [n_head][count]. The device buffer is laid
+// out [n_head][max_pos] (16384 floats a head): copying all of it for the ~100-1000 positions in use was 1 MB a layer, about 1 ms,
+// and reading every layer of every token halved the speed of a generation. A pitched copy moves only the used part.
+// Waits for the work already queued on the engine's stream.
+bool cuda_attention_probe_read(uint32_t layer, float* host_out, uint32_t count) {
+    if (!g_probe.d_buf || layer >= g_probe.n_layers || !host_out || count == 0 || count > g_probe.max_pos) return false;
     cudaStream_t stream = scratch_stream();
     const size_t n = (size_t) g_probe.n_head * g_probe.max_pos;
-    if (cudaMemcpyAsync(host_out, g_probe.d_buf + (size_t) layer * n, n * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess) return false;
+    if (cudaMemcpy2DAsync(host_out, (size_t) count * sizeof(float),
+                          g_probe.d_buf + (size_t) layer * n, (size_t) g_probe.max_pos * sizeof(float),
+                          (size_t) count * sizeof(float), g_probe.n_head, cudaMemcpyDeviceToHost, stream) != cudaSuccess) return false;
     return cudaStreamSynchronize(stream) == cudaSuccess;
 }
 

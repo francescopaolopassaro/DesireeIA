@@ -136,3 +136,70 @@ def test_logit_bias_forbids_and_forces(model):
         assert _first_token(model, "Say hi.") == other
     finally:
         model.set_logit_bias(None)
+
+
+_CODE = '''def add(a, b):
+    """Sum of two numbers."""
+    return a + b
+
+
+def subtract(a, b):
+    """Difference of two numbers."""
+    return a - b
+
+
+def multiply(a, b):
+    """Product of two numbers."""
+    return a * b
+'''
+
+
+def _copy_prompt_ids(model):
+    prompt = "Here is a Python file:\n\n```python\n" + _CODE + "\n```\n\nOutput the file again exactly as it is. Output only the full file in one code block."
+    text = model.apply_chat_template([("user", prompt)], True) + "```python\n"
+    return model.tokenize(text, add_bos=True)
+
+
+def _greedy_run(model, ids, n=120):
+    model.reset_session()
+    tok = model.predict(ids)
+    out = []
+    for _ in range(n):
+        if model.is_end_of_generation(tok):
+            break
+        out.append(tok)
+        tok = model.next_token()
+    return out
+
+
+def test_speculation_writes_the_same_text_and_reports_its_rounds(model):
+    if not hasattr(_lib(), "desireeia_set_speculation"):
+        pytest.skip("needs a native engine 0.3.1")
+    from desireeia.types import SamplingOptions
+    model.set_sampling(SamplingOptions(temperature=0.0))
+    ids = _copy_prompt_ids(model)
+    model.set_speculation(0)
+    plain = _greedy_run(model, ids)
+    model.set_speculation(8)
+    try:
+        spec = _greedy_run(model, ids)
+        rounds, proposed, kept = model.speculation_info()
+    finally:
+        model.set_speculation(0)
+    assert spec == plain                       # the batched pass and the one-token step agreed on this text
+    assert rounds > 0 and proposed >= rounds * 3 and 0 <= kept <= proposed
+    with pytest.raises(ValueError):
+        model.set_speculation(99)
+
+
+def test_speculation_steps_aside_for_a_json_schema(model):
+    if not hasattr(_lib(), "desireeia_set_speculation"):
+        pytest.skip("needs a native engine 0.3.1")
+    model.set_speculation(8)
+    model.set_json_schema(SCHEMA)
+    try:
+        doc = json.loads(_text(model, _generate(model, "Describe Rome.", 160)))
+        assert doc["kind"] in ("village", "town", "city")
+    finally:
+        model.set_json_schema(None)
+        model.set_speculation(0)

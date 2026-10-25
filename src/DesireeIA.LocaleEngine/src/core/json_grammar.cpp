@@ -730,6 +730,48 @@ uint64_t JsonSchemaConstraint::state_key() const {
     return h;
 }
 
+void PieceTrie::build(const std::vector<std::string>& pieces, const std::vector<uint8_t>& include) {
+    nodes_.assign(1, Node{});
+    token_next_.assign(pieces.size(), -1);
+    for (size_t id = 0; id < pieces.size(); ++id) {
+        if (pieces[id].empty() || (id < include.size() && !include[id])) continue;
+        int32_t cur = 0;
+        for (unsigned char b : pieces[id]) {
+            int32_t child = nodes_[cur].first_child;
+            while (child >= 0 && nodes_[child].byte != b) child = nodes_[child].next_sibling;
+            if (child < 0) {
+                child = (int32_t) nodes_.size();
+                Node n;
+                n.byte = b;
+                n.next_sibling = nodes_[cur].first_child;
+                nodes_.push_back(n);
+                nodes_[cur].first_child = child;
+            }
+            cur = child;
+        }
+        token_next_[id] = nodes_[cur].token;
+        nodes_[cur].token = (int32_t) id;
+    }
+}
+
+void JsonSchemaConstraint::walk(const PieceTrie& trie, int32_t node, const std::vector<Config>& cur, std::vector<uint8_t>& keep) const {
+    for (int32_t t = trie.nodes_[node].token; t >= 0; t = trie.token_next_[(size_t) t]) keep[(size_t) t] = 1;
+    std::vector<Config> next;
+    for (int32_t ch = trie.nodes_[node].first_child; ch >= 0; ch = trie.nodes_[ch].next_sibling) {
+        next.clear();
+        for (const Config& c : cur) {
+            step(c, trie.nodes_[ch].byte, next);
+            if (next.size() > kMaxConfigs) next.resize(kMaxConfigs);
+        }
+        if (!next.empty()) walk(trie, ch, next, keep);
+    }
+}
+
+void JsonSchemaConstraint::mask(const PieceTrie& trie, std::vector<uint8_t>& keep) const {
+    if (!configured() || gave_up_ || trie.empty()) return;
+    walk(trie, 0, cfgs_, keep);
+}
+
 bool JsonSchemaConstraint::in_plain_string() const {
     if (!configured() || gave_up_ || cfgs_.size() != 1) return false;
     const Config& c = cfgs_[0];

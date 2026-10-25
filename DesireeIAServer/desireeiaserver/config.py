@@ -28,7 +28,7 @@ SERIALIZED_KEYS = (
     "top_p", "repeat_penalty", "repeat_last_n", "frequency_penalty",
     "presence_penalty", "seed", "n_predict", "system_prompt", "log_level",
     "max_upload_mb", "max_request_mb", "whisper_model",
-    "context_memory_ttl_seconds", "context_spill_chars",
+    "context_memory_ttl_seconds", "context_spill_chars", "speculation",
 )
 
 
@@ -88,6 +88,9 @@ class Settings:
     # replaced in the prompt by a short stub the model pages through.
     context_memory_ttl_seconds: int = 1800
     context_spill_chars: int = 4000
+    # Speculative decoding from the text itself (engine 0.3.1): the longest guess tried per round, 0 = off. Only with greedy sampling
+    # (temperature 0) and no JSON schema, logit bias or token probabilities in the request; worth it where answers repeat what they read.
+    speculation: int = 0
     config_path: Optional[Path] = None
 
     @property
@@ -224,6 +227,8 @@ def parse_args(argv: Optional[List[str]] = None) -> Settings:
     engine.add_argument("--n-gpu-layers", type=int, default=None)
     engine.add_argument("--ram-budget-mb", type=int, default=None)
     engine.add_argument("--parallel", type=int, default=None, help="number of concurrent slots")
+    engine.add_argument("--speculation", type=int, default=None,
+                        help="speculative decoding from the text itself: longest guess per round (1-32, 8 is a good start), 0 = off (default)")
 
     sampling = parser.add_argument_group("sampling")
     sampling.add_argument("--temperature", type=float, default=None, help="0 = greedy")

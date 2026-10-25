@@ -36,6 +36,26 @@
 
 namespace desireeia {
 
+// The pieces of a vocabulary as a byte trie. Asking "which tokens keep the document valid" by running the automaton over every
+// token is 100k-260k walks a step; walking the trie instead advances the automaton once per shared prefix and drops a whole
+// branch the moment the automaton dies on it, so a structural position (where almost nothing is allowed) costs a few thousand
+// steps, not the vocabulary.
+class PieceTrie {
+public:
+    // pieces[i] is the text of token i. Tokens whose `include[i]` is 0 (or any empty piece) are left out.
+    void build(const std::vector<std::string>& pieces, const std::vector<uint8_t>& include);
+    bool empty() const { return nodes_.size() <= 1; }
+private:
+    friend class JsonSchemaConstraint;
+    struct Node {
+        int32_t first_child = -1, next_sibling = -1;
+        int32_t token = -1;          // head of the list of tokens that end here
+        uint8_t byte = 0;
+    };
+    std::vector<Node> nodes_ = std::vector<Node>(1);
+    std::vector<int32_t> token_next_;   // per token: the next token that ends at the same node
+};
+
 class JsonSchemaConstraint {
 public:
     // Empty text turns the constraint off. "json" (or "true" / "{}") means
@@ -73,6 +93,10 @@ public:
     // with no length limit, the item count of an unbounded array) are left out,
     // so the repetitive parts of a document hit the same entry again and again.
     uint64_t state_key() const;
+
+    // Marks in `keep` (one byte per token, already sized, zeroed by the caller) every token of `trie` whose piece keeps the document
+    // valid from here; the result is the same set as asking allows() for each token. End-of-generation tokens are not in the trie.
+    void mask(const PieceTrie& trie, std::vector<uint8_t>& keep) const;
 
 private:
     struct SNode {
@@ -119,6 +143,7 @@ private:
     void start_value(Config c, int node, unsigned char ch, std::vector<Config>& out) const;
     bool can_end(const Config& c) const;
     bool run_piece(const std::string& piece, std::vector<Config>& cur) const;
+    void walk(const PieceTrie& trie, int32_t node, const std::vector<Config>& cur, std::vector<uint8_t>& keep) const;
 
     std::vector<SNode> nodes_;
     int root_ = 0;

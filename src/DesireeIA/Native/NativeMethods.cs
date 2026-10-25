@@ -285,6 +285,12 @@ internal static class NativeMethods
     internal static extern Error desireeia_set_json_schema(IntPtr ctx, byte[]? schemaJson);
 
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_set_speculation(IntPtr ctx, int maxDraft);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_get_speculation_info(IntPtr ctx, out ulong rounds, out ulong proposed, out ulong accepted);
+
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_score_tokens(IntPtr ctx, int[] tokens, nuint nTokens, nuint fromIndex,
         float[] outLogprob, float[]? outEntropy);
 

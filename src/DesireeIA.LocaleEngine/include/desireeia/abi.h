@@ -571,6 +571,19 @@ DESIREEIA_API desireeia_error desireeia_set_tool_constraint(desireeia_ctx* ctx, 
                                                             const char* close_tag,
                                                             const char* const* tool_names, size_t n_tools);
 
+/* Speculative decoding from the text itself (0.3.1), off by default. With greedy sampling (temperature 0) and nothing that
+ * must look at every token on its own (no JSON schema, tool constraint, logit bias, attention probe or confidence tracking), the
+ * engine looks for the last few tokens earlier in the context and tries what followed them as the next tokens: the guess and the
+ * token before it go through the model in ONE batched pass, the guess is kept up to the first position where the model chose
+ * differently, and the model's own choice there is the next token. The text is the one the model would have written (a batched pass
+ * and a one-token decode add up in a different order, so at a near-tie the two can differ, as a prefill and a decode already can);
+ * several tokens cost one pass. Worth it where an answer repeats what it has read: editing a file, renaming, quoting code. A gate
+ * stops trying when the guesses stop paying, and the pipelined GPU path takes over again. max_draft: the longest guess per round,
+ * 1..32 (8 is a good start); 0 turns it off. desireeia_get_speculation_info: rounds run, tokens guessed, tokens kept. */
+DESIREEIA_API desireeia_error desireeia_set_speculation(desireeia_ctx* ctx, int32_t max_draft);
+DESIREEIA_API desireeia_error desireeia_get_speculation_info(desireeia_ctx* ctx, uint64_t* out_rounds, uint64_t* out_proposed,
+                                                             uint64_t* out_accepted);
+
 /* Scores text the model did not write (0.3.0): the log-probability of tokens[from_index .. n_tokens) given
  * everything before each of them, and optionally the entropy of the model's distribution at each of those
  * positions (nats). out_logprob (and out_entropy, may be NULL) have n_tokens - from_index entries; from_index

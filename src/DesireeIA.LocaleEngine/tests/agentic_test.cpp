@@ -176,6 +176,66 @@ static void test_json_grammar() {
     }
 }
 
+// The byte-trie mask must be the very set that asking token by token gives, in every state a document passes through.
+static void test_json_trie_mask() {
+    std::printf("--- JSON schema mask by trie ---\n");
+    std::vector<std::string> vocab;
+    for (int ch = 32; ch < 127; ++ch) vocab.emplace_back(1, (char) ch);
+    for (const char* t : {"{\"", "\":", "\",", "\"}", "\"]", "{", "}", "[", "]", ",", ":", "true", "false", "null", "tru", "nul", "12", "-1", "3.14", "1e5",
+                          "name", "age", "\"name\"", "\"age\"", "tags", " \"", "\n", "\n  ", "  ", "\\n", "\\\"", "\\u00", "\xC3\xA9", "\xC3", "\xA9",
+                          "village", "town", "city", "cit", "ity", "Rome", " Rome", "{\"name\":", "\":\"", "\":[", "],", "\"],\"", "0.5,", "10}", "]}", "}}"})
+        vocab.emplace_back(t);
+    const size_t eog = vocab.size();
+    vocab.emplace_back("<eos>");                         // an end-of-generation token: never in the trie, asked separately
+    std::vector<uint8_t> include(vocab.size(), 1), plain(vocab.size(), 0);
+    include[eog] = 0;
+    for (size_t i = 0; i < vocab.size(); ++i) {
+        plain[i] = include[i] && !vocab[i].empty();
+        for (unsigned char b : vocab[i]) if (b == '"' || b == '\\' || b < 0x20) plain[i] = 0;
+    }
+    std::vector<uint8_t> special(vocab.size(), 0);
+    for (size_t i = 0; i < vocab.size(); ++i) special[i] = include[i] && !plain[i];
+    PieceTrie all, spec;
+    all.build(vocab, include);
+    spec.build(vocab, special);
+
+    const char* schemas[] = {
+        R"({"type":"object","properties":{"name":{"type":"string"},"age":{"type":"integer"},"tags":{"type":"array","items":{"type":"string"},"maxItems":2},"kind":{"enum":["village","town","city"]}},"required":["name","age"]})",
+        "json",
+        R"({"anyOf":[{"type":"string"},{"type":"null"},{"type":"number"}]})",
+    };
+    size_t checked = 0, mismatches = 0;
+    for (const char* schema : schemas) {
+        for (unsigned seed = 1; seed <= 6; ++seed) {
+            JsonSchemaConstraint c;
+            std::string err;
+            if (!c.configure(schema, err)) { CHECK(false, "schema for the trie test"); return; }
+            c.reset();
+            unsigned rng = seed * 2654435761u;
+            for (int step = 0; step < 60; ++step) {
+                // the set by asking every token
+                std::vector<uint8_t> want(vocab.size(), 0);
+                for (size_t i = 0; i < vocab.size(); ++i) want[i] = (i == eog) ? 0 : (c.allows(vocab[i], false) ? 1 : 0);
+                // the set by the trie (plain pieces first when inside a plain string, as the engine does)
+                std::vector<uint8_t> got(vocab.size(), 0);
+                if (c.in_plain_string()) { for (size_t i = 0; i < vocab.size(); ++i) if (plain[i]) got[i] = 1; c.mask(spec, got); }
+                else c.mask(all, got);
+                for (size_t i = 0; i < vocab.size(); ++i) if (i != eog) { ++checked; if (want[i] != got[i]) ++mismatches; }
+                // advance with a pseudo-random allowed token
+                std::vector<size_t> ok;
+                for (size_t i = 0; i < vocab.size(); ++i) if (want[i]) ok.push_back(i);
+                if (ok.empty()) break;
+                rng = rng * 1664525u + 1013904223u;
+                c.accept(vocab[ok[(rng >> 8) % ok.size()]]);
+                if (c.allows(std::string(), true)) break;      // the document is complete
+            }
+        }
+    }
+    CHECK(checked > 3000, "the trie test looked at enough tokens");
+    if (mismatches) std::printf("    %zu of %zu tokens differ\n", mismatches, checked);
+    CHECK(mismatches == 0, "the trie gives exactly the set that token-by-token asking gives");
+}
+
 // ---- tool-call constraint -----------------------------------------------
 
 static bool emit(ToolCallConstraint& t, const std::string& text) {
@@ -349,6 +409,7 @@ static void test_context_memory() {
 int main() {
     test_tool_grammar();
     test_json_grammar();
+    test_json_trie_mask();
     test_jinja_language();
     test_jinja_fixtures();
     test_context_memory();

@@ -396,6 +396,11 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     lib.desireeia_set_tool_constraint.argtypes = [c_void_p, c_char_p, c_char_p, POINTER(c_char_p), c_uint64]
     lib.desireeia_set_tool_constraint.restype = c_int32
 
+    if hasattr(lib, "desireeia_set_speculation"):
+        lib.desireeia_set_speculation.argtypes = [c_void_p, c_int32]
+        lib.desireeia_set_speculation.restype = c_int32
+        lib.desireeia_get_speculation_info.argtypes = [c_void_p, POINTER(c_uint64), POINTER(c_uint64), POINTER(c_uint64)]
+        lib.desireeia_get_speculation_info.restype = c_int32
     if hasattr(lib, "desireeia_score_tokens"):
         lib.desireeia_score_tokens.argtypes = [c_void_p, POINTER(c_int32), c_uint64, c_uint64,
                                                POINTER(c_float), POINTER(c_float)]

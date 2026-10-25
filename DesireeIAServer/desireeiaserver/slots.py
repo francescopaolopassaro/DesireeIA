@@ -287,6 +287,16 @@ class SlotPrediction:
                                       toolcalling.TOOL_CALL_OPEN, toolcalling.TOOL_CALL_CLOSE)
         self._configure_json_schema(model)
         self._configure_logit_bias(model)
+        self._configure_speculation(model)
+
+    def _configure_speculation(self, model) -> None:
+        """Persists on the model like the other engine settings: always (re)set. The engine itself steps aside for a request that cannot use it."""
+        if not hasattr(model, "set_speculation"):
+            return
+        try:
+            model.set_speculation(max(0, min(32, int(getattr(self._slot._settings, "speculation", 0) or 0))))
+        except (RuntimeError, ValueError):
+            pass   # a native engine older than 0.3.1 has no speculation: nothing to do
 
     def _configure_logit_bias(self, model) -> None:
         """Persists on the model across requests like the other engine settings: always (re)set."""

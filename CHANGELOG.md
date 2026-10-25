@@ -1,5 +1,24 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.3.1 · PyPI `desireeia` 0.3.1 · `desireeia-server` 0.3.1 · engine 0.3.1 (ABI 5)
+
+Found by using 0.3.0 from Kodinn's prompt laboratory: two diagnostics that cost far more than they should, one feature that was too slow on big vocabularies, and one speed idea made available. Additive: wrappers built for 0.3.0 keep working; the new calls say "needs a native engine 0.3.1" on an older one.
+
+### Faster — JSON schema output no longer slows generation
+
+- The mask of the tokens that keep the document valid was computed by running the automaton over every token of the vocabulary at every step (262k walks on Gemma 3). The vocabulary is now a byte trie: the automaton advances once per shared prefix and a branch is dropped as soon as the automaton dies on it, so a structural position costs a few thousand steps instead of the vocabulary. The set of allowed tokens is exactly the same (a test compares the two for every state of random documents).
+- Free text against schema-constrained, tokens per second: MiniCPM5 2B 65 → 64 (0.3.0: 65 → 51), Spark-X2.5 4B 52 → 52 (53 → 40), Qwen2.5-Coder 3B 48 → 48 (49 → 37), Gemma 3 4B 55 → 55 (55 → 29).
+
+### Faster — reading the attention probe
+
+- `GetAttention` copied a layer's whole probe buffer (16,384 positions a head, about 1 MB) for the few hundred positions in use, and allocated a vector the size of it on every call. A pitched copy now moves only the positions in use, and the host buffer is reused. Reading all 36 layers of MiniCPM5 2B after every token: 26 → 54 tok/s (free generation 62). Reading one layer costs about 0.2 ms instead of 1.2 ms.
+
+### Added — speculative decoding from the text itself (off by default)
+
+- `desireeia_set_speculation(ctx, max_draft)` / `desireeia_get_speculation_info`; `SetSpeculation` / `GetSpeculationInfo` (C#), `set_speculation` / `speculation_info` (Python), `--speculation N` (server). With greedy sampling and nothing that must see every token on its own, the last four tokens are looked up earlier in the context (the occurrence nearest to where a copy is expected to continue wins) and what followed them is tried: one batched pass checks the guess, which is kept up to the first position where the model chose differently. The text is the one the model would have written.
+- A gate keeps it free where the text does not repeat: it closes after a few rounds that gained less than 0.7 tokens, or after 24 tokens without a guess, and the pipelined GPU path takes over again.
+- Measured on an RTX 1000 Ada: a check pass costs about 3.5 one-token steps and 30–50% of the guesses are kept, so the gain is modest (Spark-X2.5 4B copying a file 49 → 53–59 tok/s, MiniCPM5 2B none, MiniCPM5 2B on the CPU +5%). Outputs identical to speculation off on every tested text. Off by default; documented as aimed at long verbatim copies and CPU-only machines.
+
 ## NuGet `DesireeIA` 0.3.0 · PyPI `desireeia` 0.3.0 · `desireeia-server` 0.3.0 · engine 0.3.0 (ABI 5)
 
 What the model considered besides what it wrote, and where it looked when it wrote it.

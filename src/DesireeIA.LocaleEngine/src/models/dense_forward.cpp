@@ -1746,15 +1746,17 @@ bool DenseForward::attention_probe_read(uint32_t layer, int32_t head, float* out
     const uint32_t count = std::min<uint32_t>(probe_pos_ + 1, kProbeMaxPos);
     if (capacity < (int32_t) count) return false;
 
-    std::vector<float> raw;     // device layers: raw scores [head][kProbeMaxPos]
+    // device layers: raw scores of the used positions only, [head][count]; the buffer is reused between calls (a vector the size of
+    // the whole probe, allocated and zeroed for every layer of every token, was a cost of its own)
+    thread_local std::vector<float> raw;
     const float* cpu = nullptr; // CPU layers: normalised weights
     if (src == 1) {
         if (probe_cpu_.empty()) return false;
         cpu = probe_cpu_.data() + (size_t) layer * H * kProbeMaxPos;
     } else {
 #ifdef DESIREEIA_CUDA_ENABLED
-        raw.resize((size_t) H * kProbeMaxPos);
-        if (!cuda_attention_probe_read(layer, raw.data())) return false;
+        if (raw.size() < (size_t) H * count) raw.resize((size_t) H * count);
+        if (!cuda_attention_probe_read(layer, raw.data(), count)) return false;
 #else
         return false;
 #endif
@@ -1767,7 +1769,7 @@ bool DenseForward::attention_probe_read(uint32_t layer, int32_t head, float* out
             return;
         }
         // softmax of the raw scores, the same arithmetic the decode attention uses (-inf = outside the window)
-        const float* r = raw.data() + (size_t) h * kProbeMaxPos;
+        const float* r = raw.data() + (size_t) h * count;
         float mx = -INFINITY;
         for (uint32_t i = 0; i < count; ++i) mx = r[i] > mx ? r[i] : mx;
         double sum = 0.0;

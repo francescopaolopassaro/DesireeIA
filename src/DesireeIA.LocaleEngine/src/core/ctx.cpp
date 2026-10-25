@@ -83,8 +83,21 @@ struct EngineContext {
     // Whole-output constraint from a JSON schema (core/json_grammar.h). When set it
     // takes the place of the tool-call constraint: it uses the same piece tables.
     JsonSchemaConstraint json;
+    // The vocabulary as byte tries for the JSON mask: every token, and only the tokens that are not safe inside any string (those that
+    // hold a quote, a backslash or a control byte) - inside a string the others are allowed without asking the automaton.
+    PieceTrie json_trie_all, json_trie_special;
+    bool json_tries_ready = false;
+    size_t json_trie_size = 0;
     // Masks already worked out for a document state (see JsonSchemaConstraint::state_key); cleared when the schema changes.
     std::unordered_map<uint64_t, std::vector<uint8_t>> json_mask_cache;
+    // Speculative decoding from the text itself (desireeia_set_speculation): 0 = off, else the longest guess tried.
+    int spec_max_draft = 0;
+    std::deque<int32_t> spec_out;            // tokens already decided by a round, handed out by the next calls
+    int spec_cooldown = 0;                   // tokens still to decode the normal way after the gate closed
+    int spec_dry = 0, spec_rounds = 0;
+    int64_t spec_align = -1;                 // where in the history the text being copied is expected to continue (-1 = not following any)
+    double spec_gain = 1.5;
+    uint64_t spec_rounds_total = 0, spec_proposed = 0, spec_accepted = 0;
     // Per-token logit bias (desireeia_set_logit_bias): empty = off.
     std::vector<std::pair<int32_t, float>> bias;
     std::vector<std::string> tool_pieces;
@@ -881,6 +894,39 @@ static void tool_mask(EngineContext* c, std::vector<float>& logits) {
             return;
         }
     }
+    if (use_json) {
+        // The tries: built once per vocabulary, on the first constrained step.
+        if (!c->json_tries_ready || c->json_trie_size != logits.size()) {
+            std::vector<uint8_t> inc_all(logits.size(), 0), inc_special(logits.size(), 0);
+            for (size_t id = 0; id < logits.size(); ++id) {
+                if (c->tool_is_eog[id] || c->tool_pieces[id].empty()) continue;
+                inc_all[id] = 1;
+                if (!c->tool_plain[id]) inc_special[id] = 1;
+            }
+            c->json_trie_all.build(c->tool_pieces, inc_all);
+            c->json_trie_special.build(c->tool_pieces, inc_special);
+            c->json_trie_size = logits.size();
+            c->json_tries_ready = true;
+        }
+        std::vector<uint8_t> keep(logits.size(), 0);
+        if (c->json.in_plain_string()) {
+            for (size_t id = 0; id < logits.size(); ++id) if (c->tool_plain[id]) keep[id] = 1;
+            c->json.mask(c->json_trie_special, keep);
+        } else {
+            c->json.mask(c->json_trie_all, keep);
+        }
+        const bool can_end = c->json.allows(std::string(), true);
+        size_t kept = 0;
+        for (size_t id = 0; id < logits.size(); ++id) {
+            if (c->tool_is_eog[id]) keep[id] = can_end ? 1 : 0;
+            kept += keep[id];
+        }
+        if (kept == 0) { c->json.give_up(); return; }
+        for (size_t id = 0; id < logits.size(); ++id) if (!keep[id]) logits[id] = -1e30f;
+        if (c->json_mask_cache.size() >= 48) c->json_mask_cache.clear();
+        c->json_mask_cache.emplace(json_key, std::move(keep));
+        return;
+    }
     auto allows = [&](const std::string& p, bool eog) { return use_json ? c->json.allows(p, eog) : c->tool.allows(p, eog); };
     // A piece whose first byte is rejected is rejected: 256 checks up front
     // skip the full automaton walk for almost the whole vocabulary.
@@ -1000,8 +1046,138 @@ static void rb_apply(EngineContext* c, int32_t& token) {
     rb_accept(c, token);
 }
 
+// ---- speculative decoding from the text itself ------------------------------------------------------
+//
+// An agent that edits a file writes, token after token, text it has just read: the old lines of a replacement, a function it
+// is renaming, a block it repeats. When the last few tokens of the answer also occur earlier in the context, what followed them
+// there is a good guess for what follows now. The guess is checked, not trusted: the guessed tokens and the one before them go
+// through the model in ONE batched pass, which gives the model's own choice at every position; the guess is kept up to the first
+// position where the model chose differently, and the model's choice there is the next token. So the text is the one the
+// model would have written; what changes is that several tokens cost one pass. (The batched pass and the one-token decode do
+// their sums in a different order, so at a near-tie the two can pick differently, as a prefill and a decode already can.)
+//
+// Greedy decoding only, and only when nothing needs to look at every token on its own: no constraint, no bias, no probe, no
+// confidence tracking. A gate keeps it from costing anything where the text does not repeat: after a few rounds that gained
+// less than they cost it switches off for a while, and the pipelined GPU path takes over again.
+
+namespace {
+constexpr size_t kSpecNgram = 4;        // tokens that must match earlier text
+constexpr size_t kSpecMinDraft = 3;     // shorter guesses are not worth a batched pass
+constexpr int kSpecCooldown = 48;       // tokens decoded the normal way after the gate closes
+constexpr int kSpecDryLimit = 24;       // tokens in a row without any guess before the gate closes
+
+// A guess for what follows `h + [last]`: the continuation of an earlier occurrence of its last kSpecNgram tokens. When a copy is under way
+// (`align` says where the source is expected to continue) the occurrence nearest to that place wins: in code the same four tokens recur
+// with different continuations, and the latest occurrence is then usually the wrong one; without a copy, the latest wins.
+// `cont_out` is where the chosen continuation starts in the history.
+bool spec_draft(const std::vector<int32_t>& h, int32_t last, size_t max_draft, int64_t align, std::vector<int32_t>& out, int64_t& cont_out) {
+    const size_t L = h.size() + 1;
+    if (L < kSpecNgram + 1) return false;
+    auto at = [&](size_t i) { return i < h.size() ? h[i] : last; };
+    const size_t tail = L - kSpecNgram;
+    int64_t best = -1, best_dist = INT64_MAX;
+    int seen = 0;
+    for (size_t start = tail; start-- > 0; ) {
+        bool match = true;
+        for (size_t j = 0; j < kSpecNgram; ++j) {
+            if (at(start + j) != at(tail + j)) { match = false; break; }
+        }
+        if (!match) continue;
+        const int64_t cont = (int64_t) (start + kSpecNgram);
+        if (cont >= (int64_t) L - 1) continue;                // nothing after it that is not the tail itself
+        if (align < 0) { best = cont; break; }                 // no copy under way: the latest occurrence
+        const int64_t dist = cont > align ? cont - align : align - cont;
+        if (dist < best_dist) { best_dist = dist; best = cont; }
+        if (++seen >= 64) break;
+    }
+    if (best < 0) return false;
+    out.clear();
+    for (size_t k = 0; k < max_draft && (size_t) best + k < L - 1; ++k) out.push_back(at((size_t) best + k));
+    cont_out = best;
+    return out.size() >= kSpecMinDraft;
+}
+}
+
+static bool spec_possible(const EngineContext* c) {
+    if (c->spec_max_draft <= 0 || c->spec_cooldown > 0) return false;
+    if (c->sampler.params().temperature > 0.0f) return false;
+    if (c->sampler.track_stats() || c->sampler.force_host()) return false;
+    if (c->tool.constraining() || c->tool.armed() || c->json.constraining() || !c->bias.empty() || rb_active(c)) return false;
+    return dynamic_cast<const DenseForward*>(c->gf) != nullptr;
+}
+
+// 1 = a round was run (out_token set, the rest queued), 0 = the pass failed, -1 = no guess this time (nothing was done).
+static int spec_round(EngineContext* c, int32_t& out_token) {
+    DenseForward* df = dynamic_cast<DenseForward*>(c->gf);
+    std::vector<int32_t> draft;
+    int64_t cont = 0;
+    if (!df || !spec_draft(c->history, c->last_token, (size_t) c->spec_max_draft, c->spec_align, draft, cont)) {
+        if (c->spec_align >= 0) ++c->spec_align;             // a plain token: the source moves on with it
+        if (++c->spec_dry >= kSpecDryLimit) { c->spec_cooldown = kSpecCooldown; c->spec_dry = 0; c->spec_gain = 1.5; c->spec_rounds = 0; c->spec_align = -1; }
+        return -1;
+    }
+    c->spec_dry = 0;
+    const size_t m = draft.size();
+    std::vector<int32_t> in;
+    in.reserve(m + 1);
+    in.push_back(c->last_token);
+    in.insert(in.end(), draft.begin(), draft.end());
+
+    const size_t base = df->cache_len();
+    std::vector<float> last_logits, all;
+    if (!c->gf->step(*c->st.reader, in.data(), in.size(), last_logits, &all) || all.size() % (m + 1) != 0) {
+        c->st.last_error = "dense forward: speculative pass failed";
+        if (!c->gf->last_fail().empty()) c->st.last_error += " (" + c->gf->last_fail() + ")";
+        if (c->st.log) c->st.log(3, c->st.last_error.c_str());
+        invalidate_session(c);
+        return 0;
+    }
+    const size_t V = all.size() / (m + 1);
+
+    // The model's own choice at each position, in the context the previous choices made; stop at the first disagreement.
+    c->history.push_back(c->last_token);                 // consumed, as in the one-token path
+    if (c->kv_valid) c->kv_tokens.push_back(c->last_token);
+    std::vector<int32_t> outs;
+    outs.reserve(m + 1);
+    std::vector<float> row(V);
+    size_t accepted = 0;
+    for (size_t i = 0; i <= m; ++i) {
+        std::memcpy(row.data(), all.data() + i * V, V * sizeof(float));
+        const int32_t tok = c->sampler.sample(row, c->history);
+        outs.push_back(tok);
+        if (i < m && tok == draft[i]) {
+            ++accepted;
+            c->history.push_back(tok);                   // the guess was right: it is consumed too
+            if (c->kv_valid) c->kv_tokens.push_back(tok);
+            continue;
+        }
+        break;
+    }
+    // The pass wrote m + 1 positions; the ones that count are the consumed token and the accepted guesses.
+    df->truncate_cache(base + 1 + accepted);
+
+    out_token = outs[0];
+    for (size_t k = 1; k < outs.size(); ++k) c->spec_out.push_back(outs[k]);
+    c->last_token = outs.back();
+
+    // the copy goes on after the slot the model just filled (right or not: a renamed word keeps the source in step)
+    c->spec_align = cont + (int64_t) accepted + 1;
+    ++c->spec_rounds_total;
+    c->spec_proposed += m;
+    c->spec_accepted += accepted;
+    // the gate: how many extra tokens a round brings, smoothed; a pass costs a bit more than a one-token step
+    c->spec_gain = 0.6 * c->spec_gain + 0.4 * (double) accepted;
+    if (++c->spec_rounds >= 3 && c->spec_gain < 0.7) {
+        c->spec_cooldown = kSpecCooldown;
+        c->spec_rounds = 0;
+        c->spec_gain = 1.5;
+    }
+    return 1;
+}
+
 static bool tool_needs_host(const EngineContext* c) {
-    return rb_active(c) || !c->bias.empty() || c->json.constraining() || (c->tool.configured() && (c->tool.constraining() || c->tool.armed()));
+    return rb_active(c) || !c->bias.empty() || c->json.constraining() || (c->tool.configured() && (c->tool.constraining() || c->tool.armed()))
+           || spec_possible(c);
 }
 
 bool engine_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n, size_t from,
@@ -1017,6 +1193,7 @@ bool engine_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n, si
     // this text (kept in kv_tokens at the end, so a following predict can reuse its head).
     c->has_session = false;
     c->pending.clear();
+    c->spec_out.clear();
     const size_t reuse = reusable_prefix(c, tokens, from);      // context positions [0, from - 1)
     if (reuse > 0) df->truncate_cache(reuse);
     else c->gf->reset_cache();
@@ -1070,6 +1247,25 @@ bool engine_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n, si
 }
 
 // Logit bias: added to the logits of the listed tokens before every draw (host path, whole vocabulary).
+bool engine_set_speculation(desireeia_ctx* ctx, int32_t max_draft) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c || max_draft < 0 || max_draft > 32) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    drain_pipeline(c);
+    c->spec_max_draft = max_draft;
+    c->spec_cooldown = 0; c->spec_dry = 0; c->spec_rounds = 0; c->spec_gain = 1.5; c->spec_align = -1;
+    if (max_draft == 0) c->spec_out.clear();
+    return true;
+}
+
+bool engine_speculation_info(desireeia_ctx* ctx, uint64_t& rounds, uint64_t& proposed, uint64_t& accepted) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    if (!c) return false;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    rounds = c->spec_rounds_total; proposed = c->spec_proposed; accepted = c->spec_accepted;
+    return true;
+}
+
 bool engine_set_logit_bias(desireeia_ctx* ctx, const int32_t* ids, const float* bias, size_t n) {
     EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
     if (!c || (n && (!ids || !bias))) return false;
@@ -1156,6 +1352,7 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     c->history.assign(tokens, tokens + n_tokens);
     c->tool.reset();
     c->json.reset();
+    c->spec_align = -1;
     c->sampler.set_generation_start(n_tokens);
     c->sampler.set_dry_suspended(false);
     rb_reset(c, tokens, n_tokens);
@@ -1167,6 +1364,7 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     c->last_token = out_token;
     c->has_session = true;
     c->pending.clear();
+    c->spec_out.clear();
     return true;
 }
 
@@ -1284,6 +1482,14 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
     std::lock_guard<std::mutex> lk(c->mtx);
     if (!c->gf || !c->st.reader || !c->has_session) return false;
 
+    // Tokens a speculative round already decided: nothing to compute, the cache and the history are already past them.
+    if (!c->spec_out.empty()) {
+        out_token = c->spec_out.front();
+        c->spec_out.pop_front();
+        return true;
+    }
+    if (c->spec_cooldown > 0) { --c->spec_cooldown; if (c->spec_align >= 0) ++c->spec_align; }
+
 #ifdef DESIREEIA_CUDA_ENABLED
     if (!tool_needs_host(c)) {
         const int r = next_token_pipelined(c, out_token);
@@ -1298,6 +1504,10 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
         drain_pipeline(c);
     }
 #endif
+    if (spec_possible(c)) {
+        const int r = spec_round(c, out_token);
+        if (r >= 0) return r == 1;
+    }
     int32_t tk = c->last_token;
     // Reused across tokens: a whole vocabulary (~1 MB) allocated and zeroed
     // on every token was measurable next to the sampling itself.
@@ -1549,6 +1759,7 @@ bool engine_session_reset(desireeia_ctx* ctx) {
     invalidate_session(c);
     c->has_session = false;
     c->pending.clear();
+    c->spec_out.clear();
     c->last_reused = 0;
     return true;
 }
@@ -1680,6 +1891,7 @@ bool engine_session_deserialize(desireeia_ctx* ctx, const uint8_t* data, size_t 
     c->kv_valid = true;
     c->has_session = false;   // nothing to continue from until the next predict
     c->pending.clear();
+    c->spec_out.clear();
     c->last_reused = 0;
     out_tokens = n;
     return true;
@@ -2176,6 +2388,7 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
     c->history.assign(tokens, tokens + n_tokens);
     c->tool.reset();
     c->json.reset();
+    c->spec_align = -1;
     c->sampler.set_generation_start(n_tokens);
     c->sampler.set_dry_suspended(false);
     rb_reset(c, tokens, n_tokens);
@@ -2187,6 +2400,7 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
     c->last_token = out_token;
     c->has_session = true;
     c->pending.clear();
+    c->spec_out.clear();
     return true;
 }
 

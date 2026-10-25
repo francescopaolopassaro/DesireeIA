@@ -119,3 +119,15 @@ def test_n_answers_to_one_prompt(client):
 
 def test_n_cannot_be_streamed(client):
     assert _chat(client, n=2, stream=True).status_code == 400 or _chat(client, n=2, stream=True).status_code == 501
+
+
+def test_speculation_setting_is_handed_to_the_engine(tmp_path, fake_desireeia):
+    app = create_app(_make_settings(tmp_path, speculation=8))
+    with TestClient(app, raise_server_exceptions=False) as c:
+        assert _chat(c).status_code == 200
+        assert _model(c).speculation == 8
+
+
+def test_speculation_is_off_unless_asked_for(client):
+    assert _chat(client).status_code == 200
+    assert _model(client).speculation == 0

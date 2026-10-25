@@ -382,6 +382,9 @@ uint32_t engine_context_length_trained(const desireeia_ctx* ctx);
 // turns it off.
 // JSON-schema constraint on the whole output; an empty schema turns it off. false + error when the schema is unusable.
 bool engine_set_json_schema(desireeia_ctx* ctx, const std::string& schema, std::string& error);
+// Speculative decoding from the text itself: 0 turns it off, else the longest guess tried per round.
+bool engine_set_speculation(desireeia_ctx* ctx, int32_t max_draft);
+bool engine_speculation_info(desireeia_ctx* ctx, uint64_t& rounds, uint64_t& proposed, uint64_t& accepted);
 // Teacher-forced log-probability (and entropy, nats) of tokens[from .. n) given what precedes them.
 bool engine_score_tokens(desireeia_ctx* ctx, const int32_t* tokens, size_t n, size_t from, float* out_logprob, float* out_entropy);
 bool engine_set_logit_bias(desireeia_ctx* ctx, const int32_t* ids, const float* bias, size_t n);
@@ -765,7 +768,8 @@ DESIREEIA_INTERNAL int cuda_prefill_chunk_tokens();
 // configure(false, ...) frees it. read copies one layer's [n_head][max_pos] block to the host.
 DESIREEIA_INTERNAL bool cuda_attention_probe_configure(bool enabled, uint32_t n_layers, uint32_t n_head, uint32_t max_pos,
                                                        size_t layer_stride_bytes);
-DESIREEIA_INTERNAL bool cuda_attention_probe_read(uint32_t layer, float* host_out);
+// host_out: [n_head][count] raw scores of the first `count` positions of the layer
+DESIREEIA_INTERNAL bool cuda_attention_probe_read(uint32_t layer, float* host_out, uint32_t count);
 DESIREEIA_INTERNAL int cuda_attention_out(const void* d_wo_qs, const void* d_wo_scale,
                                          const float* q, uint32_t n_head, uint32_t heads_per_kv,
                                          uint32_t head_dim, uint32_t kv_dim,

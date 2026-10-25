@@ -515,6 +515,30 @@ class LocalModel:
         if err != Error.OK:
             raise RuntimeError(f"Set tool constraint failed: {Error(err).name}")
 
+    def set_speculation(self, max_draft: int = 8) -> None:
+        """Speculative decoding from the text itself (engine 0.3.1, off by default). With greedy sampling and nothing that must
+        look at every token on its own (no JSON schema, tool constraint, logit bias, attention probe or confidence tracking), the
+        engine tries what followed the last few tokens earlier in the context as the next tokens, checks the guess in one batched
+        pass and keeps it up to the first position where the model chose differently. Several tokens cost one pass. Worth it where an
+        answer repeats what it has read (editing a file, renaming, quoting code). ``max_draft`` 1..32; ``0`` turns it off."""
+        self._check()
+        lib = self._need_abi4("desireeia_set_speculation")
+        with self._lock:
+            err = lib.desireeia_set_speculation(self._ctx, int(max_draft))
+        if err != Error.OK:
+            raise ValueError("max_draft must be between 0 and 32")
+
+    def speculation_info(self) -> Tuple[int, int, int]:
+        """``(rounds, tokens_guessed, tokens_kept)`` since speculation was last set."""
+        self._check()
+        lib = self._need_abi4("desireeia_get_speculation_info")
+        r, p, a = c_uint64(), c_uint64(), c_uint64()
+        with self._lock:
+            err = lib.desireeia_get_speculation_info(self._ctx, byref(r), byref(p), byref(a))
+        if err != Error.OK:
+            raise RuntimeError(f"Speculation info failed: {Error(err).name}")
+        return r.value, p.value, a.value
+
     def score_tokens(self, tokens: List[int], from_index: int = 1) -> Tuple[List[float], List[float]]:
         """Score text the model did not write. Returns ``(logprobs, entropies)`` for ``tokens[from_index:]``:
         the log-probability of each token given everything before it, and the entropy (nats) of the model's

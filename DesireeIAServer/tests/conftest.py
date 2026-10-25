@@ -115,6 +115,9 @@ class FakeLocalModel:
             raise ValueError("JSON schema refused: PARSE: schema: unknown type 'bogus'")
         self.json_schema = schema
 
+    def set_speculation(self, max_draft: int = 8) -> None:
+        self.speculation = max_draft
+
     def set_logit_bias(self, bias=None) -> None:
         self.logit_bias = dict(bias) if bias else None
 

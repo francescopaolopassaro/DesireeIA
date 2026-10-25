@@ -69,7 +69,7 @@ namespace {
 #define DESIREEIA_EMIT(level, msg) emit_impl(__FILE__, __LINE__, __func__, (level), (msg))
 
 DESIREEIA_API const char* desireeia_version(void) {
-    return "0.3.0";
+    return "0.3.1";
 }
 
 DESIREEIA_API desireeia_error desireeia_set_logger(desireeia_log_cb cb, void* user) {
@@ -842,6 +842,25 @@ DESIREEIA_API desireeia_error desireeia_set_json_schema(desireeia_ctx* ctx, cons
         tl_last_error = error;
         return DESIREEIA_ERR_PARSE;
     }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+// ---- speculative decoding ---------------------------------------------------
+
+DESIREEIA_API desireeia_error desireeia_set_speculation(desireeia_ctx* ctx, int32_t max_draft) {
+    ABI_GUARD_BEGIN
+    if (!ctx || max_draft < 0 || max_draft > 32) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_set_speculation(ctx, max_draft)) return DESIREEIA_ERR_INVALID_ARG;
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_get_speculation_info(desireeia_ctx* ctx, uint64_t* out_rounds, uint64_t* out_proposed,
+                                                             uint64_t* out_accepted) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !out_rounds || !out_proposed || !out_accepted) return DESIREEIA_ERR_INVALID_ARG;
+    if (!desireeia::engine_speculation_info(ctx, *out_rounds, *out_proposed, *out_accepted)) return DESIREEIA_ERR_INVALID_ARG;
     return DESIREEIA_OK;
     ABI_GUARD_END
 }

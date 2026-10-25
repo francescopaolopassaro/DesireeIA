@@ -93,6 +93,7 @@ public:
     // Something outside the sampler needs every token handled on the host, one at a time (the attention probe
     // reads the capture of the token that was just decoded, which the device-side draw would already have passed).
     void set_force_host(bool v) { force_host_ = v; }
+    bool force_host() const { return force_host_; }
     bool host_only() const { return ext_.min_p > 0.0f || ext_.dry_multiplier > 0.0f || track_ || force_host_; }
 
     // Picks the next token from the logits. `history` are the tokens

@@ -722,6 +722,35 @@ public sealed class LocalModel : IDisposable
     /// <paramref name="toolNames"/> null turns it off; empty accepts any name.
     /// </summary>
     /// <summary>
+    /// Speculative decoding from the text itself (0.3.1, off by default). With greedy sampling and nothing that must look at every
+    /// token on its own (no JSON schema, tool constraint, logit bias, attention probe or confidence tracking), the engine tries what
+    /// followed the last few tokens earlier in the context as the next tokens, checks the guess in one batched pass and keeps it up
+    /// to the first position where the model chose differently. The text is the one the model would have written; several tokens
+    /// cost one pass. Worth it where an answer repeats what it has read (editing a file, renaming, quoting code). A gate stops
+    /// trying when the guesses stop paying. <paramref name="maxDraft"/>: the longest guess per round, 1..32 (8 is a good start); 0 turns it off.
+    /// </summary>
+    public void SetSpeculation(int maxDraft)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        try { err = NativeMethods.desireeia_set_speculation(_context, maxDraft); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Speculative decoding: needs a native engine 0.3.1 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new ArgumentOutOfRangeException(nameof(maxDraft), "0..32");
+    }
+
+    /// <summary>Rounds run, tokens guessed and tokens kept since speculation was last set.</summary>
+    public (ulong Rounds, ulong Proposed, ulong Accepted) GetSpeculationInfo()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        ulong r, p, a;
+        try { err = NativeMethods.desireeia_get_speculation_info(_context, out r, out p, out a); }
+        catch (EntryPointNotFoundException) { throw new NotSupportedException("Speculative decoding: needs a native engine 0.3.1 or newer."); }
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException($"Speculation info failed: {err}");
+        return (r, p, a);
+    }
+
+    /// <summary>
     /// Scores text the model did not write: the log-probability of <c>tokens[fromIndex..]</c> given everything before each
     /// of them, and the entropy (nats) of the model's distribution at each of those positions. Nothing is generated.
     /// Use it to compare two versions of a prompt, to see how surprised the model is by each token, or to pick a label.
