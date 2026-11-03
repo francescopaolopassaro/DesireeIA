@@ -38,8 +38,16 @@ struct ModernBertConfig {
 // Weights stay in half precision; each matmul widens a weight row once and
 // reuses it for every token of the sequence. No state persists between
 // forward() calls.
+class ModernBertCuda;
+struct CudaHeadDesc;
+
 class DESIREEIA_INTERNAL ModernBertEncoder {
 public:
+    ModernBertEncoder() = default;
+    ~ModernBertEncoder();
+    ModernBertEncoder(const ModernBertEncoder&) = delete;
+    ModernBertEncoder& operator=(const ModernBertEncoder&) = delete;
+
     // `prefix` is the tensor-name prefix of the encoder inside the file
     // (e.g. "encoder." for a checkpoint that bundles encoder and head).
     bool load(const StFile& st, const std::string& prefix, const ModernBertConfig& cfg,
@@ -48,6 +56,19 @@ public:
     // floats (the last hidden state of every position).
     bool forward(const int32_t* ids, size_t n, std::vector<float>& out) const;
     const ModernBertConfig& config() const { return cfg_; }
+
+    // Moves the encoder passes to an NVIDIA GPU (tensor cores). Optional: when
+    // it fails (err says why: no device, not enough memory, a build without
+    // CUDA) the CPU path stays in use; forward() also falls back to the CPU by
+    // itself for an input the GPU workspace cannot take.
+    bool enable_gpu(std::string& err);
+    bool gpu_enabled() const { return gpu_ != nullptr; }
+    // Decision head on the GPU as well (optional, needs enable_gpu() first). When it is
+    // ready, gpu_forward_head() returns the post-head hidden state of `rows` positions.
+    bool gpu_set_head(const CudaHeadDesc& head, std::string& err);
+    bool gpu_head_ready() const { return gpu_head_; }
+    bool gpu_forward_head(const int32_t* ids, size_t n, int qtype, const size_t* rows, size_t n_rows,
+                          std::vector<float>& out) const;
 
     // Parses an encoder config.json (HF layout, both the newer
     // rope_parameters form and the older *_rope_theta form).
@@ -66,6 +87,8 @@ private:
     std::vector<float> emb_norm_;
     std::vector<float> final_norm_;
     std::vector<Layer> layers_;
+    ModernBertCuda* gpu_ = nullptr;
+    bool gpu_head_ = false;
 };
 
 }

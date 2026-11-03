@@ -672,6 +672,22 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
             const unsigned hw = std::thread::hardware_concurrency();
             if (hw > 0) ThreadPool::set_thread_override((int) hw);
         }
+        // The encoder goes to the GPU when the plan leaves the backend open (or asks
+        // for CUDA) and a device with room is there; anything else keeps the CPU.
+        // DESIREEIA_DECISION_CPU=1 forces the CPU (used to compare the two paths).
+        {
+            const char* force_cpu = std::getenv("DESIREEIA_DECISION_CPU");
+            const bool backend_ok = plan.backend == 0 || plan.backend == DESIREEIA_BACKEND_CUDA;
+            if (backend_ok && !(force_cpu && force_cpu[0] == '1')) {
+                std::string gerr;
+                if (dm->enable_gpu(gerr)) {
+                    if (log) log(5, dm->gpu_head_ready() ? "decision model: encoder and head run on the GPU"
+                                                         : "decision model: encoder runs on the GPU, the head on the CPU");
+                } else if (log && gerr != "no CUDA device" && gerr != "this build has no CUDA backend") {
+                    log(4, ("decision model: GPU not used (" + gerr + "), running on the CPU").c_str());
+                }
+            }
+        }
 #ifdef DESIREEIA_CUDA_ENABLED
         g_live_contexts.fetch_add(1);
 #endif

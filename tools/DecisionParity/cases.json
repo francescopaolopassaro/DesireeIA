@@ -1,0 +1,16 @@
+[
+ {"name":"choice_email","state":"Subject: Server down in production\n\nHi team, the main API has been returning 500 errors for the last 20 minutes and customers are complaining. Please look at it ASAP.",
+  "q":{"t":"choice","ins":"Route this email to the right team.","crit":{"billing":"payment and invoice questions","infra":"servers, outages and deployments","sales":"new customers and pricing"}}},
+ {"name":"choice_json_state","state":{"ticket":{"id":4821,"priority":"high","text":"I was charged twice for my subscription, please refund one payment.","tags":["payment","refund"]},"customer":{"tier":"gold","since":2019}},
+  "q":{"t":"choice","ins":"Which department should handle this ticket?","crit":{"billing":"","support":"","engineering":""}}},
+ {"name":"score_sentiment","state":"The product is okay, shipping was a bit slow but support solved my issue quickly. Overall I am fairly satisfied.",
+  "q":{"t":"score","ins":"Rate the customer satisfaction.","crit":["very unhappy","unhappy","neutral","happy","very happy"]}},
+ {"name":"noul_refund","state":"Customer writes: I bought this laptop 12 days ago and the screen is broken. I want my money back.",
+  "q":{"t":"noul","ins":"Is the customer entitled to a refund under a 30 day return policy?","crit":{"true":"the purchase is within 30 days","false":"more than 30 days have passed"}}},
+ {"name":"noul_default","state":"Il treno per Milano parte alle 9:15 dal binario 4, non è previsto alcun ritardo.",
+  "q":{"t":"noul","ins":"The train is delayed.","crit":null}},
+ {"name":"choice_unicode_quotes","state":"Il cliente scrive: \"Non riesco ad accedere all'account – la password non funziona più!\" 😕 — urgente.",
+  "q":{"t":"choice","ins":"Classify the request.","crit":{"login":"access problems","billing":"payments","other":"anything else"}}},
+ {"name":"long_state","state":"__LONG__",
+  "q":{"t":"choice","ins":"What is the main topic of the text?","crit":{"cooking":"recipes and food","finance":"money and markets","sports":"games and athletes","travel":"trips and places"}}}
+]

@@ -18,6 +18,8 @@
 
 #if defined(__AVX2__)
 #include <immintrin.h>
+#elif defined(__aarch64__)
+#include <arm_neon.h>
 #endif
 
 namespace desireeia {
@@ -82,6 +84,14 @@ inline float dot_f32(const float* a, const float* b, size_t n) {
     lo = _mm_add_ps(lo, _mm_movehl_ps(lo, lo));
     lo = _mm_add_ss(lo, _mm_shuffle_ps(lo, lo, 1));
     s = _mm_cvtss_f32(lo);
+#elif defined(__aarch64__)
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+    for (; i + 8 <= n; i += 8) {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
+        acc1 = vfmaq_f32(acc1, vld1q_f32(a + i + 4), vld1q_f32(b + i + 4));
+    }
+    for (; i + 4 <= n; i += 4) acc0 = vfmaq_f32(acc0, vld1q_f32(a + i), vld1q_f32(b + i));
+    s = vaddvq_f32(vaddq_f32(acc0, acc1));
 #endif
     for (; i < n; ++i) s += a[i] * b[i];
     return s;
@@ -94,6 +104,8 @@ inline void axpy_f32(float* y, float w, const float* x, size_t n) {
     const __m256 wv = _mm256_set1_ps(w);
     for (; i + 8 <= n; i += 8)
         _mm256_storeu_ps(y + i, _mm256_fmadd_ps(wv, _mm256_loadu_ps(x + i), _mm256_loadu_ps(y + i)));
+#elif defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) vst1q_f32(y + i, vfmaq_n_f32(vld1q_f32(y + i), vld1q_f32(x + i), w));
 #endif
     for (; i < n; ++i) y[i] += w * x[i];
 }

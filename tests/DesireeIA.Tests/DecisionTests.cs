@@ -111,6 +111,45 @@ public class DecisionTests
         Assert.Equal(new[] { "false", "true" }, result.Answers[2].Options);
     }
 
+    // The multilingual checkpoint: state, questions and options in other languages and scripts.
+    [Fact]
+    public void Decide_UnderstandsOtherLanguages_OnRealMultilingualModel()
+    {
+        if (!NativeHasDecide()) return;
+        var dir = Environment.GetEnvironmentVariable("DESIREEIA_TEST_DECISION_MODEL_ML");
+        if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+
+        using var model = LocalModel.Load(dir, new ExecutionPlan());
+
+        var italian = model.Decide(
+            "Oggetto: Server giù in produzione\n\nL'API principale restituisce errori 500 da venti minuti e i clienti si lamentano.",
+            new[]
+            {
+                DecisionQuestion.Choice("Instrada questa email al team giusto.", new Dictionary<string, string>
+                {
+                    ["fatturazione"] = "pagamenti e fatture",
+                    ["infrastruttura"] = "server, disservizi e rilasci",
+                    ["vendite"] = "nuovi clienti e prezzi"
+                })
+            });
+        Assert.NotNull(italian);
+        Assert.Equal("infrastruttura", italian!.Answers[0].Choice);
+
+        var chinese = model.Decide(
+            "你好，我无法登录我的账户，密码总是提示错误，请帮忙处理。",
+            new[]
+            {
+                DecisionQuestion.Choice("这个请求应该交给哪个部门？", new Dictionary<string, string>
+                {
+                    ["账户"] = "登录和密码问题",
+                    ["账单"] = "付款和发票",
+                    ["技术"] = "服务器和故障"
+                })
+            });
+        Assert.NotNull(chinese);
+        Assert.Equal("账户", chinese!.Answers[0].Choice);
+    }
+
     [Fact]
     public void Decide_RejectsAnInvalidRequest_OnRealModel()
     {

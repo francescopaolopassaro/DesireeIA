@@ -10,6 +10,9 @@
 #include "core/thread_pool.h"
 #include <algorithm>
 #include <cmath>
+#ifdef DESIREEIA_CUDA_ENABLED
+#include "encoder_cuda.h"
+#endif
 
 namespace desireeia {
 
@@ -141,8 +144,89 @@ bool ModernBertEncoder::load(const StFile& st, const std::string& prefix, const 
     return true;
 }
 
+ModernBertEncoder::~ModernBertEncoder() {
+#ifdef DESIREEIA_CUDA_ENABLED
+    delete gpu_;
+#endif
+}
+
+bool ModernBertEncoder::enable_gpu(std::string& err) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (gpu_) return true;
+    if (!st_) { err = "encoder is not loaded"; return false; }
+    if (!ModernBertCuda::device_available()) { err = "no CUDA device"; return false; }
+    HalfMat tok;
+    if (!st_->read_half(tok_name_, tok)) { err = "cannot read the token table"; return false; }
+    CudaEncoderDesc desc;
+    desc.n_vocab = cfg_.n_vocab;
+    desc.d = cfg_.n_embd;
+    desc.heads = cfg_.n_head;
+    desc.ff = cfg_.n_ff;
+    desc.local_window = cfg_.local_window;
+    desc.eps = cfg_.eps;
+    desc.theta_global = cfg_.theta_global;
+    desc.theta_local = cfg_.theta_local;
+    desc.tok_emb = tok.data.data();
+    desc.emb_norm = emb_norm_.data();
+    desc.final_norm = final_norm_.data();
+    for (size_t l = 0; l < layers_.size(); ++l) {
+        const Layer& L = layers_[l];
+        CudaEncoderLayer cl;
+        cl.wqkv = L.wqkv.data.data();
+        cl.wo = L.wo.data.data();
+        cl.wi = L.wi.data.data();
+        cl.mlp_wo = L.mlp_wo.data.data();
+        cl.attn_norm = L.attn_norm.empty() ? nullptr : L.attn_norm.data();
+        cl.mlp_norm = L.mlp_norm.data();
+        cl.is_global = cfg_.is_global[l] != 0;
+        desc.layers.push_back(cl);
+    }
+    ModernBertCuda* g = new ModernBertCuda;
+    if (!g->init(desc, err)) { delete g; return false; }
+    gpu_ = g;
+    return true;
+#else
+    err = "this build has no CUDA backend";
+    return false;
+#endif
+}
+
+bool ModernBertEncoder::gpu_set_head(const CudaHeadDesc& head, std::string& err) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (!gpu_) { err = "the encoder is not on the GPU"; return false; }
+    gpu_head_ = gpu_->set_head(head, err);
+    return gpu_head_;
+#else
+    (void) head;
+    err = "this build has no CUDA backend";
+    return false;
+#endif
+}
+
+bool ModernBertEncoder::gpu_forward_head(const int32_t* ids, size_t n, int qtype, const size_t* rows, size_t n_rows,
+                                         std::vector<float>& out) const {
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (!gpu_ || !gpu_head_ || n == 0 || n > ModernBertCuda::max_tokens()) return false;
+    for (size_t t = 0; t < n; ++t) {
+        if (ids[t] < 0 || (uint32_t) ids[t] >= cfg_.n_vocab) return false;
+    }
+    return gpu_->forward_head(ids, n, qtype, rows, n_rows, out);
+#else
+    (void) ids; (void) n; (void) qtype; (void) rows; (void) n_rows; (void) out;
+    return false;
+#endif
+}
+
 bool ModernBertEncoder::forward(const int32_t* ids, size_t n, std::vector<float>& out) const {
     if (!st_ || n == 0) return false;
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (gpu_ && n <= ModernBertCuda::max_tokens()) {
+        bool valid = true;
+        for (size_t t = 0; t < n; ++t) valid = valid && ids[t] >= 0 && (uint32_t) ids[t] < cfg_.n_vocab;
+        if (valid && gpu_->forward(ids, n, out)) return true;
+        // any GPU failure: run the same pass on the CPU
+    }
+#endif
     const size_t d = cfg_.n_embd;
     const size_t H = cfg_.n_head;
     const size_t hd = d / H;

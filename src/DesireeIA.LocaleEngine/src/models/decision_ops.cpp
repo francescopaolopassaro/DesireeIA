@@ -63,6 +63,11 @@ void half_row_to_f32(const uint16_t* src, float* dst, size_t n) {
         const __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + i));
         _mm256_storeu_ps(dst + i, _mm256_cvtph_ps(h));
     }
+#elif defined(__aarch64__)
+    for (; i + 4 <= n; i += 4) {
+        const float16x4_t h = vreinterpret_f16_u16(vld1_u16(src + i));
+        vst1q_f32(dst + i, vcvt_f32_f16(h));
+    }
 #endif
     for (; i < n; ++i) dst[i] = desireeia_fp16_to_fp32(src[i]);
 }
@@ -238,6 +243,45 @@ void linear_f16(const float* X, size_t n, size_t in, const HalfMat& W, const flo
                         }
                         float s[4][2] = { { hsum256(a00), hsum256(a01) }, { hsum256(a10), hsum256(a11) },
                                           { hsum256(a20), hsum256(a21) }, { hsum256(a30), hsum256(a31) } };
+                        for (; i < in; ++i) {
+                            s[0][0] += x0[i] * w0[i]; s[0][1] += x1[i] * w0[i];
+                            s[1][0] += x0[i] * w1[i]; s[1][1] += x1[i] * w1[i];
+                            s[2][0] += x0[i] * w2[i]; s[2][1] += x1[i] * w2[i];
+                            s[3][0] += x0[i] * w3[i]; s[3][1] += x1[i] * w3[i];
+                        }
+                        for (size_t r = 0; r < 4; ++r) {
+                            Y[t * out + o + r] = s[r][0] + bo[r];
+                            Y[(t + 1) * out + o + r] = s[r][1] + bo[r];
+                        }
+                    }
+                }
+#endif
+#if defined(__aarch64__)
+                if (rows == 4) {
+                    const float* w0 = wbuf.data();
+                    const float* w1 = w0 + in;
+                    const float* w2 = w1 + in;
+                    const float* w3 = w2 + in;
+                    for (; t + 2 <= t1; t += 2) {
+                        const float* x0 = X + t * in;
+                        const float* x1 = x0 + in;
+                        float32x4_t a00 = vdupq_n_f32(0.f), a01 = a00, a10 = a00, a11 = a00;
+                        float32x4_t a20 = a00, a21 = a00, a30 = a00, a31 = a00;
+                        size_t i = 0;
+                        for (; i + 4 <= in; i += 4) {
+                            const float32x4_t xv0 = vld1q_f32(x0 + i);
+                            const float32x4_t xv1 = vld1q_f32(x1 + i);
+                            float32x4_t w = vld1q_f32(w0 + i);
+                            a00 = vfmaq_f32(a00, xv0, w); a01 = vfmaq_f32(a01, xv1, w);
+                            w = vld1q_f32(w1 + i);
+                            a10 = vfmaq_f32(a10, xv0, w); a11 = vfmaq_f32(a11, xv1, w);
+                            w = vld1q_f32(w2 + i);
+                            a20 = vfmaq_f32(a20, xv0, w); a21 = vfmaq_f32(a21, xv1, w);
+                            w = vld1q_f32(w3 + i);
+                            a30 = vfmaq_f32(a30, xv0, w); a31 = vfmaq_f32(a31, xv1, w);
+                        }
+                        float s[4][2] = { { vaddvq_f32(a00), vaddvq_f32(a01) }, { vaddvq_f32(a10), vaddvq_f32(a11) },
+                                          { vaddvq_f32(a20), vaddvq_f32(a21) }, { vaddvq_f32(a30), vaddvq_f32(a31) } };
                         for (; i < in; ++i) {
                             s[0][0] += x0[i] * w0[i]; s[0][1] += x1[i] * w0[i];
                             s[1][0] += x0[i] * w1[i]; s[1][1] += x1[i] * w1[i];

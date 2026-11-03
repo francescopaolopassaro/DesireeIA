@@ -59,7 +59,7 @@ DesireeIA is designed to provide high-performance AI integration tailored for pr
 
 ---
 
-## Decision models — Laya (0.4.0)
+## Decision models — Laya (since 0.4.0)
 
 `LocalModel` also runs **decision models**: pass the folder of a [Laya](https://huggingface.co/convaiinnovations/laya) checkpoint (as downloaded from Hugging Face) instead of a GGUF file. They never generate text: you give a state and typed questions, and get a probability for every option.
 
@@ -86,18 +86,20 @@ foreach (var answer in result!.Answers)
     Console.WriteLine($"{answer.Choice}  confidence {answer.Confidence:F2}");   // Decide returns null for a model that is not a decision model
 ```
 
-The state can be text or any object that serializes to JSON. Use `Confidence` (1 minus the normalized entropy) to decide when to escalate; the model's act/escalate output is reported by its authors as unreliable. Needs the native engine interface 6 (shipped in this package). To time it: `DesireeIA.Bench decide <folder>` (source in the repository's `bench/`).
+The state can be text or any object that serializes to JSON. Use `Confidence` (1 minus the normalized entropy) to decide when to escalate; the model's act/escalate output is reported by its authors as unreliable. Both the English and the multilingual checkpoint work, on the GPU (Windows package) or the CPU. Needs the native engine interface 6 (shipped in this package). To time it: `DesireeIA.Bench decide <folder>` (source in the repository's `bench/`).
 
-**How fast is it?** On a laptop CPU only (Intel Core Ultra, 22 logical cores, other applications open), the time for one question grows with the length of the input — the question, the options and the state together, in tokens:
+**How fast is it?** The time for one question grows with the length of the input — the question, the options and the state together, in tokens. Measured on a laptop with an NVIDIA RTX 1000 Ada (6 GB) and an Intel Core Ultra CPU (22 logical cores), with other applications open:
 
-| Input | Time for one decision | Throughput |
+| Input | NVIDIA GPU | CPU only |
 |---|---|---|
-| ~60 tokens (a short email) | 0.13 – 0.25 s | 250 – 450 tokens/s |
-| ~250 tokens | 0.5 – 1.4 s | 180 – 540 tokens/s |
-| ~500 tokens | 1.0 – 2.6 s | 195 – 480 tokens/s |
-| ~1000 tokens (the model's limit) | 2.6 – 6.7 s | 150 – 390 tokens/s |
+| ~60 tokens (a short email) | 17 ms | 0.13 – 0.4 s |
+| ~250 tokens | 21 ms | 0.5 – 1.6 s |
+| ~500 tokens | 39 ms | 1.0 – 3.6 s |
+| ~1000 tokens (the model's limit) | 99 ms | 2.6 – 9.5 s |
 
-The range is the spread between runs of the benchmark below on a machine that was not idle; on a quiet machine expect the lower figure. All cores are used unless you fix `ThreadCount` in the plan. A GPU path for the encoder is not there yet.
+GPU figures are the median of 7 runs (C# and Python agree within 3 ms). The CPU figures are the spread between sessions: the same input took 2.6 s and 9.5 s on this machine hours apart, because the CPU path follows the laptop's thermal state and the GPU path does not.
+
+**Where it runs.** Unless you ask for a backend, the encoder and the decision head run on the first NVIDIA GPU that has room for them (about 1.5 GB free) and otherwise on the CPU — any problem on the GPU falls back to the CPU by itself. `Backend = Cpu` in the plan, or the environment variable `DESIREEIA_DECISION_CPU=1`, keeps it on the CPU; on the CPU all logical cores are used unless you fix `ThreadCount`. The GPU path is in the Windows package (built with CUDA); the Linux packages are CPU builds. Both give the same decisions.
 
 **Measure it on your machine** (the program loads the model, prints one decision of each type, then times the same question over inputs of growing length):
 
@@ -108,7 +110,7 @@ python python/examples/decide_benchmark.py laya/typed-decisions
 dotnet run -c Release --project bench/DesireeIA.Bench -- decide laya/typed-decisions
 ```
 
-Options for both: `--lengths 64,256,1024` and `--runs 5`.
+Options for both: `--lengths 64,256,1024` and `--runs 5`. The parity check against the reference lives in `tools/DecisionParity`.
 
 #### Guide: get Laya from Hugging Face and use it
 
@@ -118,7 +120,7 @@ Options for both: `--lengths 64,256,1024` and `--runs 5`.
 |---|---|---|---|
 | `typed-decisions/` | 843 MB | 1024 tokens | **recommended** (fine-tuned for typed decisions), tested |
 | repository root | 843 MB | 512 tokens | English base checkpoint, tested |
-| `multilingual/` | 644 MB | 1024 tokens | not supported yet (its tokenizer is a different kind) |
+| `multilingual/` | 644 MB | 1024 tokens | **supported**: questions, options and state in any language the model covers (tested in Italian, Chinese, Arabic, German, Spanish) |
 
 Laya is released under Apache 2.0 by its authors; keep their license and attribution when you redistribute it.
 
@@ -209,6 +211,7 @@ curl http://127.0.0.1:8080/v1/decide -H "Content-Type: application/json" -d '{
 ```
 
 Putting the `typed-decisions` folder into the server's models directory works too: it is listed in `/v1/models` like a model file.
+On Windows, send text that is not plain ASCII (Chinese, Arabic, accents…) from a file — `curl ... --data-binary @request.json` with the file saved as UTF-8 — because the command line does not carry it as UTF-8.
 
 Each answer is a small object. For the example above you get, in essence:
 
@@ -219,7 +222,7 @@ Each answer is a small object. For the example above you get, in essence:
 
 `choice` is the winner, `probabilities` has one value per option in the order you gave them (they add up to 1), and `confidence` goes from 0 (undecided) to 1 (certain): use it to decide when a person should look at the case instead of trusting the answer.
 
-**If it does not load.** `Model load failed ... see the log` means one of the four files is missing or the folder is not a supported checkpoint (the multilingual one is not). Pass a logger (`LocalModel.Load(path, plan, Console.WriteLine)` / `LocalModel.load(path, plan, logger=print)`) to read the reason. `Decide`/`decide` returns `null`/`None` when the loaded model is not a decision model, and a language model cannot answer `/v1/chat/completions` from this folder (the server says so with a 400).
+**If it does not load.** `Model load failed ... see the log` means one of the four files is missing or the folder is not a decision-model checkpoint. Pass a logger (`LocalModel.Load(path, plan, Console.WriteLine)` / `LocalModel.load(path, plan, logger=print)`) to read the reason. `Decide`/`decide` returns `null`/`None` when the loaded model is not a decision model, and a language model cannot answer `/v1/chat/completions` from this folder (the server says so with a 400).
 
 ## Supported model formats
 

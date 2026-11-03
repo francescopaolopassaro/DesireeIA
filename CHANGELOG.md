@@ -1,5 +1,34 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.4.1 · PyPI `desireeia` 0.4.1 · `desireeia-server` 0.4.1 · engine 0.4.1 (ABI 6)
+
+Decision models, completed: the multilingual Laya checkpoint, the GPU, and Linux on ARM. Nothing changes in the API (the interface stays 6, wrappers built for 0.4.0 keep working): the same calls now take the multilingual folder too, and run on the GPU when there is one.
+
+### Added — the multilingual checkpoint
+
+- The tokenizer reads the SentencePiece-style `tokenizer.json` of the multilingual checkpoint: spaces become U+2581, the text is cut before each mark, BPE runs over characters and a character missing from the vocabulary falls back to its UTF-8 bytes. The names of the special tokens (`<bos>`, `<eos>`, `<mask>`…) come from the checkpoint's `tokenizer_config.json`. A `tokenizer.json` with another kind of pre-tokenizer is refused instead of guessed.
+- Checked against the Hugging Face `tokenizers` library over 42 strings in many scripts (Latin with accents, Chinese, Japanese, Korean, Arabic, Hebrew, Hindi, Thai, Armenian, Russian, emoji, a `<mask>` inside the text): identical ids for both checkpoints. The English tokenizer also got more punctuation of non-Latin scripts in its character table (an Arabic comma was classified as a letter).
+- Against Laya's own code on the same weights, 7 cases in six languages: same token counts, same decisions, logits within 1e-5 on the CPU.
+
+### Added — the GPU
+
+- The encoder and the decision head run on an NVIDIA GPU: half-precision tensor-core matrix products with float accumulation (built for compute capability 7.5 and up, tested on an 8.9 card), a float residual stream, rotary attention with global and sliding-window layers, and the head's layers, all in one `.cu` file that does not touch the language-model CUDA backend. Chosen automatically when the plan leaves the backend open or asks for CUDA and the card has room; any failure (no device, not enough memory, an input over 2048 tokens) falls back to the CPU path by itself. `DESIREEIA_DECISION_CPU=1` forces the CPU.
+- Measured on an RTX 1000 Ada: 17 ms for a 60-token input and 99 ms for 1019 tokens, against 0.13–0.4 s and 2.6–9.5 s on the 22-core CPU. Logits differ from the CPU path by up to 4e-3 (half precision); the decisions are the same in every parity case.
+
+### Added — Linux on ARM
+
+- `linux-arm64` library, cross-built on the x64 Docker container (generic armv8-a, runs on any 64-bit ARM Linux) and **run** on an emulated aarch64 container: the native self-test (71 passed) and the decision-model parity (English and multilingual, logits within 1.5e-5). NEON kernels for the decision models (the four-weight-row matrix product, dot product, half-to-float conversion), so ARM does not fall back to scalar code. `Build\build.ps1` does all of it (`-SkipArm64` skips it); the library is packed into the NuGet package and the PyPI wheel.
+- macOS: the same NEON code is what Apple Silicon compiles, but there is no Mac here, so nothing was built or run. `.github/workflows/native-macos.yml` builds and self-tests `osx-arm64` and `osx-x64` on GitHub's Apple runners (run it by hand and put the artifacts in `Build/runtimes/osx-*/native`); it has not been run yet, and the packages do not claim macOS.
+
+### Faster on the CPU
+
+- Decision models use every logical core unless the plan fixes a thread count (the auto plan is sized for token-by-token decoding and stopped at about 8), and the matrix product works on cache-resident token tiles with a 4x2 AVX2 kernel.
+
+### Tools
+
+- `tools/DecisionParity`: the parity check against Laya's code (`ref.py` records the reference, `cpp.py` compares the engine, `tok_compare.py` the tokenizer), with the recorded short cases. `DesireeIA.Bench decide` and `python/examples/decide_benchmark.py` time the engine.
+- Chat on a model that cannot generate answers 400 and points at `/v1/decide` (0.4.0).
+
 ## NuGet `DesireeIA` 0.4.0 · PyPI `desireeia` 0.4.0 · `desireeia-server` 0.4.0 · engine 0.4.0 (ABI 6)
 
 Decision models: the engine now runs Laya, a model that answers typed questions with a probability per option instead of writing text. Additive: a separate backend that is only reached when the model path is a decision-model folder; every other model, and every existing call, behaves exactly as in 0.3.1. Wrappers built for 0.3.1 keep working against this engine; the new calls say "needs interface 6" on an older one.

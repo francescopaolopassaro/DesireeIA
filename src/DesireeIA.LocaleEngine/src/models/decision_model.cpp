@@ -8,6 +8,9 @@
 #include "decision_model.h"
 #include "decision_json.h"
 #include "core/thread_pool.h"
+#ifdef DESIREEIA_CUDA_ENABLED
+#include "encoder_cuda.h"
+#endif
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -171,6 +174,36 @@ bool DecisionModel::open(const std::string& dir, std::string& err) {
     return true;
 }
 
+bool DecisionModel::enable_gpu(std::string& err) {
+    if (!enc_.enable_gpu(err)) return false;
+#ifdef DESIREEIA_CUDA_ENABLED
+    // The head follows the encoder onto the GPU when it fits; if not, only that part
+    // stays on the CPU and nothing is reported as an error.
+    CudaHeadDesc desc;
+    desc.ffn = head_.empty() ? 0 : (uint32_t) head_[0].lin1.rows;
+    desc.type_emb = type_emb_.data();
+    for (const HeadLayer& L : head_) {
+        CudaHeadLayer cl;
+        cl.in_proj = L.in_proj.data.data();
+        cl.out_proj = L.out_proj.data.data();
+        cl.lin1 = L.lin1.data.data();
+        cl.lin2 = L.lin2.data.data();
+        cl.in_proj_b = L.in_proj_b.data();
+        cl.out_proj_b = L.out_proj_b.data();
+        cl.lin1_b = L.lin1_b.data();
+        cl.lin2_b = L.lin2_b.data();
+        cl.n1w = L.n1w.data();
+        cl.n1b = L.n1b.data();
+        cl.n2w = L.n2w.data();
+        cl.n2b = L.n2b.data();
+        desc.layers.push_back(cl);
+    }
+    std::string head_note;
+    enc_.gpu_set_head(desc, head_note);
+#endif
+    return true;
+}
+
 float DecisionModel::temperature_for(int qtype, size_t k) const {
     auto it = temp_by_bucket_.find(temp_bucket(qtype, k));
     float t = it != temp_by_bucket_.end() ? it->second : temp_by_type_[(size_t) qtype];
@@ -240,57 +273,79 @@ bool DecisionModel::run(const std::vector<int32_t>& ids, const std::vector<size_
                         Answer& out) const {
     const size_t n = ids.size();
     const size_t d = d_;
-    std::vector<float> h;
-    if (!enc_.forward(ids.data(), n, h)) return false;
+    const size_t k = markers.size();
+    std::vector<float> m(k * d);     // hidden state at every option marker
+    std::vector<float> cls(d);       // hidden state of the first position
 
-    for (size_t t = 0; t < n; ++t) {
-        for (size_t i = 0; i < d; ++i) h[t * d + i] += type_emb_[(size_t) qtype * d + i];
+    // Encoder + type embedding + head layers. On the GPU all three stay there and only the
+    // rows the scorer needs come back; otherwise they run here.
+    bool done = false;
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (enc_.gpu_head_ready()) {
+        std::vector<size_t> rows(1, 0);
+        rows.insert(rows.end(), markers.begin(), markers.end());
+        std::vector<float> got;
+        if (enc_.gpu_forward_head(ids.data(), n, qtype, rows.data(), rows.size(), got) && got.size() == rows.size() * d) {
+            std::copy(got.begin(), got.begin() + (long) d, cls.begin());
+            std::copy(got.begin() + (long) d, got.end(), m.begin());
+            done = true;
+        }
     }
+#endif
+    if (!done) {
+        std::vector<float> h;
+        if (!enc_.forward(ids.data(), n, h)) return false;
 
-    const size_t H = std::max<size_t>(1, d / 64);
-    const size_t hd = d / H;
-    const float scale = 1.0f / std::sqrt((float) hd);
-    std::vector<float> y(n * d), qkv(n * 3 * d), att(n * d), proj(n * d);
-    for (const HeadLayer& L : head_) {
-        layer_norm(h.data(), n, d, L.n1w.data(), L.n1b.data(), 1e-5f, y.data());
-        linear_f16(y.data(), n, d, L.in_proj, L.in_proj_b.data(), qkv.data());
-        ThreadPool::global().parallel_for(n * H, [&](size_t a, size_t b) {
-            std::vector<float> sc(n);
-            for (size_t idx = a; idx < b; ++idx) {
-                const size_t t = idx / H;
-                const size_t hh = idx % H;
-                const float* q = qkv.data() + t * 3 * d + hh * hd;
-                float mx = -1e30f;
-                for (size_t k = 0; k < n; ++k) {
-                    sc[k] = dot_f32(q, qkv.data() + k * 3 * d + d + hh * hd, hd) * scale;
-                    mx = std::max(mx, sc[k]);
-                }
-                double sum = 0.0;
-                for (size_t k = 0; k < n; ++k) { sc[k] = std::exp(sc[k] - mx); sum += sc[k]; }
-                const float inv = (float) (1.0 / sum);
-                float* o = att.data() + t * d + hh * hd;
-                for (size_t j = 0; j < hd; ++j) o[j] = 0.0f;
-                for (size_t k = 0; k < n; ++k) {
-                    const float w = sc[k] * inv;
-                    axpy_f32(o, w, qkv.data() + k * 3 * d + 2 * d + hh * hd, hd);
-                }
-            }
-        });
-        linear_f16(att.data(), n, d, L.out_proj, L.out_proj_b.data(), proj.data());
-        for (size_t i = 0; i < n * d; ++i) h[i] += proj[i];
+        for (size_t t = 0; t < n; ++t) {
+            for (size_t i = 0; i < d; ++i) h[t * d + i] += type_emb_[(size_t) qtype * d + i];
+        }
 
-        layer_norm(h.data(), n, d, L.n2w.data(), L.n2b.data(), 1e-5f, y.data());
-        std::vector<float> ffn(n * L.lin1.rows);
-        linear_f16(y.data(), n, d, L.lin1, L.lin1_b.data(), ffn.data());
-        for (float& v : ffn) v = v > 0.0f ? v : 0.0f;               // ReLU, the default of the reference layer
-        linear_f16(ffn.data(), n, L.lin1.rows, L.lin2, L.lin2_b.data(), proj.data());
-        for (size_t i = 0; i < n * d; ++i) h[i] += proj[i];
+        const size_t H = std::max<size_t>(1, d / 64);
+        const size_t hd = d / H;
+        const float scale = 1.0f / std::sqrt((float) hd);
+        std::vector<float> y(n * d), qkv(n * 3 * d), att(n * d), proj(n * d);
+        for (const HeadLayer& L : head_) {
+            layer_norm(h.data(), n, d, L.n1w.data(), L.n1b.data(), 1e-5f, y.data());
+            linear_f16(y.data(), n, d, L.in_proj, L.in_proj_b.data(), qkv.data());
+            ThreadPool::global().parallel_for(n * H, [&](size_t a, size_t b) {
+                std::vector<float> sc(n);
+                for (size_t idx = a; idx < b; ++idx) {
+                    const size_t t = idx / H;
+                    const size_t hh = idx % H;
+                    const float* q = qkv.data() + t * 3 * d + hh * hd;
+                    float mx = -1e30f;
+                    for (size_t k = 0; k < n; ++k) {
+                        sc[k] = dot_f32(q, qkv.data() + k * 3 * d + d + hh * hd, hd) * scale;
+                        mx = std::max(mx, sc[k]);
+                    }
+                    double sum = 0.0;
+                    for (size_t k = 0; k < n; ++k) { sc[k] = std::exp(sc[k] - mx); sum += sc[k]; }
+                    const float inv = (float) (1.0 / sum);
+                    float* o = att.data() + t * d + hh * hd;
+                    for (size_t j = 0; j < hd; ++j) o[j] = 0.0f;
+                    for (size_t k = 0; k < n; ++k) {
+                        const float w = sc[k] * inv;
+                        axpy_f32(o, w, qkv.data() + k * 3 * d + 2 * d + hh * hd, hd);
+                    }
+                }
+            });
+            linear_f16(att.data(), n, d, L.out_proj, L.out_proj_b.data(), proj.data());
+            for (size_t i = 0; i < n * d; ++i) h[i] += proj[i];
+
+            layer_norm(h.data(), n, d, L.n2w.data(), L.n2b.data(), 1e-5f, y.data());
+            std::vector<float> ffn(n * L.lin1.rows);
+            linear_f16(y.data(), n, d, L.lin1, L.lin1_b.data(), ffn.data());
+            for (float& v : ffn) v = v > 0.0f ? v : 0.0f;               // ReLU, the default of the reference layer
+            linear_f16(ffn.data(), n, L.lin1.rows, L.lin2, L.lin2_b.data(), proj.data());
+            for (size_t i = 0; i < n * d; ++i) h[i] += proj[i];
+        }
+        std::copy(h.begin(), h.begin() + (long) d, cls.begin());
+        for (size_t i = 0; i < k; ++i)
+            std::copy(h.begin() + (long) (markers[i] * d), h.begin() + (long) ((markers[i] + 1) * d), m.begin() + (long) (i * d));
     }
 
     // scorer at every option marker
-    const size_t k = markers.size();
-    std::vector<float> m(k * d), mn(k * d), s1(k * d);
-    for (size_t i = 0; i < k; ++i) std::copy(h.begin() + (long) (markers[i] * d), h.begin() + (long) ((markers[i] + 1) * d), m.begin() + (long) (i * d));
+    std::vector<float> mn(k * d), s1(k * d);
     layer_norm(m.data(), k, d, sc_nw_.data(), sc_nb_.data(), 1e-5f, mn.data());
     linear_f16(mn.data(), k, d, sc_l1_, sc_l1_b_.data(), s1.data());
     out.logits.assign(k, 0.0f);
@@ -313,7 +368,7 @@ bool DecisionModel::run(const std::vector<int32_t>& ids, const std::vector<size_
         else if (v > t2) t2 = v;
     }
     std::vector<float> feat(d + 4);
-    std::copy(h.begin(), h.begin() + (long) d, feat.begin());
+    std::copy(cls.begin(), cls.end(), feat.begin());
     feat[d + 0] = t1;
     feat[d + 1] = t1 - t2;
     feat[d + 2] = (float) ent;

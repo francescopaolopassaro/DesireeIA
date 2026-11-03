@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <cstdio>
 #include <iterator>
 
 namespace desireeia {
@@ -92,7 +93,17 @@ bool is_symbol_cp(uint32_t c) {
            (c >= 0x3008 && c <= 0x3020) || (c >= 0xFE00 && c <= 0xFE0F) ||
            (c >= 0xFE30 && c <= 0xFE6F) || (c >= 0xFF01 && c <= 0xFF0F) ||
            (c >= 0xFF1A && c <= 0xFF20) || c == 0xFEFF || c == 0x200B || c == 0x200C ||
-           c == 0x200D || (c >= 0x1F000 && c <= 0x1FAFF) || (c >= 0xE000 && c <= 0xF8FF);
+           c == 0x200D || (c >= 0x1F000 && c <= 0x1FAFF) || (c >= 0xE000 && c <= 0xF8FF) ||
+           // punctuation and symbols of other scripts (Arabic, Hebrew, Devanagari, Armenian, Thai,
+           // Georgian, Ethiopic, Tibetan, Myanmar, Khmer, CJK and fullwidth forms)
+           (c >= 0x0600 && c <= 0x0605) || c == 0x060C || c == 0x060D || c == 0x061B ||
+           c == 0x061E || c == 0x061F || (c >= 0x066A && c <= 0x066D) || c == 0x06D4 ||
+           c == 0x05BE || c == 0x05C0 || c == 0x05C3 || c == 0x05C6 || c == 0x05F3 || c == 0x05F4 ||
+           c == 0x0964 || c == 0x0965 || c == 0x0970 || (c >= 0x055A && c <= 0x055F) || c == 0x0589 ||
+           c == 0x0E3F || c == 0x0E4F || c == 0x0E5A || c == 0x0E5B || c == 0x10FB ||
+           (c >= 0x1360 && c <= 0x1368) || (c >= 0x0F04 && c <= 0x0F12) || (c >= 0x104A && c <= 0x104F) ||
+           (c >= 0x17D4 && c <= 0x17DA) || c == 0x30FB || (c >= 0xFF3B && c <= 0xFF40) ||
+           (c >= 0xFF5B && c <= 0xFF65) || (c >= 0x02C2 && c <= 0x02C5) || (c >= 0x02D2 && c <= 0x02DF);
 }
 
 enum Cls { Letter, Number, Other, Space };
@@ -208,10 +219,15 @@ bool HfBpeTokenizer::load_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return false;
     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    return load_json(content);
+    std::string config;
+    const size_t slash = path.find_last_of("/\\");
+    const std::string dir = slash == std::string::npos ? std::string() : path.substr(0, slash + 1);
+    std::ifstream cf(dir + "tokenizer_config.json", std::ios::binary);
+    if (cf) config.assign((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
+    return load_json(content, config);
 }
 
-bool HfBpeTokenizer::load_json(const std::string& json_text) {
+bool HfBpeTokenizer::load_json(const std::string& json_text, const std::string& config_json) {
     djson::Value root;
     djson::Parser parser(json_text);
     if (!parser.parse(root) || !root.is_obj()) return false;
@@ -229,6 +245,52 @@ bool HfBpeTokenizer::load_json(const std::string& json_text) {
     added_by_first_.clear();
     cache_.clear();
     n_vocab_ = 0;
+    metaspace_ = false;
+    replace_space_ = false;
+    split_ = true;
+    prepend_scheme_ = "always";
+    replacement_ = "\xE2\x96\x81";
+    byte_fallback_ = false;
+
+    // Pre-tokenizer: byte-level (English checkpoints) or metaspace (multilingual).
+    // Anything else is refused: guessing would silently produce wrong token ids.
+    const djson::Value* pre = root.find("pre_tokenizer");
+    if (pre && pre->is_obj()) {
+        const djson::Value* pt = pre->find("type");
+        const std::string ptype = pt && pt->is_str() ? pt->str : std::string();
+        if (ptype == "Metaspace") {
+            metaspace_ = true;
+            if (const djson::Value* r = pre->find("replacement")) if (r->is_str() && !r->str.empty()) replacement_ = r->str;
+            if (const djson::Value* sch = pre->find("prepend_scheme")) {
+                if (sch->is_str()) prepend_scheme_ = sch->str;
+            } else if (const djson::Value* apf = pre->find("add_prefix_space")) {
+                prepend_scheme_ = (apf->type == djson::Value::Bool && !apf->b) ? "never" : "always";
+            }
+            if (const djson::Value* sp = pre->find("split")) split_ = !(sp->type == djson::Value::Bool && !sp->b);
+        } else if (ptype != "ByteLevel") {
+            return false;
+        }
+    }
+    if (const djson::Value* norm = root.find("normalizer")) {
+        auto scan = [&](const djson::Value& n) {
+            const djson::Value* nt = n.find("type");
+            if (!nt || !nt->is_str() || nt->str != "Replace") return;
+            const djson::Value* pat = n.find("pattern");
+            const djson::Value* ps = pat ? pat->find("String") : nullptr;
+            const djson::Value* content = n.find("content");
+            if (ps && ps->is_str() && ps->str == " " && content && content->is_str()) {
+                replace_space_ = true;
+                replacement_ = content->str;
+            }
+        };
+        if (norm->is_obj()) {
+            scan(*norm);
+            if (const djson::Value* list = norm->find("normalizers")) {
+                if (list->is_arr()) for (const auto& n : list->arr) if (n.is_obj()) scan(n);
+            }
+        }
+    }
+    if (const djson::Value* bf = model->find("byte_fallback")) byte_fallback_ = bf->type == djson::Value::Bool && bf->b;
 
     vocab_.reserve(vocab->obj.size());
     int32_t max_id = -1;
@@ -278,10 +340,35 @@ bool HfBpeTokenizer::load_json(const std::string& json_text) {
     }
 
     n_vocab_ = (size_t) (max_id + 1);
-    cls_id_ = token_id("[CLS]");
-    sep_id_ = token_id("[SEP]");
-    mask_id_ = token_id("[MASK]");
-    pad_id_ = token_id("[PAD]");
+
+    // Names of the special tokens: tokenizer_config.json when present, else the
+    // usual encoder names. cls/sep fall back to the bos/eos tokens.
+    std::string cls_name = "[CLS]", sep_name = "[SEP]", mask_name = "[MASK]", pad_name = "[PAD]";
+    if (!config_json.empty()) {
+        djson::Value cfg;
+        djson::Parser cp(config_json);
+        if (cp.parse(cfg) && cfg.is_obj()) {
+            auto name_of = [&](const char* key) {
+                const djson::Value* v = cfg.find(key);
+                if (!v) return std::string();
+                if (v->is_str()) return v->str;
+                if (v->is_obj()) if (const djson::Value* c = v->find("content")) if (c->is_str()) return c->str;
+                return std::string();
+            };
+            std::string v;
+            if (!(v = name_of("cls_token")).empty() || !(v = name_of("bos_token")).empty()) cls_name = v;
+            if (!(v = name_of("sep_token")).empty() || !(v = name_of("eos_token")).empty()) sep_name = v;
+            if (!(v = name_of("mask_token")).empty()) mask_name = v;
+            if (!(v = name_of("pad_token")).empty()) pad_name = v;
+        }
+    }
+    cls_id_ = token_id(cls_name);
+    sep_id_ = token_id(sep_name);
+    mask_id_ = token_id(mask_name);
+    pad_id_ = token_id(pad_name);
+    mask_text_ = mask_name;
+    unk_id_ = -1;
+    if (const djson::Value* u = model->find("unk_token")) if (u->is_str()) unk_id_ = token_id(u->str);
     return !vocab_.empty() && cls_id_ >= 0 && sep_id_ >= 0 && mask_id_ >= 0;
 }
 
@@ -330,18 +417,106 @@ void HfBpeTokenizer::bpe_chunk(const std::string& chunk, std::vector<int32_t>& o
     out.insert(out.end(), ids.begin(), ids.end());
 }
 
-void HfBpeTokenizer::encode_plain(const std::string& text, std::vector<int32_t>& out) const {
+namespace {
+std::string replace_all(std::string s, const std::string& from, const std::string& to) {
+    if (from.empty()) return s;
+    size_t pos = 0;
+    while ((pos = s.find(from, pos)) != std::string::npos) {
+        s.replace(pos, from.size(), to);
+        pos += to.size();
+    }
+    return s;
+}
+}
+
+// BPE of one metaspace piece: characters (or their UTF-8 bytes when the
+// character is not in the vocabulary and byte fallback is on), then merges.
+void HfBpeTokenizer::metaspace_piece(const std::string& piece, std::vector<int32_t>& out) const {
+    auto hit = cache_.find(piece);
+    if (hit != cache_.end()) {
+        out.insert(out.end(), hit->second.begin(), hit->second.end());
+        return;
+    }
+
+    std::vector<std::string> sym;
+    static const std::string kUnk = "\x01<unk>";   // marker no vocabulary entry can equal
+    for (size_t i = 0; i < piece.size();) {
+        size_t len = 0;
+        decode_cp(piece, i, len);
+        const std::string ch = piece.substr(i, len);
+        i += len;
+        if (vocab_.count(ch)) { sym.push_back(ch); continue; }
+        bool ok = byte_fallback_;
+        std::vector<std::string> bytes;
+        if (ok) {
+            for (unsigned char b : ch) {
+                char buf[8];
+                std::snprintf(buf, sizeof buf, "<0x%02X>", (unsigned) b);
+                if (!vocab_.count(buf)) { ok = false; break; }
+                bytes.push_back(buf);
+            }
+        }
+        if (ok) sym.insert(sym.end(), bytes.begin(), bytes.end());
+        else sym.push_back(kUnk);
+    }
+
+    for (;;) {
+        int32_t best = -1;
+        size_t at = 0;
+        for (size_t i = 0; i + 1 < sym.size(); ++i) {
+            auto it = merge_rank_.find(sym[i] + " " + sym[i + 1]);
+            if (it != merge_rank_.end() && (best < 0 || it->second < best)) {
+                best = it->second;
+                at = i;
+            }
+        }
+        if (best < 0) break;
+        sym[at] += sym[at + 1];
+        sym.erase(sym.begin() + (long) at + 1);
+    }
+
+    std::vector<int32_t> ids;
+    for (const auto& s : sym) {
+        auto it = vocab_.find(s);
+        if (it != vocab_.end()) ids.push_back(it->second);
+        else if (unk_id_ >= 0 && (ids.empty() || ids.back() != unk_id_)) ids.push_back(unk_id_);   // fuse_unk
+    }
+    if (cache_.size() < 100000) cache_.emplace(piece, ids);
+    out.insert(out.end(), ids.begin(), ids.end());
+}
+
+void HfBpeTokenizer::encode_plain(const std::string& text, bool first_segment, std::vector<int32_t>& out) const {
     if (text.empty()) return;
-    std::vector<std::string> chunks;
-    pre_tokenize(text, chunks);
-    for (const auto& c : chunks) bpe_chunk(c, out);
+    if (!metaspace_) {
+        std::vector<std::string> chunks;
+        pre_tokenize(text, chunks);
+        for (const auto& c : chunks) bpe_chunk(c, out);
+        return;
+    }
+
+    std::string s = replace_space_ ? replace_all(text, " ", replacement_) : text;
+    const bool prepend = prepend_scheme_ == "always" || (prepend_scheme_ == "first" && first_segment);
+    if (prepend && s.compare(0, replacement_.size(), replacement_) != 0) s = replacement_ + s;
+    if (!split_) { metaspace_piece(s, out); return; }
+
+    // Cut before every replacement mark; the mark stays with the text that follows it.
+    size_t start = 0;
+    for (size_t pos = 0; pos <= s.size();) {
+        const bool at_mark = pos + replacement_.size() <= s.size() && s.compare(pos, replacement_.size(), replacement_) == 0;
+        if (pos == s.size() || (at_mark && pos > start)) {
+            if (pos > start) metaspace_piece(s.substr(start, pos - start), out);
+            start = pos;
+            if (pos == s.size()) break;
+        }
+        pos += at_mark ? replacement_.size() : 1;
+    }
 }
 
 std::vector<int32_t> HfBpeTokenizer::encode(const std::string& text) const {
     std::vector<int32_t> out;
     if (!ready()) return out;
     if (added_.empty()) {
-        encode_plain(text, out);
+        encode_plain(text, true, out);
         return out;
     }
 
@@ -363,7 +538,7 @@ std::vector<int32_t> HfBpeTokenizer::encode(const std::string& text) const {
             while (plain_end > plain_start && is_ws_byte((unsigned char) text[plain_end - 1])) --plain_end;
         }
         if (plain_end > plain_start) {
-            encode_plain(text.substr(plain_start, plain_end - plain_start), out);
+            encode_plain(text.substr(plain_start, plain_end - plain_start), plain_start == 0, out);
         }
         out.push_back(hit->id);
         pos += hit->content.size();
@@ -372,7 +547,7 @@ std::vector<int32_t> HfBpeTokenizer::encode(const std::string& text) const {
         }
         plain_start = pos;
     }
-    if (plain_start < text.size()) encode_plain(text.substr(plain_start), out);
+    if (plain_start < text.size()) encode_plain(text.substr(plain_start), plain_start == 0, out);
     return out;
 }
 

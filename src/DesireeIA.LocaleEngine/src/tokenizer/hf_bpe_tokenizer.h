@@ -16,27 +16,33 @@
 
 namespace desireeia {
 
-// Byte-level BPE tokenizer driven by a tokenizer.json file (the format used
-// next to encoder checkpoints distributed as plain directories). It is a
-// separate class from BpeTokenizer on purpose: that one is fed from GGUF
-// metadata and uses an approximate pre-tokenizer, whereas the decision
-// models need token ids that match the reference implementation exactly.
+// BPE tokenizer driven by a tokenizer.json file (the format used next to
+// encoder checkpoints distributed as plain directories). It is a separate
+// class from BpeTokenizer on purpose: that one is fed from GGUF metadata and
+// uses an approximate pre-tokenizer, whereas the decision models need token
+// ids that match the reference implementation exactly.
 //
-// Pipeline: added tokens are matched atomically (longest first, honouring
-// the lstrip/rstrip flags) -> remaining text is split with the GPT2
-// pre-tokenization pattern -> bytes are mapped to the visible unicode
-// alphabet -> BPE merges by rank -> vocabulary lookup.
+// Two flavours are supported, picked from the file's pre-tokenizer:
+//   - byte-level (English checkpoints): the GPT2 pre-tokenization pattern,
+//     bytes mapped to the visible unicode alphabet, BPE merges by rank;
+//   - metaspace (multilingual checkpoints): spaces become U+2581, the text is
+//     cut before every U+2581, BPE runs over characters, and a character that
+//     is not in the vocabulary falls back to its UTF-8 bytes (<0xHH> pieces).
+// In both, added tokens are matched atomically (longest first, honouring the
+// lstrip/rstrip flags) before anything else.
 //
 // Known gaps: Unicode normalization (NFC) is not applied, so input that is
-// not already NFC-composed can tokenize differently; letter/number/space
-// classification of non-ASCII code points is table-based, not the full
-// Unicode database.
+// not already NFC-composed can tokenize differently; for the byte-level
+// flavour, letter/number classification of non-ASCII code points is
+// table-based, not the full Unicode database.
 class DESIREEIA_INTERNAL HfBpeTokenizer {
 public:
-    // Loads vocab, merges and added tokens from a tokenizer.json file.
+    // Loads vocab, merges and added tokens from a tokenizer.json file. The
+    // names of the special tokens come from a tokenizer_config.json in the
+    // same folder when there is one.
     bool load_file(const std::string& path);
-    // Same, from the file content already in memory.
-    bool load_json(const std::string& json_text);
+    // Same, from the file contents already in memory (config_json may be empty).
+    bool load_json(const std::string& json_text, const std::string& config_json = std::string());
 
     // Encodes text without adding any special token of its own.
     std::vector<int32_t> encode(const std::string& text) const;
@@ -61,8 +67,9 @@ private:
         bool rstrip = false;
     };
 
-    void encode_plain(const std::string& text, std::vector<int32_t>& out) const;
+    void encode_plain(const std::string& text, bool first_segment, std::vector<int32_t>& out) const;
     void bpe_chunk(const std::string& chunk, std::vector<int32_t>& out) const;
+    void metaspace_piece(const std::string& piece, std::vector<int32_t>& out) const;
 
     std::unordered_map<std::string, int32_t> vocab_;
     std::unordered_map<std::string, int32_t> merge_rank_;
@@ -74,7 +81,16 @@ private:
     int32_t sep_id_ = -1;
     int32_t mask_id_ = -1;
     int32_t pad_id_ = -1;
+    int32_t unk_id_ = -1;
     std::string mask_text_ = "[MASK]";
+
+    // metaspace flavour
+    bool metaspace_ = false;
+    bool replace_space_ = false;      // the normalizer turns ' ' into the replacement
+    bool byte_fallback_ = false;
+    bool split_ = true;
+    std::string replacement_ = "\xE2\x96\x81";   // U+2581
+    std::string prepend_scheme_ = "always";
 };
 
 }

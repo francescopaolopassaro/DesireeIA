@@ -43,6 +43,12 @@ public:
     static bool is_decision_dir(const std::string& path);
 
     bool open(const std::string& dir, std::string& err);
+    // Runs the encoder, and when it fits the decision head too, on an NVIDIA GPU
+    // (see ModernBertEncoder). False with the reason when the encoder cannot go to
+    // the GPU; a head that cannot is not an error, it just stays on the CPU.
+    bool enable_gpu(std::string& err);
+    bool gpu_enabled() const { return enc_.gpu_enabled(); }
+    bool gpu_head_ready() const { return enc_.gpu_head_ready(); }
 
     // Runs a decision request and returns the response, both as JSON text.
     //

@@ -1,0 +1,16 @@
+[
+ {"name":"it_choice","state":"Oggetto: Server giù in produzione\n\nSalve, l'API principale restituisce errori 500 da venti minuti e i clienti si lamentano. Intervenite subito.",
+  "q":{"t":"choice","ins":"Instrada questa email al team giusto.","crit":{"fatturazione":"pagamenti e fatture","infrastruttura":"server, disservizi e rilasci","vendite":"nuovi clienti e prezzi"}}},
+ {"name":"zh_choice","state":"你好，我无法登录我的账户，密码总是提示错误，请帮忙处理。",
+  "q":{"t":"choice","ins":"这个请求应该交给哪个部门？","crit":{"账户":"登录和密码问题","账单":"付款和发票","技术":"服务器和故障"}}},
+ {"name":"ar_noul","state":"مرحبا، لا أستطيع تسجيل الدخول إلى حسابي منذ الصباح.",
+  "q":{"t":"noul","ins":"العميل لديه مشكلة في تسجيل الدخول.","crit":null}},
+ {"name":"de_score","state":"Das Produkt ist in Ordnung, aber der Versand war langsam. Der Support hat mein Problem schnell gelöst.",
+  "q":{"t":"score","ins":"Bewerte die Kundenzufriedenheit.","crit":["sehr unzufrieden","unzufrieden","neutral","zufrieden","sehr zufrieden"]}},
+ {"name":"es_json_state","state":{"ticket":{"id":4821,"prioridad":"alta","texto":"Me cobraron dos veces la suscripción, necesito un reembolso."},"cliente":{"nivel":"oro"}},
+  "q":{"t":"choice","ins":"¿Qué departamento debe atender este ticket?","crit":{"facturación":"","soporte":"","ingeniería":""}}},
+ {"name":"mixed_emoji_mask","state":"Cliente: ¡Muchas gracias! 😀 <mask> Il pagamento è arrivato, grazie mille. 谢谢!",
+  "q":{"t":"noul","ins":"The customer is satisfied.","crit":{"true":"il cliente è soddisfatto","false":"il cliente è insoddisfatto"}}},
+ {"name":"long_state","state":"__LONG__",
+  "q":{"t":"choice","ins":"Di cosa parla principalmente il testo?","crit":{"cucina":"ricette e cibo","finanza":"denaro e mercati","sport":"giochi e atleti","viaggi":"viaggi e luoghi"}}}
+]

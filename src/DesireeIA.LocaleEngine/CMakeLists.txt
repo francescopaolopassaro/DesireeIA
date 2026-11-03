@@ -93,7 +93,7 @@ FetchContent_MakeAvailable(brotli)
 target_link_libraries(DesireeIALocaleEngine PRIVATE brotlienc brotlidec brotlicommon)
 
 if(DESIREEIA_ENABLE_CUDA)
-    target_sources(DesireeIALocaleEngine PRIVATE src/cuda/backend_cuda.cu)
+    target_sources(DesireeIALocaleEngine PRIVATE src/cuda/backend_cuda.cu src/cuda/encoder_cuda.cu)
     set_target_properties(DesireeIALocaleEngine PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
     target_link_libraries(DesireeIALocaleEngine PRIVATE CUDA::cudart)
     target_compile_definitions(DesireeIALocaleEngine PRIVATE DESIREEIA_CUDA_ENABLED)

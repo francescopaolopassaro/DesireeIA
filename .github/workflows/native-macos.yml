@@ -1,0 +1,58 @@
+# Builds and self-tests the native engine on Apple hardware (osx-arm64 and
+# osx-x64) and uploads the shared libraries as artifacts.
+#
+# Why this exists: the release script (Build/build.ps1) runs on Windows and
+# can produce win-x64 and, through Docker, linux-x64 and linux-arm64. It cannot
+# build for macOS (that needs a macOS host with the Apple toolchain). Run this
+# workflow by hand (Actions > native-macos > Run workflow), download the two
+# artifacts, and put the files in Build/runtimes/osx-arm64/native/ and
+# Build/runtimes/osx-x64/native/ before packing: the NuGet project and the
+# Python packaging pick them up from there, and the pack guard checks that
+# they export the decision-model entry point.
+#
+# Status: written without access to a Mac, so it has NOT been run yet. The
+# engine code paths it exercises (NEON kernels, std::filesystem, the shared
+# library build) are the ones already verified on linux-arm64 under emulation.
+name: native-macos
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14, rid: osx-arm64, arch: arm64 }
+          - { os: macos-13, rid: osx-x64, arch: x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: >
+          cmake -S src/DesireeIA.LocaleEngine -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DDESIREEIA_BUILD_TESTS=ON
+          -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }}
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build
+        run: cmake --build build --target DesireeIALocaleEngine desireeia_selftest -j 4
+
+      - name: Native self-test
+        run: ./build/desireeia_selftest | tee selftest.log
+
+      - name: The decision-model entry point is exported
+        run: nm -gU build/DesireeIALocaleEngine.dylib | grep desireeia_decide
+
+      - name: Name the library the way the packaging expects
+        run: |
+          mkdir -p out/${{ matrix.rid }}/native
+          cp build/DesireeIALocaleEngine.dylib out/${{ matrix.rid }}/native/libDesireeIALocaleEngine.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.rid }}-native
+          path: out/${{ matrix.rid }}/native/libDesireeIALocaleEngine.dylib
