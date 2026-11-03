@@ -55,8 +55,12 @@ add_library(DesireeIALocaleEngine SHARED
     src/models/prerouter.cpp
     src/models/ssm_forward.cpp
     src/models/bert_forward.cpp
+    src/models/decision_ops.cpp
+    src/models/modernbert_forward.cpp
+    src/models/decision_model.cpp
     src/tokenizer/spm_tokenizer.cpp
     src/tokenizer/bpe_tokenizer.cpp
+    src/tokenizer/hf_bpe_tokenizer.cpp
     src/tokenizer/tokenizer.cpp
     src/gguf/gguf_reader.cpp
     src/quant/quant.cpp

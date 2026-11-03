@@ -61,7 +61,7 @@ class ModelFile:
     name: str
     size_bytes: int
     modified_at: float
-    format: str          # "gguf" | "safetensors" | "unknown"
+    format: str          # "gguf" | "safetensors" | "decision" (a model directory) | "unknown"
     valid: bool          # magic/header check passed
 
 
@@ -123,14 +123,45 @@ def check_magic(path: Path) -> bool:
     return False
 
 
+# A decision model (for example Laya) is a directory, not a single file:
+# the weights plus the encoder config, the tokenizer and the head settings.
+DECISION_MODEL_FILES = (
+    "rl_agent_config.json",
+    "model.safetensors",
+    "encoder/config.json",
+    "tokenizer/tokenizer.json",
+)
+
+
+def is_decision_dir(path: Path) -> bool:
+    return path.is_dir() and all((path / part).is_file() for part in DECISION_MODEL_FILES)
+
+
 def list_models(models_dir: Path) -> Iterator[ModelFile]:
     """Scans `models_dir` (non-recursive: checkpoints are single files,
     not project trees) for supported checkpoints. A file with a supported
     extension but a failing magic check is still listed (so a truncated or
-    wrong-format upload is visible, not silently hidden) with valid=False."""
+    wrong-format upload is visible, not silently hidden) with valid=False.
+    A directory holding a complete decision model is listed too (format
+    "decision"); any other directory is ignored, as before."""
     if not models_dir.is_dir():
         return
     for entry in sorted(models_dir.iterdir(), key=lambda p: p.name.lower()):
+        if entry.is_dir():
+            if is_decision_dir(entry):
+                weights = entry / "model.safetensors"
+                try:
+                    stat = weights.stat()
+                except OSError:
+                    continue
+                yield ModelFile(
+                    name=entry.name,
+                    size_bytes=stat.st_size,
+                    modified_at=stat.st_mtime,
+                    format="decision",
+                    valid=check_magic(weights),
+                )
+            continue
         if not entry.is_file():
             continue
         if entry.suffix.lower() not in SUPPORTED_EXTENSIONS:

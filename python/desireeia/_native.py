@@ -355,6 +355,13 @@ def _setup_signatures(lib: ctypes.CDLL) -> None:
     ]
     lib.desireeia_embed.restype = c_int32
 
+    # ABI 6: decision models (absent on an older engine: LocalModel.decide says so)
+    if hasattr(lib, "desireeia_decide"):
+        lib.desireeia_decide.argtypes = [
+            c_void_p, c_char_p, POINTER(ctypes.c_char), c_uint64, POINTER(c_uint64)
+        ]
+        lib.desireeia_decide.restype = c_int32
+
     # sampling
     lib.desireeia_set_sampling.argtypes = [c_void_p, POINTER(Sampling)]
     lib.desireeia_set_sampling.restype = c_int32

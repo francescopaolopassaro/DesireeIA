@@ -515,8 +515,8 @@ DESIREEIA_API desireeia_error desireeia_predict_image(desireeia_ctx* ctx,
  * missing-symbol crash. 2 = engine 0.1.2 (the functions below); 3 = engine
  * 0.2.0 (tool-call constraint, apply_chat_template_json, context memory); 4 = engine 0.2.1
  * (reasoning budget, min-p/DRY, token stats); 5 = engine 0.3.0 (top candidates per token,
- * attention probe). */
-#define DESIREEIA_ABI_VERSION 5
+ * attention probe); 6 = decision models (desireeia_decide). */
+#define DESIREEIA_ABI_VERSION 6
 DESIREEIA_API int32_t desireeia_abi_version(void);
 
 /* Text of the last error: the context's own (a failed predict, a refused
@@ -771,6 +771,34 @@ DESIREEIA_API desireeia_error desireeia_memory_export(desireeia_memory* mem, con
 DESIREEIA_API desireeia_error desireeia_memory_touch(desireeia_memory* mem, const char* session);
 DESIREEIA_API desireeia_error desireeia_memory_drop_session(desireeia_memory* mem, const char* session);
 DESIREEIA_API desireeia_error desireeia_memory_sweep(desireeia_memory* mem, int32_t* out_removed);
+
+/* ── Decision models (ABI 6) ────────────────────────────────────────────────
+ * A decision model is a non-autoregressive encoder with a typed decision
+ * head: it never generates text. desireeia_create accepts the model's
+ * directory (rl_agent_config.json, model.safetensors, encoder/config.json,
+ * tokenizer/tokenizer.json) in place of a model file.
+ *
+ * request_json: { "state": <text or any JSON value>,
+ *                 "questions": [ {"type": "choice"|"score"|"noul",
+ *                                 "instruction": "...", "options": ...}, ... ],
+ *                 "calibrate": true, "truncate_left": false }
+ * The answer is a JSON document with, per question, the option labels, the
+ * calibrated probabilities, the raw logits, the chosen option, a confidence
+ * in [0,1] and the act/escalate head's probabilities.
+ *
+ * Output convention is the one of desireeia_embed: out_json=NULL with
+ * out_capacity=0 only fills *out_len (length in bytes without the
+ * terminator); the buffer is NUL-terminated and needs *out_len + 1 bytes.
+ * The model runs once for a request that is repeated back to back.
+ *
+ * Returns DESIREEIA_ERR_NOT_SUPPORTED when the loaded model is not a
+ * decision model, DESIREEIA_ERR_PARSE for an invalid request (the text is
+ * available through desireeia_last_error). */
+DESIREEIA_API desireeia_error desireeia_decide(desireeia_ctx* ctx,
+                                               const char* request_json,
+                                               char* out_json,
+                                               size_t out_capacity,
+                                               size_t* out_len);
 
 #ifdef __cplusplus
 }

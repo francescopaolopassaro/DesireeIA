@@ -203,6 +203,18 @@ class Slot:
                 self._busy = False
             self.touch()
 
+    def decide(self, state, questions, calibrate: bool = True, truncate_left: bool = False):
+        """Typed decisions from a decision model, or None when the loaded model is not one. Decision models keep no
+        generation state, so this does not take the busy gate: only the inference lock, which serializes the
+        replica's native calls."""
+        model = self.ensure_loaded()
+        with self._inference_lock:
+            self.touch()
+            try:
+                return model.decide(state, questions, calibrate=calibrate, truncate_left=truncate_left)
+            finally:
+                self.touch()
+
     def info(self) -> Optional[dict]:
         if self._state != SlotState.LOADED or self._model is None:
             return None
@@ -375,6 +387,12 @@ class SlotPrediction:
 
     def run(self, cancelled: threading.Event, tracker: TokenTracker) -> Iterator[PredictionStep]:
         model = self._slot.ensure_loaded()
+        if not model.has_tokenizer:
+            # An encoder or a decision model: nothing here can turn text into a prompt, and without this the
+            # request failed deep in the engine as an opaque 500.
+            from .api.errors import NotSupportedError
+            raise NotSupportedError(
+                "this model cannot generate text (it has no tokenizer); decision models are used through /v1/decide")
         with self._slot._gate:
             if self._slot._busy:
                 raise SlotBusy()

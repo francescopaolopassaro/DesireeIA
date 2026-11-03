@@ -252,6 +252,17 @@ internal static class NativeMethods
                                               out nuint outLen,
                                               out uint outEmbdDim);
 
+    // Decision models (interface 6): JSON request in, JSON answers out. Same
+    // query-size convention as desireeia_embed: outJson=null with
+    // outCapacity=0 fills only outLen (bytes, without the terminator); the
+    // buffer needs outLen + 1 bytes.
+    [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
+    internal static extern Error desireeia_decide(IntPtr ctx,
+                                               [MarshalAs(UnmanagedType.LPUTF8Str)] string requestJson,
+                                               byte[]? outJson,
+                                               nuint outCapacity,
+                                               out nuint outLen);
+
     // which: 0=BOS 1=EOS 2=UNK 3=PAD (desireeia_special_token in abi.h).
     [DllImport(Lib, CallingConvention = CallingConvention.Cdecl)]
     internal static extern Error desireeia_special_token_id(IntPtr ctx, int which, out int outId);

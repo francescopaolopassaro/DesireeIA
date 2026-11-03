@@ -396,6 +396,48 @@ public sealed class LocalModel : IDisposable
     }
 
     /// <summary>
+    /// Typed decisions from a decision model (a model directory such as Laya).
+    /// <paramref name="state"/> is free text or any object that serializes to
+    /// JSON; each question is answered with a probability per option. The model
+    /// never generates text. Returns null if the loaded model is not a decision
+    /// model.
+    /// </summary>
+    public DecisionResult? Decide(object state, IReadOnlyList<DecisionQuestion> questions,
+                                  bool calibrate = true, bool truncateLeft = false)
+    {
+        var json = DecideJson(DecisionJson.BuildRequest(state, questions, calibrate, truncateLeft));
+        return json is null ? null : DecisionJson.ParseResponse(json);
+    }
+
+    /// <summary>
+    /// Raw form of <see cref="Decide"/>: a JSON request in, the JSON answers out
+    /// (the format is described in desireeia_decide, abi.h). Null if the loaded
+    /// model is not a decision model.
+    /// </summary>
+    public string? DecideJson(string requestJson)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        NativeMethods.Error err;
+        nuint len;
+        try
+        {
+            err = NativeMethods.desireeia_decide(_context, requestJson, null, 0, out len);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            throw new InvalidOperationException(
+                "The native engine is too old for decision models (needs interface 6).");
+        }
+        if (err == NativeMethods.Error.NotSupported) return null;
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException(Describe("Decide failed", err, _context));
+
+        var buf = new byte[checked((int) len + 1)];
+        err = NativeMethods.desireeia_decide(_context, requestJson, buf, (nuint) buf.Length, out len);
+        if (err != NativeMethods.Error.Ok) throw new InvalidOperationException(Describe("Decide failed", err, _context));
+        return System.Text.Encoding.UTF8.GetString(buf, 0, (int) len);
+    }
+
+    /// <summary>
     /// Id of the requested special token (BOS/EOS/UNK/PAD), or null if the
     /// model does not define it or does not have a recognized vocabulary.
     /// </summary>

@@ -392,6 +392,65 @@ class LocalModel:
             rows.append(row)
         return rows
 
+    # -- decision models ------------------------------------------------------
+
+    def decide(
+        self,
+        state,
+        questions: List[dict],
+        calibrate: bool = True,
+        truncate_left: bool = False,
+    ) -> Optional[dict]:
+        """Typed decisions from a decision model (a model directory such as Laya).
+
+        ``state`` is free text or any JSON-serializable value. ``questions`` is a
+        list of dicts, each with ``type`` (``"choice"``, ``"score"`` or ``"noul"``),
+        ``instruction`` and the options:
+
+        * choice: ``options`` = ``{"label": "description", ...}`` (or a list of labels)
+        * score:  ``options`` = ``["level 0 text", "level 1 text", ...]``
+        * noul:   optional ``"true"`` / ``"false"`` descriptions
+
+        Returns ``{"model": ..., "answers": [...]}``; every answer has ``options``,
+        ``probabilities`` (calibrated unless ``calibrate=False``), ``logits``,
+        ``index``, ``choice``, ``confidence`` and the act/escalate probabilities.
+        Returns None if the loaded model is not a decision model. The model never
+        generates text.
+        """
+        import json
+        from .engine import last_error
+
+        self._check()
+        lib = _nat.get_lib()
+        if not hasattr(lib, "desireeia_decide"):
+            raise RuntimeError("The native engine is too old for decision models (needs interface 6)")
+
+        request = json.dumps(
+            {
+                "state": state,
+                "questions": questions,
+                "calibrate": bool(calibrate),
+                "truncate_left": bool(truncate_left),
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+        out_len = c_uint64()
+        with self._lock:
+            err = lib.desireeia_decide(self._ctx, request, None, 0, byref(out_len))
+        if err == Error.NOT_SUPPORTED:
+            return None
+        if err != Error.OK:
+            detail = last_error()
+            raise ValueError(f"Decide failed: {Error(err).name}" + (f" - {detail}" if detail else ""))
+
+        buf = ctypes.create_string_buffer(out_len.value + 1)
+        with self._lock:
+            err = lib.desireeia_decide(self._ctx, request, buf, len(buf), byref(out_len))
+        if err != Error.OK:
+            raise RuntimeError(f"Decide failed: {Error(err).name}")
+        return json.loads(buf.value.decode("utf-8"))
+
     # -- special tokens ------------------------------------------------------
 
     def special_token_id(self, which: SpecialToken) -> Optional[int]:

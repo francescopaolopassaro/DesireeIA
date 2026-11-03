@@ -1,5 +1,26 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.4.0 · PyPI `desireeia` 0.4.0 · `desireeia-server` 0.4.0 · engine 0.4.0 (ABI 6)
+
+Decision models: the engine now runs Laya, a model that answers typed questions with a probability per option instead of writing text. Additive: a separate backend that is only reached when the model path is a decision-model folder; every other model, and every existing call, behaves exactly as in 0.3.1. Wrappers built for 0.3.1 keep working against this engine; the new calls say "needs interface 6" on an older one.
+
+### Added — decision models
+
+- A ModernBERT encoder (rotary positions, gated-GELU feed-forward, bias-free norms, alternating full and sliding-window attention) with half-precision weights widened row by row, and the typed decision head (`choice`, `score`, `noul`; one mask marker per option; per-bucket temperature calibration read from the checkpoint). Loaded straight from the Hugging Face folder: no conversion step.
+- A tokenizer driven by `tokenizer.json` (byte-level BPE with the full GPT-2 pre-tokenization pattern, added tokens with their strip flags). Known gaps: no Unicode NFC normalization of the input, and non-ASCII letter/number classification is table-based. The multilingual checkpoint (a different tokenizer) is not supported yet.
+- `desireeia_decide` (ABI 6): JSON request in, JSON answers out, two-call buffer convention; a request repeated back to back runs the model once. `NOT_SUPPORTED` when the model is not a decision model, `PARSE` with the reason in `desireeia_last_error` for an invalid request.
+- C#: `LocalModel.Decide(state, questions)` with `DecisionQuestion.Choice/Score/NoUl`, `DecisionAnswer`, `DecisionResult`; `DecideJson` for the raw form. Python: `LocalModel.decide(state, questions)`. Server: `POST /v1/decide`; a folder holding a complete decision model in the models directory is listed and served like a checkpoint file.
+- Chat on a model that cannot generate (no tokenizer) now answers 400 pointing at `/v1/decide` instead of an opaque 500.
+
+### Verified
+
+- Same weights, same inputs, against the reference implementation (7 cases: all three question types, a structured state, accents/emoji/quotes, a 1024-token input that hits truncation): same token counts, same decisions, largest logit difference 5e-6.
+- CPU only, 22 logical cores: 0.13–0.25 s for a 60-token input and 2.6–6.7 s for 1024 tokens (benchmarks in `python/examples/decide_benchmark.py` and `DesireeIA.Bench decide`). The first version took 0.46 s and 18 s: the matrix product now works on token tiles that stay in cache with a 4x2 AVX2 kernel, attention is vectorized, and a decision model uses every logical core unless the plan fixes the thread count (the auto plan is sized for token-by-token decoding and stops at about 8). A GPU path for the encoder is the next step.
+
+### Packaging
+
+- `dotnet pack` now refuses to pack a native library that does not export `desireeia_decide`, naming the file: an engine that `Build\build.ps1` has not refreshed (the Linux library needs Docker) can no longer go into the package silently. `-p:SkipEngineCheck=true` overrides it.
+
 ## NuGet `DesireeIA` 0.3.1 · PyPI `desireeia` 0.3.1 · `desireeia-server` 0.3.1 · engine 0.3.1 (ABI 5)
 
 Found by using 0.3.0 from Kodinn's prompt laboratory: two diagnostics that cost far more than they should, one feature that was too slow on big vocabularies, and one speed idea made available. Additive: wrappers built for 0.3.0 keep working; the new calls say "needs a native engine 0.3.1" on an older one.

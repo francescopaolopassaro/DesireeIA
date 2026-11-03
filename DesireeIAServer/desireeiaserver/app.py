@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
 
 from . import __version__
-from .api import (chat, embeddings, errors as api_errors, health, metrics_api,
+from .api import (chat, decide, embeddings, errors as api_errors, health, metrics_api,
                    models_files, props, score, settings_api, tokenize, tools_api, transcribe_api)
 from .api.v1 import build_router as build_v1_router
 from . import engine
@@ -108,6 +108,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(settings_api.router)
     app.include_router(tokenize.router)
     app.include_router(score.router)
+    app.include_router(decide.router)
     app.include_router(chat.router)
     app.include_router(embeddings.router)
     app.include_router(models_files.router)

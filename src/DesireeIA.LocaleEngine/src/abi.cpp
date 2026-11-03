@@ -69,7 +69,7 @@ namespace {
 #define DESIREEIA_EMIT(level, msg) emit_impl(__FILE__, __LINE__, __func__, (level), (msg))
 
 DESIREEIA_API const char* desireeia_version(void) {
-    return "0.3.1";
+    return "0.4.0";
 }
 
 DESIREEIA_API desireeia_error desireeia_set_logger(desireeia_log_cb cb, void* user) {
@@ -344,6 +344,32 @@ DESIREEIA_API desireeia_error desireeia_embed(desireeia_ctx* ctx,
     *out_embd_dim = dim;
     if (out_embd && out_capacity >= embd.size()) {
         std::memcpy(out_embd, embd.data(), embd.size() * sizeof(float));
+    }
+    return DESIREEIA_OK;
+    ABI_GUARD_END
+}
+
+DESIREEIA_API desireeia_error desireeia_decide(desireeia_ctx* ctx,
+                                               const char* request_json,
+                                               char* out_json,
+                                               size_t out_capacity,
+                                               size_t* out_len) {
+    ABI_GUARD_BEGIN
+    if (!ctx || !request_json || !out_len) {
+        return DESIREEIA_ERR_INVALID_ARG;
+    }
+    std::string response;
+    std::string error;
+    bool supported = false;
+    if (!desireeia::engine_decide(ctx, request_json, response, error, supported)) {
+        if (!supported) return DESIREEIA_ERR_NOT_SUPPORTED;
+        tl_last_error = error;
+        return DESIREEIA_ERR_PARSE;
+    }
+    *out_len = response.size();
+    if (out_json && out_capacity >= response.size() + 1) {
+        std::memcpy(out_json, response.data(), response.size());
+        out_json[response.size()] = '\0';
     }
     return DESIREEIA_OK;
     ABI_GUARD_END

@@ -411,6 +411,15 @@ bool engine_is_eog_token(const desireeia_ctx* ctx, int32_t id);
 bool engine_embed(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
                    std::vector<float>& out_embd, uint32_t& out_embd_dim);
 
+// Decision model (a directory holding an encoder plus a typed decision
+// head, see models/decision_model.h): runs a JSON request of typed
+// questions over a state and returns the JSON answers. false when the
+// loaded model is not a decision model (DESIREEIA_ERR_NOT_SUPPORTED in the
+// ABI, signalled by supported=false) or when the request is invalid
+// (error describes why).
+bool engine_decide(desireeia_ctx* ctx, const std::string& request_json,
+                   std::string& response_json, std::string& error, bool& supported);
+
 // Sampling (see core/sampler.h and desireeia_sampling in abi.h).
 bool engine_set_sampling(desireeia_ctx* ctx, const desireeia_sampling& params);
 bool engine_get_sampling(const desireeia_ctx* ctx, desireeia_sampling& out);

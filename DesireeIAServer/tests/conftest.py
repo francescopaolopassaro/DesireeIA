@@ -131,6 +131,31 @@ class FakeLocalModel:
     def embed(self, tokens):
         return None
 
+    # decision models (engine interface 6): only a path containing "laya" behaves as one, the rest answer None
+    def decide(self, state, questions, calibrate=True, truncate_left=False):
+        self.last_decide = {"state": state, "questions": questions, "calibrate": calibrate,
+                            "truncate_left": truncate_left}
+        if "laya" not in str(self.model_path).lower():
+            return None
+        answers = []
+        for q in questions:
+            qtype = q.get("type", q.get("t"))
+            options = q.get("options", q.get("crit"))
+            if qtype == "noul":
+                labels = ["false", "true"]
+            elif qtype == "score":
+                labels = [str(i) for i in range(len(options))]
+            else:
+                labels = list(options)
+            if len(labels) < 2:
+                raise ValueError("Decide failed: PARSE - question 0: needs at least two options")
+            rest = 0.3 / (len(labels) - 1)
+            probs = [0.7] + [rest] * (len(labels) - 1)
+            answers.append({"type": qtype, "options": labels, "probabilities": probs, "logits": [2.0] + [0.0] * (len(labels) - 1),
+                            "index": 0, "choice": labels[0], "confidence": 0.4, "act_probability": 1.0,
+                            "act_probabilities": [1.0, 0.0], "n_tokens": 42})
+        return {"model": "fake-decision", "answers": answers}
+
     def context_size(self) -> int:
         return 2048
 

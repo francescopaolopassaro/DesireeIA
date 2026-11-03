@@ -35,6 +35,9 @@ using System.Diagnostics;
 using System.Text.Json;
 using DesireeIA;
 
+// Decision models (Laya): `DesireeIA.Bench decide <model-folder> [--lengths 64,256,1024] [--runs 5]`.
+if (args.Length > 0 && args[0] == "decide") return DecisionBench.Run(args.Skip(1).ToArray());
+
 var paths = new List<string>();
 var prefillSizes = new[] { 512, 2048 };
 int decodeTokens = 64, restSeconds = 30, outTokens = 64;

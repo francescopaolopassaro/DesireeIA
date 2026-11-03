@@ -59,6 +59,168 @@ DesireeIA is designed to provide high-performance AI integration tailored for pr
 
 ---
 
+## Decision models — Laya (0.4.0)
+
+`LocalModel` also runs **decision models**: pass the folder of a [Laya](https://huggingface.co/convaiinnovations/laya) checkpoint (as downloaded from Hugging Face) instead of a GGUF file. They never generate text: you give a state and typed questions, and get a probability for every option.
+
+```csharp
+using DesireeIA;
+
+using var model = LocalModel.Load(@"C:\models\laya\typed-decisions", new ExecutionPlan());
+
+var result = model.Decide(
+    "Subject: Server down in production. The main API returns 500 errors.",
+    new[]
+    {
+        DecisionQuestion.Choice("Route this email.", new Dictionary<string, string>
+        {
+            ["billing"] = "payments and invoices",
+            ["infra"] = "servers and outages",
+            ["sales"] = "new customers and pricing"
+        }),
+        DecisionQuestion.Score("Rate the urgency.", new[] { "none", "low", "medium", "high", "critical" }),
+        DecisionQuestion.NoUl("Customers are affected.")
+    });
+
+foreach (var answer in result!.Answers)
+    Console.WriteLine($"{answer.Choice}  confidence {answer.Confidence:F2}");   // Decide returns null for a model that is not a decision model
+```
+
+The state can be text or any object that serializes to JSON. Use `Confidence` (1 minus the normalized entropy) to decide when to escalate; the model's act/escalate output is reported by its authors as unreliable. Needs the native engine interface 6 (shipped in this package). To time it: `DesireeIA.Bench decide <folder>` (source in the repository's `bench/`).
+
+**How fast is it?** On a laptop CPU only (Intel Core Ultra, 22 logical cores, other applications open), the time for one question grows with the length of the input — the question, the options and the state together, in tokens:
+
+| Input | Time for one decision | Throughput |
+|---|---|---|
+| ~60 tokens (a short email) | 0.13 – 0.25 s | 250 – 450 tokens/s |
+| ~250 tokens | 0.5 – 1.4 s | 180 – 540 tokens/s |
+| ~500 tokens | 1.0 – 2.6 s | 195 – 480 tokens/s |
+| ~1000 tokens (the model's limit) | 2.6 – 6.7 s | 150 – 390 tokens/s |
+
+The range is the spread between runs of the benchmark below on a machine that was not idle; on a quiet machine expect the lower figure. All cores are used unless you fix `ThreadCount` in the plan. A GPU path for the encoder is not there yet.
+
+**Measure it on your machine** (the program loads the model, prints one decision of each type, then times the same question over inputs of growing length):
+
+```bash
+# Python
+python python/examples/decide_benchmark.py laya/typed-decisions
+# C# (from the repository root)
+dotnet run -c Release --project bench/DesireeIA.Bench -- decide laya/typed-decisions
+```
+
+Options for both: `--lengths 64,256,1024` and `--runs 5`.
+
+#### Guide: get Laya from Hugging Face and use it
+
+**1. Pick the checkpoint.** The repository [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) is about 2.4 GB and holds several checkpoints. Download only one folder:
+
+| Folder | Size | Input window | Status |
+|---|---|---|---|
+| `typed-decisions/` | 843 MB | 1024 tokens | **recommended** (fine-tuned for typed decisions), tested |
+| repository root | 843 MB | 512 tokens | English base checkpoint, tested |
+| `multilingual/` | 644 MB | 1024 tokens | not supported yet (its tokenizer is a different kind) |
+
+Laya is released under Apache 2.0 by its authors; keep their license and attribution when you redistribute it.
+
+**2. Download it.** You need Python only for this step (or any tool that can fetch the files with the same folder layout):
+
+```bash
+pip install -U huggingface_hub
+hf download convaiinnovations/laya --include "typed-decisions/*" --local-dir laya
+```
+
+If the `hf` command is not on your PATH, run it as `python -m huggingface_hub.cli.hf download ...`. The same thing from Python:
+
+```python
+from huggingface_hub import snapshot_download
+snapshot_download("convaiinnovations/laya", allow_patterns=["typed-decisions/*"], local_dir="laya")
+```
+
+For the English base checkpoint use `--include "model.safetensors" --include "rl_agent_config.json" --include "encoder/*" --include "tokenizer/*"` instead.
+
+**3. Check the folder.** The engine takes the folder as it is, with no conversion. It must contain these files (the hidden `.cache` folder Hugging Face leaves next to them can be deleted):
+
+```
+laya/typed-decisions/
+├── model.safetensors
+├── rl_agent_config.json
+├── encoder/config.json
+└── tokenizer/tokenizer.json
+```
+
+**4. Use it from C#.**
+
+```bash
+dotnet add package DesireeIA
+```
+
+```csharp
+using DesireeIA;
+
+// The folder, not a file. The weights (about 1 GB) are read once at load time.
+using var model = LocalModel.Load("laya/typed-decisions", new ExecutionPlan());
+
+var result = model.Decide(
+    "Subject: Server down in production. The main API returns 500 errors.",
+    new[]
+    {
+        DecisionQuestion.Choice("Route this email.", new Dictionary<string, string>
+        {
+            ["billing"] = "payments and invoices",
+            ["infra"] = "servers and outages",
+            ["sales"] = "new customers and pricing"
+        })
+    });
+
+var answer = result!.Answers[0];
+Console.WriteLine($"{answer.Choice} ({answer.Probabilities[answer.Index]:P0}, confidence {answer.Confidence:F2})");
+```
+
+**5. Use it from Python.**
+
+```bash
+pip install desireeia
+```
+
+```python
+from desireeia import LocalModel, ExecutionPlan
+
+with LocalModel.load("laya/typed-decisions", ExecutionPlan()) as model:
+    result = model.decide(
+        "Subject: Server down in production. The main API returns 500 errors.",
+        [{"type": "choice", "instruction": "Route this email.",
+          "options": {"billing": "payments and invoices",
+                      "infra": "servers and outages",
+                      "sales": "new customers and pricing"}}],
+    )
+    answer = result["answers"][0]
+    print(answer["choice"], answer["probabilities"], answer["confidence"])
+```
+
+**6. Or through the server** (any language, OpenAI-style errors):
+
+```bash
+pip install desireeia-server
+desireeia-server --model laya/typed-decisions --port 8080
+curl http://127.0.0.1:8080/v1/decide -H "Content-Type: application/json" -d '{
+  "state": "Subject: Server down in production. The main API returns 500 errors.",
+  "questions": [{"type": "choice", "instruction": "Route this email.",
+                 "options": {"billing": "payments", "infra": "servers and outages", "sales": "pricing"}}]}'
+```
+
+Putting the `typed-decisions` folder into the server's models directory works too: it is listed in `/v1/models` like a model file.
+
+Each answer is a small object. For the example above you get, in essence:
+
+```json
+{"choice": "infra", "options": ["billing", "infra", "sales"],
+ "probabilities": [0.06, 0.85, 0.09], "confidence": 0.52}
+```
+
+`choice` is the winner, `probabilities` has one value per option in the order you gave them (they add up to 1), and `confidence` goes from 0 (undecided) to 1 (certain): use it to decide when a person should look at the case instead of trusting the answer.
+
+**If it does not load.** `Model load failed ... see the log` means one of the four files is missing or the folder is not a supported checkpoint (the multilingual one is not). Pass a logger (`LocalModel.Load(path, plan, Console.WriteLine)` / `LocalModel.load(path, plan, logger=print)`) to read the reason. `Decide`/`decide` returns `null`/`None` when the loaded model is not a decision model, and a language model cannot answer `/v1/chat/completions` from this folder (the server says so with a 400).
+
 ## Supported model formats
 
 - **GGUF**

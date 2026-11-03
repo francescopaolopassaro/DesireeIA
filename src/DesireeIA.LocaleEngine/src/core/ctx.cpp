@@ -17,6 +17,7 @@
 #include "models/dense_forward.h"
 #include "models/ssm_forward.h"
 #include "models/bert_forward.h"
+#include "models/decision_model.h"
 #include "vision/vision_gguf.h"
 #include "ssd_tier/hybrid_tier.h"
 #include "tokenizer/tokenizer.h"
@@ -45,6 +46,15 @@ struct EngineContext {
     // has no KV cache to reset. Separate field, mutually exclusive with gf
     // (a model is either generative or an encoder, never both here).
     BertForward* bert = nullptr;
+    // Decision model (encoder + typed decision head, non-autoregressive).
+    // Its own backend: set only when the path is a decision-model
+    // directory, in which case none of the fields above is used.
+    DecisionModel* decision = nullptr;
+    // Last decision request and its answer: the two-call buffer convention
+    // of the ABI asks the same question twice, and the second call must not
+    // run the model again.
+    std::string decide_req;
+    std::string decide_resp;
     Tokenizer tok;
     bool has_tok = false;
     int32_t last_token = -1;
@@ -641,6 +651,33 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
     ctx->st.last_error.clear();
     ctx->st.usage_file = sidecar_path(model_path ? model_path : "", ".desireeia_usage");
 
+    // A decision-model directory has its own loader and shares nothing with
+    // the paths below; every other model path falls through unchanged.
+    if (model_path && DecisionModel::is_decision_dir(model_path)) {
+        DecisionModel* dm = new DecisionModel;
+        std::string derr;
+        if (!dm->open(model_path, derr)) {
+            if (log) log(3, ("decision model: " + derr).c_str());
+            delete dm;
+            delete ctx;
+            return nullptr;
+        }
+        ctx->decision = dm;
+        // The auto plan sizes the pool for token-by-token decoding, which is
+        // memory-bound and stops scaling after a handful of threads. An encoder
+        // pass is compute-bound and keeps scaling with every core, so unless the
+        // caller fixed a thread count it gets all of them (measured: a 1000-token
+        // input takes 6.8 s on the auto count and 2.6 s on every logical core).
+        if (plan.n_threads <= 0) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            if (hw > 0) ThreadPool::set_thread_override((int) hw);
+        }
+#ifdef DESIREEIA_CUDA_ENABLED
+        g_live_contexts.fetch_add(1);
+#endif
+        return reinterpret_cast<desireeia_ctx*>(ctx);
+    }
+
     auto* reader = make_reader(ctx->st.plan.format);
     if (!reader) {
         delete ctx;
@@ -840,6 +877,7 @@ void engine_destroy(desireeia_ctx* ctx) {
     if (c->st.hybrid) c->st.hybrid->save_usage();
     delete c->gf;
     delete c->bert;
+    delete c->decision;
     delete c->st.kv;
     delete c->st.experts;
     delete c->st.hybrid;
@@ -857,6 +895,23 @@ bool engine_embed(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens,
     if (!c->bert || !c->st.reader || n_tokens == 0) return false;
     out_embd_dim = c->bert->config().n_embd;
     return c->bert->encode(*c->st.reader, tokens, n_tokens, out_embd);
+}
+
+bool engine_decide(desireeia_ctx* ctx, const std::string& request_json,
+                   std::string& response_json, std::string& error, bool& supported) {
+    EngineContext* c = reinterpret_cast<EngineContext*>(ctx);
+    supported = false;
+    if (!c || !c->decision) return false;
+    supported = true;
+    std::lock_guard<std::mutex> lk(c->mtx);
+    if (!c->decide_req.empty() && c->decide_req == request_json) {
+        response_json = c->decide_resp;
+        return true;
+    }
+    if (!c->decision->decide(request_json, response_json, error)) return false;
+    c->decide_req = request_json;
+    c->decide_resp = response_json;
+    return true;
 }
 
 

@@ -1,9 +1,14 @@
 # DesireeIA
-![Version 0.3.1](https://img.shields.io/badge/version-v0.3.1-blue)
+![Version 0.4.0](https://img.shields.io/badge/version-v0.4.0-blue)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
 **A local inference engine built for agents.** A native C++17 core with a stable C ABI, official packages for .NET (NuGet) and Python (PyPI), and an OpenAI-compatible server — where the things an agent needs are part of the engine itself, down to the token, instead of glue code around it.
 <img src="images/DesireeIA.jpg" />
+
+> ### 🆕 Decision models: DesireeIA now runs Laya
+>
+> A native C++ engine that runs **[Laya](https://huggingface.co/convaiinnovations/laya)** — the model that answers *typed questions with a probability per option instead of writing text* — straight from its Hugging Face folder: **no Python, no PyTorch, no ONNX conversion**. The same engine already runs your GGUF language models, and it is one call away from C# (`model.Decide(...)`), Python (`model.decide(...)`) and the OpenAI-style server (`POST /v1/decide`). Output matches the reference implementation to 5·10⁻⁶ on the logits. [How to use it and what it costs →](#decision-models--typed-answers-no-generated-text-040)
+
 ## What it does
 
 DesireeIA loads quantized language models from disk and runs them entirely on local hardware — no network calls, no external services. It auto-adapts its execution plan to the machine it's running on, and on a 6 GB laptop GPU it outruns llama.cpp on the same GGUF files (see "Measured performance").
@@ -144,6 +149,166 @@ Three calls that make the engine usable as a building block, not only as a chat 
 
 `desireeia-server` also honours `response_format` (`json_object` and `json_schema`) with the engine's schema constraint instead of a prompt instruction, and answers `n` > 1 (up to 8, not streamed): the prompt is prefilled once and the answers are drawn one after the other.
 
+### Decision models — typed answers, no generated text (0.4.0)
+
+A decision model reads a *state* (an email, a ticket, a JSON record) and a list of typed *questions*, and returns a probability for every option you define. It never generates text, so there is nothing to parse and nothing to hallucinate. The engine runs [Laya](https://huggingface.co/convaiinnovations/laya) (a ModernBERT encoder with a typed decision head) from its Hugging Face folder as it is: `model.safetensors`, `tokenizer/tokenizer.json`, `encoder/config.json` and `rl_agent_config.json`. Point `--model`, `LocalModel.Load` or `LocalModel.load` at that folder, or drop the folder into the server's models directory.
+
+Three question types: `choice` (one of N labelled options), `score` (an ordinal level 0..N-1) and `noul` (does the statement hold: false/true). The answer carries calibrated probabilities, the raw logits, the chosen option and a `confidence` (1 minus the normalized entropy; use it to decide when to escalate — the model's act/escalate head is reported by its authors as unreliable).
+
+```
+POST /v1/decide
+{"state": "Subject: Server down in production ...",
+ "questions": [{"type": "choice", "instruction": "Route this email.",
+                "options": {"billing": "payments", "infra": "servers and outages", "sales": "pricing"}}]}
+→ {"answers": [{"choice": "infra", "probabilities": [0.05, 0.88, 0.07], "confidence": 0.60, ...}]}
+```
+
+```csharp
+var result = model.Decide(email, new[] { DecisionQuestion.Choice("Route this email.", "billing", "infra", "sales") });
+Console.WriteLine(result!.Answers[0].Choice);
+```
+
+```python
+result = model.decide(email, [{"type": "choice", "instruction": "Route this email.",
+                               "options": {"billing": "", "infra": "", "sales": ""}}])
+print(result["answers"][0]["choice"])
+```
+
+Checked against the reference implementation on the same weights: the largest difference in the logits is 5e-6, with the same tokenization and the same decision. Calls with a model that is not a decision model return `NOT_SUPPORTED` / `null`. Only English-checkpoint-style tokenizers (byte-level BPE `tokenizer.json`) are supported; the multilingual Laya checkpoint is not yet.
+
+**How fast is it?** On a laptop CPU only (Intel Core Ultra, 22 logical cores, other applications open), the time for one question grows with the length of the input — the question, the options and the state together, in tokens:
+
+| Input | Time for one decision | Throughput |
+|---|---|---|
+| ~60 tokens (a short email) | 0.13 – 0.25 s | 250 – 450 tokens/s |
+| ~250 tokens | 0.5 – 1.4 s | 180 – 540 tokens/s |
+| ~500 tokens | 1.0 – 2.6 s | 195 – 480 tokens/s |
+| ~1000 tokens (the model's limit) | 2.6 – 6.7 s | 150 – 390 tokens/s |
+
+The range is the spread between runs of the benchmark below on a machine that was not idle; on a quiet machine expect the lower figure. All cores are used unless you fix `ThreadCount` in the plan. A GPU path for the encoder is not there yet.
+
+**Measure it on your machine** (the program loads the model, prints one decision of each type, then times the same question over inputs of growing length):
+
+```bash
+# Python
+python python/examples/decide_benchmark.py laya/typed-decisions
+# C# (from the repository root)
+dotnet run -c Release --project bench/DesireeIA.Bench -- decide laya/typed-decisions
+```
+
+Options for both: `--lengths 64,256,1024` and `--runs 5`.
+
+#### Guide: get Laya from Hugging Face and use it
+
+**1. Pick the checkpoint.** The repository [`convaiinnovations/laya`](https://huggingface.co/convaiinnovations/laya) is about 2.4 GB and holds several checkpoints. Download only one folder:
+
+| Folder | Size | Input window | Status |
+|---|---|---|---|
+| `typed-decisions/` | 843 MB | 1024 tokens | **recommended** (fine-tuned for typed decisions), tested |
+| repository root | 843 MB | 512 tokens | English base checkpoint, tested |
+| `multilingual/` | 644 MB | 1024 tokens | not supported yet (its tokenizer is a different kind) |
+
+Laya is released under Apache 2.0 by its authors; keep their license and attribution when you redistribute it.
+
+**2. Download it.** You need Python only for this step (or any tool that can fetch the files with the same folder layout):
+
+```bash
+pip install -U huggingface_hub
+hf download convaiinnovations/laya --include "typed-decisions/*" --local-dir laya
+```
+
+If the `hf` command is not on your PATH, run it as `python -m huggingface_hub.cli.hf download ...`. The same thing from Python:
+
+```python
+from huggingface_hub import snapshot_download
+snapshot_download("convaiinnovations/laya", allow_patterns=["typed-decisions/*"], local_dir="laya")
+```
+
+For the English base checkpoint use `--include "model.safetensors" --include "rl_agent_config.json" --include "encoder/*" --include "tokenizer/*"` instead.
+
+**3. Check the folder.** The engine takes the folder as it is, with no conversion. It must contain these files (the hidden `.cache` folder Hugging Face leaves next to them can be deleted):
+
+```
+laya/typed-decisions/
+├── model.safetensors
+├── rl_agent_config.json
+├── encoder/config.json
+└── tokenizer/tokenizer.json
+```
+
+**4. Use it from C#.**
+
+```bash
+dotnet add package DesireeIA
+```
+
+```csharp
+using DesireeIA;
+
+// The folder, not a file. The weights (about 1 GB) are read once at load time.
+using var model = LocalModel.Load("laya/typed-decisions", new ExecutionPlan());
+
+var result = model.Decide(
+    "Subject: Server down in production. The main API returns 500 errors.",
+    new[]
+    {
+        DecisionQuestion.Choice("Route this email.", new Dictionary<string, string>
+        {
+            ["billing"] = "payments and invoices",
+            ["infra"] = "servers and outages",
+            ["sales"] = "new customers and pricing"
+        })
+    });
+
+var answer = result!.Answers[0];
+Console.WriteLine($"{answer.Choice} ({answer.Probabilities[answer.Index]:P0}, confidence {answer.Confidence:F2})");
+```
+
+**5. Use it from Python.**
+
+```bash
+pip install desireeia
+```
+
+```python
+from desireeia import LocalModel, ExecutionPlan
+
+with LocalModel.load("laya/typed-decisions", ExecutionPlan()) as model:
+    result = model.decide(
+        "Subject: Server down in production. The main API returns 500 errors.",
+        [{"type": "choice", "instruction": "Route this email.",
+          "options": {"billing": "payments and invoices",
+                      "infra": "servers and outages",
+                      "sales": "new customers and pricing"}}],
+    )
+    answer = result["answers"][0]
+    print(answer["choice"], answer["probabilities"], answer["confidence"])
+```
+
+**6. Or through the server** (any language, OpenAI-style errors):
+
+```bash
+pip install desireeia-server
+desireeia-server --model laya/typed-decisions --port 8080
+curl http://127.0.0.1:8080/v1/decide -H "Content-Type: application/json" -d '{
+  "state": "Subject: Server down in production. The main API returns 500 errors.",
+  "questions": [{"type": "choice", "instruction": "Route this email.",
+                 "options": {"billing": "payments", "infra": "servers and outages", "sales": "pricing"}}]}'
+```
+
+Putting the `typed-decisions` folder into the server's models directory works too: it is listed in `/v1/models` like a model file.
+
+Each answer is a small object. For the example above you get, in essence:
+
+```json
+{"choice": "infra", "options": ["billing", "infra", "sales"],
+ "probabilities": [0.06, 0.85, 0.09], "confidence": 0.52}
+```
+
+`choice` is the winner, `probabilities` has one value per option in the order you gave them (they add up to 1), and `confidence` goes from 0 (undecided) to 1 (certain): use it to decide when a person should look at the case instead of trusting the answer.
+
+**If it does not load.** `Model load failed ... see the log` means one of the four files is missing or the folder is not a supported checkpoint (the multilingual one is not). Pass a logger (`LocalModel.Load(path, plan, Console.WriteLine)` / `LocalModel.load(path, plan, logger=print)`) to read the reason. `Decide`/`decide` returns `null`/`None` when the loaded model is not a decision model, and a language model cannot answer `/v1/chat/completions` from this folder (the server says so with a 400).
+
 ### Every model's own chat template
 
 The engine compiles the GGUF's `tokenizer.chat_template` at load time and renders it with a native Jinja interpreter — `if`/`for`/`set`/`namespace`/`macro`, filters such as `tojson`, `selectattr` and `map`, Python string and dict methods, Hugging Face's `trim_blocks`/`lstrip_blocks`. The test suite renders 23 real templates in 4 conversations each and compares them byte for byte with jinja2. A template that refuses a conversation (Gemma has no `tool` role) falls back to the engine's built-in formats.
@@ -210,6 +375,7 @@ Beyond the dense family:
 - **DeepSeek2** — Multi-head Latent Attention (compressed KV cache, absorbed projections), Mixture-of-Experts with a shared-expert branch and sigmoid gating, YaRN rope scaling
 - **Mamba2** — pure state-space model (selective scan, causal depthwise convolution, constant-size recurrent state instead of a growing KV cache)
 - **BERT** — encoder-only, bidirectional attention, post-norm topology, per-token embedding output (no next-token generation)
+- **Decision models (Laya)** — ModernBERT encoder (rotary positions, gated-GELU feed-forward, alternating global and sliding-window attention) plus a typed decision head; typed probabilities instead of text, see *Decision models* above. A separate backend: it changes nothing for the models above
 
 Mixture-of-Experts models route through a tiered expert store (see below) rather than holding every expert in RAM at once.
 

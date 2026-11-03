@@ -13,7 +13,7 @@
        session (KV prefix reuse) - see CHANGELOG.md. -->
   <PropertyGroup>
     <PackageId>DesireeIA</PackageId>
-    <Version>0.3.1</Version>
+    <Version>0.4.0</Version>
     <Authors>Passaro Francesco Paolo</Authors>
     <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
     <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
@@ -22,7 +22,7 @@
     <PackageProjectUrl>https://github.com/francescopaolopassaro/DesireeIA</PackageProjectUrl>
     <RepositoryUrl>https://github.com/francescopaolopassaro/DesireeIA</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>0.0.3: automatic configuration - AutoConfigurator picks backend, threads, RAM budget, non-greedy sampling (temp 0.7, top-k 40, top-p 0.9), context and reply length for the model on the current machine. New AutoConfigurator, AutoConfiguration, ModelTraits and LocalModel.LoadAuto. Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
+    <PackageReleaseNotes>0.4.0: decision models - LocalModel.Decide runs Laya-style models (typed questions, a probability per option, no generated text) with DecisionQuestion / DecisionResult; the engine interface is now 6. Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>
@@ -150,6 +150,84 @@
     hasn't been built yet (osx-x64/osx-arm64/linux-arm64 placeholders) is
     silently omitted rather than failing the pack.
   -->
+  <!--
+    Guard against shipping a stale engine. The native libraries packed below
+    come from Build\runtimes\<RID>\native, which only Build\build.ps1
+    refreshes; a platform that was not rebuilt (the Linux .so needs Docker)
+    would otherwise go into the package silently, and the C# wrapper would
+    then fail at run time with a missing entry point. Every packed engine
+    must export all the functions this wrapper binds that older engines lack
+    (RequiredEngineSymbols); pack fails and names the offending file when one
+    does not. Pass -p:SkipEngineCheck=true to pack anyway.
+  -->
+  <PropertyGroup>
+    <RequiredEngineSymbols>desireeia_decide</RequiredEngineSymbols>
+  </PropertyGroup>
+
+  <UsingTask TaskName="AssertNativeExports" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Files ParameterType="Microsoft.Build.Framework.ITaskItem[]" Required="true" />
+      <Symbols ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Using Namespace="System.Text" />
+      <Code Type="Class" Language="cs"><![CDATA[
+using System;
+using System.IO;
+using System.Text;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+
+public class AssertNativeExports : Task
+{
+    [Required] public ITaskItem[] Files { get; set; }
+    [Required] public string Symbols { get; set; }
+
+    public override bool Execute()
+    {
+        var wanted = Symbols.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+        foreach (var file in Files)
+        {
+            var bytes = File.ReadAllBytes(file.ItemSpec);
+            foreach (var symbol in wanted)
+            {
+                if (IndexOf(bytes, Encoding.ASCII.GetBytes(symbol)) < 0)
+                    Log.LogError("The engine " + file.ItemSpec + " does not export '" + symbol +
+                                 "': it is older than this wrapper. Rebuild it with Build\\build.ps1 before packing " +
+                                 "(the Linux library needs Docker running).");
+            }
+        }
+        return !Log.HasLoggedErrors;
+    }
+
+    private static int IndexOf(byte[] haystack, byte[] needle)
+    {
+        for (int i = 0; i + needle.Length <= haystack.Length; i++)
+        {
+            if (haystack[i] != needle[0]) continue;
+            int j = 1;
+            while (j < needle.Length && haystack[i + j] == needle[j]) j++;
+            if (j == needle.Length) return i;
+        }
+        return -1;
+    }
+}
+]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="AssertShippedEngineIsCurrent" BeforeTargets="GenerateNuspec" Condition="'$(SkipEngineCheck)' != 'true'">
+    <ItemGroup>
+      <_PackedEngine Include="@(None)"
+                     Condition="'%(None.Pack)' == 'true' and $([System.String]::Copy('%(None.Filename)').Contains('DesireeIALocaleEngine'))" />
+    </ItemGroup>
+    <Message Importance="high" Text="Checking that every packed engine exports: $(RequiredEngineSymbols)" />
+    <AssertNativeExports Files="@(_PackedEngine)" Symbols="$(RequiredEngineSymbols)" />
+  </Target>
+
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)..\..\Build\runtimes\win-x64\native\DesireeIALocaleEngine.dll"
           Pack="true" PackagePath="runtimes\win-x64\native\DesireeIALocaleEngine.dll"
