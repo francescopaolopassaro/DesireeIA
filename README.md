@@ -1,5 +1,5 @@
 # DesireeIA
-![Version 0.4.1](https://img.shields.io/badge/version-v0.4.1-blue)
+![Version 0.4.3](https://img.shields.io/badge/version-v0.4.3-blue)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
 **A local inference engine built for agents.** A native C++17 core with a stable C ABI, official packages for .NET (NuGet) and Python (PyPI), and an OpenAI-compatible server — where the things an agent needs are part of the engine itself, down to the token, instead of glue code around it.
@@ -57,6 +57,8 @@ DesireeIA is designed to provide high-performance AI integration tailored for pr
 - [x] Core C# integration infrastructure (Beta 0.1)
 - [x] Performance and memory benchmarking on enterprise laptop profiles
 - [x] Advanced hallucination mitigation and model tuning for Spark
+- [x] Spark X2.6 on the GPU: correct (the per-head attention gate was skipped when the output projection is Q8_0) and 17 → **52 tok/s** with the BF16 gate re-quantized on the device (0.4.2)
+- [x] Loop stop: a reply that repeats the same tokens three times in a row ends by itself — no logit touched, tool calls exempt (0.4.3)
 - [x] Multi-language bindings (Python SDK + OpenAI-compatible server, see "Python server" below)
 - [x] Agentic engine (0.2.0): context memory on SSD, token-level tool calls, native Jinja chat templates
 - [x] Token probabilities and the most likely alternatives of every token (0.3.0): `SetTopCandidates`, `GetTopCandidates`

@@ -90,6 +90,16 @@ struct EngineContext {
     // decoded piece of every vocabulary entry it filters on, built once on
     // first use (the mask needs every piece at every constrained step).
     ToolCallConstraint tool;
+    // DRY OFF INSIDE A TOOL CALL THE MODEL WRITES AS TEXT. An edit call repeats, within the same answer, most of
+    // the text it replaces; DRY (which breaks "same sentence over and over" loops) would push the replacement
+    // away from the original. The token constraint already suspends DRY, but a caller that parses the calls
+    // itself does not set one: this follows the generated text instead, only while DRY is on.
+    std::string dry_tail;
+    bool in_tool_text = false;
+    // LOOP STOP: where this generation starts in `history`, and whether the guard is on (DESIREEIA_NO_LOOP_STOP=1
+    // switches it off).
+    size_t gen_start_idx = 0;
+    bool loop_stop = std::getenv("DESIREEIA_NO_LOOP_STOP") == nullptr;
     // Whole-output constraint from a JSON schema (core/json_grammar.h). When set it
     // takes the place of the tool-call constraint: it uses the same piece tables.
     JsonSchemaConstraint json;
@@ -1034,7 +1044,35 @@ static void tool_mask(EngineContext* c, std::vector<float>& logits) {
     }
 }
 
+static void dry_track(EngineContext* c, int32_t token) {
+    if ((c->sampler.ext().dry_multiplier <= 0.0f && !c->loop_stop) || !c->has_tok || c->eog_ids.count(token)) return;
+    std::string piece;
+    c->tok.piece(token, piece);
+    if (piece.empty()) return;
+    c->dry_tail += piece;
+    // The LAST tag in the tail decides: an opening one means inside a call, a closing one outside.
+    static const char* const kOpen[] = {"<tool_call", "<function", "<|tool_call", "[TOOL_CALLS"};
+    static const char* const kClose[] = {"</tool_call>", "</function>", "<|/tool_call", "<tool_call|>"};
+    size_t open_at = std::string::npos, close_at = std::string::npos;
+    for (const char* t : kOpen) {
+        const size_t p = c->dry_tail.rfind(t);
+        if (p != std::string::npos && (open_at == std::string::npos || p > open_at)) open_at = p;
+    }
+    for (const char* t : kClose) {
+        const size_t p = c->dry_tail.rfind(t);
+        if (p != std::string::npos && (close_at == std::string::npos || p > close_at)) close_at = p;
+    }
+    if (open_at != std::string::npos || close_at != std::string::npos) {
+        if (close_at == std::string::npos) c->in_tool_text = true;
+        else if (open_at == std::string::npos) c->in_tool_text = false;
+        else c->in_tool_text = open_at > close_at;
+    }
+    // Only a tag's length is ever needed to find one split across pieces.
+    if (c->dry_tail.size() > 32) c->dry_tail.erase(0, c->dry_tail.size() - 32);
+}
+
 static void tool_accept(EngineContext* c, int32_t token) {
+    dry_track(c, token);
     if (c->json.configured()) {
         if (c->eog_ids.count(token)) return;
         std::string piece;
@@ -1050,6 +1088,41 @@ static void tool_accept(EngineContext* c, int32_t token) {
     std::string piece;
     if (c->has_tok) c->tok.piece(token, piece);
     c->tool.accept(piece);
+}
+
+// ---- loop stop ------------------------------------------------------------
+//
+// A REPLY THAT HAS STARTED REPEATING ITSELF EXACTLY IS OVER. When the last 3*p generated tokens are the same p tokens
+// three times in a row (12 <= p <= 256), the token about to be emitted is replaced by end-of-generation: the caller
+// stops as it does at any end, with the text written so far. No logit is touched, so a reply that is not looping is
+// identical with or without this; a tool call written as text (in_tool_text) and constrained output are exempt —
+// a file can legitimately hold the same block three times. Seen with Spark X2.6 at temperature 0:
+// "Il cliente: "Un cappuccino, per favore." / Il barista: …" until the caller's watchdog ended it.
+static bool loop_detected(const EngineContext* c, int32_t next) {
+    const std::vector<int32_t>& h = c->history;
+    const size_t n = h.size() + 1;                      // the history plus the token about to be emitted
+    const size_t start = std::min(c->gen_start_idx, h.size());
+    if (n < start + 36) return false;
+    const size_t gen = n - start;
+    auto at = [&](size_t i) { return i == h.size() ? next : h[i]; };
+    for (size_t p = 12; p <= 256 && 3 * p <= gen; ++p) {
+        if (at(n - 1) != at(n - 1 - p)) continue;      // cheap reject: most periods fail on the last token
+        bool same = true;
+        for (size_t k = 1; k <= 2 * p; ++k) {
+            if (at(n - k) != at(n - k - p)) { same = false; break; }
+        }
+        if (same) return true;
+    }
+    return false;
+}
+
+// Replaces OUT with end-of-generation when the reply is looping. True when it did.
+static bool loop_guard(EngineContext* c, int32_t& out) {
+    if (!c->loop_stop || c->eog_ids.empty() || c->in_tool_text || c->tool.constraining() || c->json.constraining()) return false;
+    if (c->eog_ids.count(out) || !loop_detected(c, out)) return false;
+    if (c->st.log) c->st.log(2, "loop stop: the reply repeated the same tokens three times; ended it");
+    out = *c->eog_ids.begin();
+    return true;
 }
 
 static void bias_apply(const EngineContext* c, std::vector<float>& logits) {
@@ -1426,6 +1499,9 @@ bool engine_predict(desireeia_ctx* ctx, const int32_t* tokens, size_t n_tokens, 
     c->spec_align = -1;
     c->sampler.set_generation_start(n_tokens);
     c->sampler.set_dry_suspended(false);
+    c->dry_tail.clear();
+    c->in_tool_text = false;
+    c->gen_start_idx = (size_t) n_tokens;
     rb_reset(c, tokens, n_tokens);
     if (!c->bias.empty()) bias_apply(c, logits);
     if (c->json.constraining()) tool_mask(c, logits);
@@ -1566,6 +1642,8 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
         const int r = next_token_pipelined(c, out_token);
         if (r == 1) {
             tool_accept(c, out_token);
+            // The step in flight was launched with the looping token: drain it so the cache matches what the caller got.
+            if (loop_guard(c, out_token)) { drain_pipeline(c); return true; }
             // The step already in flight drew the next token unconstrained:
             // undo it so that token is drawn under the mask.
             if (tool_needs_host(c)) drain_pipeline(c);
@@ -1611,11 +1689,12 @@ bool engine_next_token(desireeia_ctx* ctx, int32_t& out_token) {
         bias_apply(c, logits);
         if (constrained) tool_mask(c, logits);
     }
-    c->sampler.set_dry_suspended(c->tool.constraining() || c->json.constraining());
+    c->sampler.set_dry_suspended(c->tool.constraining() || c->json.constraining() || c->in_tool_text);
     out_token = got == 1 ? c->sampler.sample_candidates(c->cand_ids, c->cand_vals, c->history)
                          : c->sampler.sample(logits, c->history);
     rb_apply(c, out_token);
     tool_accept(c, out_token);
+    loop_guard(c, out_token);
     c->last_token = out_token;
     return true;
 }
@@ -2462,6 +2541,9 @@ bool engine_predict_vision(desireeia_ctx* ctx, const int32_t* tokens, size_t n_t
     c->spec_align = -1;
     c->sampler.set_generation_start(n_tokens);
     c->sampler.set_dry_suspended(false);
+    c->dry_tail.clear();
+    c->in_tool_text = false;
+    c->gen_start_idx = (size_t) n_tokens;
     rb_reset(c, tokens, n_tokens);
     if (!c->bias.empty()) bias_apply(c, logits);
     if (c->json.constraining()) tool_mask(c, logits);

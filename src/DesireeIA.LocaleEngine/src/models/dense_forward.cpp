@@ -2181,6 +2181,35 @@ bool DenseForward::load_layer_data(ModelReader& rd, uint32_t il, LayerWeights& w
                 last_fail_ = "attn_gate.weight il=" + std::to_string(il);
                 return false;
             }
+#ifdef DESIREEIA_CUDA_ENABLED
+            // A FLOAT GATE KEEPS THE WHOLE LAYER OFF THE DEVICE. Stored in BF16/F16/F32
+            // (Spark X2.6 ships it in BF16) it loads as a float matrix, which the
+            // device layer cannot take, so every token fell back to the host
+            // attention: 17 tok/s against 54 for the same model shape with a
+            // quantized gate. It is tiny (n_head x n_embd), so on CUDA it is
+            // re-quantized to Q8_0 here — finer than the Q4_K other releases ship it
+            // in. The CPU backend keeps the exact float matrix.
+            if (g_active_backend == DESIREEIA_BACKEND_CUDA && w.attn_gate.format == MatVecFormat::Float &&
+                cfg_.n_embd % QK8_0 == 0 && w.attn_gate.f.size() == (size_t) cfg_.n_head * cfg_.n_embd) {
+                const size_t nb = cfg_.n_embd / QK8_0;
+                std::vector<uint8_t> raw((size_t) cfg_.n_head * nb * sizeof(block_q8_0));
+                std::vector<int8_t> q;
+                std::vector<float> scales;
+                std::vector<uint8_t> signs;
+                for (uint32_t r = 0; r < cfg_.n_head; ++r) {
+                    quantize_q8_0(w.attn_gate.f.data() + (size_t) r * cfg_.n_embd, cfg_.n_embd, q, scales, signs);
+                    auto* blocks = reinterpret_cast<block_q8_0*>(raw.data() + (size_t) r * nb * sizeof(block_q8_0));
+                    for (size_t b = 0; b < nb; ++b) {
+                        blocks[b].d = desireeia_fp32_to_fp16(scales[b]);
+                        std::memcpy(blocks[b].qs, q.data() + b * QK8_0, QK8_0);
+                    }
+                }
+                w.attn_gate.f.clear();
+                w.attn_gate.raw = std::move(raw);
+                w.attn_gate.format = MatVecFormat::Q8_0;
+                cuda_make_resident(w.attn_gate, cfg_.n_head, cfg_.n_embd, loading_persistent_);
+            }
+#endif
         }
     } else {
         const uint32_t rot_l = cfg_.layer_n_rot(il);
@@ -3847,8 +3876,14 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             const size_t kv_layer_off = kv_quantized_
                 ? (size_t) l * cache_capacity_ * ((size_t) cfg_.n_head_kv * kv_q_row_bytes_)
                 : ((size_t) l * cache_capacity_) * kv_dim * sizeof(float);
+            // NOT WITH A PER-HEAD ATTENTION GATE (DenseQuirks::attn_gate): this
+            // episode goes straight from the attention to the output projection
+            // on device, so the gate — applied between the two, below — would be
+            // skipped. Spark X2.6 (attn_output in Q8_0, attn_gate in BF16) took
+            // this path and generated garbage from the second token; Spark X2.5
+            // never did only because its attn_output was Q4_K.
             if (g_active_backend == DESIREEIA_BACKEND_CUDA && cuda_kv_ready_ &&
-                !quirks_.alibi &&
+                !quirks_.alibi && !quirks_.attn_gate &&
                 lw->wo.format == MatVecFormat::Q8_0 && lw->wo.cuda_qs &&
                 lw->wo.lora.empty() && lw->bo.empty() &&
                 cuda_attention_out(

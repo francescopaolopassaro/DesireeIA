@@ -13,7 +13,7 @@
        session (KV prefix reuse) - see CHANGELOG.md. -->
   <PropertyGroup>
     <PackageId>DesireeIA</PackageId>
-    <Version>0.4.1</Version>
+    <Version>0.4.3</Version>
     <Authors>Passaro Francesco Paolo</Authors>
     <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
     <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
@@ -22,7 +22,7 @@
     <PackageProjectUrl>https://github.com/francescopaolopassaro/DesireeIA</PackageProjectUrl>
     <RepositoryUrl>https://github.com/francescopaolopassaro/DesireeIA</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>0.4.1: the multilingual Laya checkpoint, the encoder and decision head on the NVIDIA GPU (about 17 ms per short question), and a linux-arm64 native library. No API change (interface 6). Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
+    <PackageReleaseNotes>0.4.3: loop stop — a reply that repeats the same tokens three times in a row ends by itself (no logit is touched, tool calls written as text are exempt; DESIREEIA_NO_LOOP_STOP=1 turns it off). DRY also suspends itself inside a tool call written as text. No API change (interface 6). Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>

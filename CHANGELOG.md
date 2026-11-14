@@ -1,5 +1,37 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.4.3 · engine 0.4.3 (ABI 6)
+
+A reply that starts repeating itself now ends by itself. Nothing changes in the API; the PyPI packages stay at 0.4.1.
+
+### Fixed — small models repeating the same lines until a watchdog stops them
+
+- At temperature 0 a 4B model can fall into an exact loop. Asked "Raccontami una barzelletta", Spark X2.6 answered "Il cliente: "Un cappuccino, per favore." / Il barista: …" line after line until the caller's 300 s watchdog ended it — no answer at all, minutes of GPU.
+- **Loop stop**: when the last 3·p generated tokens are the same p tokens three times in a row (12 ≤ p ≤ 256), the engine ends the reply there, as at any end-of-generation, with the text written so far. It never changes a logit, so a reply that is not looping is token-for-token the same as before. A tool call written as text (`<tool_call>`…`</tool_call>`, `<function`…`</function>`, `<|tool_call`, `[TOOL_CALLS`) and constrained output are exempt: a file may hold the same block three times. `DESIREEIA_NO_LOOP_STOP=1` switches it off.
+- DRY now also suspends itself inside a tool call written as text (before, only inside a constrained one), for callers that turn DRY on.
+
+### Measured (KodinnCli, local models on an RTX 1000 Ada, 3 runs per task: chat, bug fix + shell, multi-place edit + tests)
+
+- The looping prompt ends in about 40 s with an answer; every other result matches the settings before (greedy, DRY off) on Spark X2.6, MiniCPM5 2B, Qwen2.5-Coder 3B and Gemma 3 4B.
+- Tried and rejected for agents: DRY on by default (it bent text the model repeats on purpose — a folder path copied twice came out altered) and temperature 0.6 + min-p (Spark X2.6 passed 1 of 3 multi-place edits against 3 of 3 greedy).
+
+## NuGet `DesireeIA` 0.4.2 · engine 0.4.2 (ABI 6)
+
+Spark X2.6 on the GPU: correct, and as fast as Spark X2.5. Nothing changes in the API (the interface stays 6). The PyPI packages stay at 0.4.1.
+
+### Fixed — Spark X2.6 generated garbage on CUDA
+
+- On the CPU Spark X2.6 answered correctly; on an NVIDIA GPU the first token was right and everything after it was noise (`thought threads threads…`). Cause: models with a **per-head attention gate** (the Spark family) multiply each head's attention output by a sigmoid gate before the output projection. When the output projection is stored in Q8_0 — as it is in Spark X2.6, while Spark X2.5 ships it in Q4_K — decode took a device episode that goes straight from the attention to the output projection, so the gate was never applied. That episode is now skipped for gated models, exactly like the fused attention block already was; none of the `DESIREEIA_CUDA_NO_*` switches reached it, which is why turning them off one by one changed nothing.
+
+### Faster — a float attention gate no longer keeps the layer on the host
+
+- Spark X2.6 stores the gate in BF16 (Spark X2.5 in Q4_K). A BF16/F16/F32 tensor loads as a float matrix, which the whole-layer device path cannot take, so every token ran its attention on the host. On CUDA the gate — tiny, one row per head — is now re-quantized to Q8_0 at load (finer than the Q4_K other releases use); the CPU backend keeps the exact float matrix.
+- Measured on an RTX 1000 Ada, 64 decoded tokens: Spark X2.6 **17.4 → 52.0 tok/s**, float fallback calls 2304 → 0; Spark X2.5 unchanged at 54.6 tok/s.
+
+### Checks
+
+- Native self-test: 82 passed, 0 failed. Spark X2.5 and X2.6 on CPU and CUDA give coherent answers to the same prompts.
+
 ## NuGet `DesireeIA` 0.4.1 · PyPI `desireeia` 0.4.1 · `desireeia-server` 0.4.1 · engine 0.4.1 (ABI 6)
 
 Decision models, completed: the multilingual Laya checkpoint, the GPU, and Linux on ARM. Nothing changes in the API (the interface stays 6, wrappers built for 0.4.0 keep working): the same calls now take the multilingual folder too, and run on the GPU when there is one.

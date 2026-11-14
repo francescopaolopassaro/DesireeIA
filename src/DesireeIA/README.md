@@ -1,17 +1,23 @@
 # DesireeIA
-![Version 0.1.2](https://img.shields.io/badge/version-v0.1.2-blue)
+![Version 0.4.3](https://img.shields.io/badge/version-v0.4.3-blue)
 [![Status](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
-> **DesireeIA 0.1.2 — stable and fast.** This release jumps straight from
-> 0.0.x to 0.1.2 because it brings more than 30 new features, optimizations
-> and fixes at once (see [CHANGELOG.md](https://github.com/francescopaolopassaro/DesireeIA/blob/main/CHANGELOG.md)), each one validated
-> with in-depth tests — native self-test, .NET and Python suites, Linux and
-> ARM64 builds — and benchmarked on real models. The engine is now stable
-> and fast: prefill several times faster on GPU and CPU, an agent system
-> prompt restored in well under a second from a saved session, a stable
-> ABI with cancellation and progress, and correctness fixes that make whole
-> model families (Qwen2.5 with YaRN, the MiniCPM/Mistral-style dense family)
-> answer properly. [Measured performance](#measured-performance) below.
+> **DesireeIA 0.4.3 — no more endless loops.** A reply that repeats the same tokens three times in a row
+> now ends by itself; nothing else changes (no logit is touched, tool calls are exempt).
+>
+> **0.4.2 — Spark X2.6 on the GPU.** Spark X2.6 now runs correctly on
+> NVIDIA GPUs (it produced garbage after the first token) and as fast as
+> Spark X2.5: **17 → 52 tok/s** on an RTX 1000 Ada laptop GPU. No API change.
+>
+> - **Language models**: GGUF, CPU (AVX2/AVX-512/NEON) and CUDA, every model's own chat template,
+>   tool calls constrained at token level, JSON schema output, reasoning budget, min-p and DRY,
+>   session KV reuse, speculative decoding from the text.
+> - **Decision models** (0.4.0–0.4.1): Laya, English and multilingual, typed answers with a probability
+>   for every option, on the GPU or the CPU.
+> - **Platforms**: win-x64 (CPU + CUDA), linux-x64, linux-arm64 native libraries in this package.
+>
+> Full notes: [CHANGELOG.md](https://github.com/francescopaolopassaro/DesireeIA/blob/main/CHANGELOG.md).
+
 ---
 
 A local large language model inference engine for the .NET ecosystem: a native C++17 core exposed through a stable C ABI, with an idiomatic .NET wrapper on top.
