@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 from typing import Optional
 
 from . import _native as _nat
@@ -21,7 +22,10 @@ def detect_hardware() -> HardwareProfile:
     err = _nat.get_lib().desireeia_probe_hw(hw)
     if err != Error.OK:
         raise RuntimeError(f"Hardware probe failed: {Error(err).name}")
-    return HardwareProfile.from_native(hw)
+    profile = HardwareProfile.from_native(hw)
+    if profile.cuda_device_count > 0:
+        profile = dataclasses.replace(profile, gpus=tuple(gpus()))
+    return profile
 
 
 def build_plan(

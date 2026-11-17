@@ -106,8 +106,11 @@ public sealed class GgufReader
         {
             var key = ReadString(r);
             var type = (ValueType)r.ReadUInt32();
+            // the per-layer local-attention flags are kept (a few hundred booleans at most); other arrays only count
+            _keepArrayValues = key.EndsWith("attention.sliding_window_pattern", StringComparison.Ordinal);
+            _arrayValues = null;
             object? value = ReadValue(r, type, out var arrayLength);
-            _kv[key] = arrayLength is null ? value! : new ArrayMarker(arrayLength.Value);
+            _kv[key] = arrayLength is null ? value! : new ArrayMarker(arrayLength.Value, _arrayValues);
         }
     }
 
@@ -153,10 +156,15 @@ public sealed class GgufReader
                 var elemType = (ValueType)r.ReadUInt32();
                 ulong n = r.ReadUInt64();
                 arrayLength = (long)n;
+                var keep = _keepArrayValues && n <= 4096 && elemType is ValueType.Bool or ValueType.UInt8 or ValueType.Int8
+                    or ValueType.UInt16 or ValueType.Int16 or ValueType.UInt32 or ValueType.Int32;
+                var values = keep ? new List<long>((int)n) : null;
                 for (ulong i = 0; i < n; i++)
                 {
-                    ReadValue(r, elemType, out _);
+                    var item = ReadValue(r, elemType, out _);
+                    if (values is not null) values.Add(item switch { bool b => b ? 1 : 0, IConvertible c => c.ToInt64(null), _ => 0 });
                 }
+                _arrayValues = values;
                 return 0;
             }
             default:
@@ -203,5 +211,9 @@ public sealed class GgufReader
 
     private List<TensorEntry> _tensors = new();
 
-    private sealed record ArrayMarker(long Length);
+    private bool _keepArrayValues;
+    private List<long>? _arrayValues;
+
+    /// <summary>An array value of the metadata: its length and, for the few arrays that are kept, its elements (booleans as 0/1).</summary>
+    public sealed record ArrayMarker(long Length, IReadOnlyList<long>? Values = null);
 }

@@ -19,4 +19,7 @@ public readonly record struct HardwareProfile(
     int IntelGpuCount,
     int AxeleraDeviceCount,
     bool Metal,
-    bool Vulkan);
+    bool Vulkan,
+    // The GPUs the engine can use, with total and FREE video memory at the moment of the probe. Null when not probed
+    // (a profile built by hand): the planner then has no video-memory figure and keeps to the RAM budget.
+    IReadOnlyList<GpuInfo>? Gpus = null);

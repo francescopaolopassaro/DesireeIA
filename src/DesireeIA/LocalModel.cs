@@ -170,7 +170,94 @@ public sealed class LocalModel : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentOutOfRangeException.ThrowIfNegative(positions);
-        return NativeMethods.desireeia_reserve_context(_context, (nuint)positions) == NativeMethods.Error.Ok;
+        // A KV cache bigger than the free video memory is NOT refused by the driver: it spills into shared memory and
+        // every prefill after it runs several times slower. Refuse it here, before allocating.
+        if (!CanReserve(positions, out _)) return false;
+        if (NativeMethods.desireeia_reserve_context(_context, (nuint)positions) != NativeMethods.Error.Ok) return false;
+        _reservedPositions = positions;
+        return true;
+    }
+
+    private int _reservedPositions;
+
+    /// <summary>Video memory kept free after the KV cache, for the compute buffers of a prefill.</summary>
+    public const ulong ComputeMarginMb = AutoConfigurator.VideoMarginMb;
+
+    /// <summary>
+    /// Whether the KV cache for <paramref name="positions"/> fits the free video memory (always true off CUDA or when the
+    /// GPU cannot be probed). <paramref name="reason"/> says why not.
+    /// </summary>
+    public bool CanReserve(int positions, out string? reason)
+    {
+        reason = null;
+        if (Plan.Backend != InferenceBackend.Cuda) return true;
+        try
+        {
+            var gpus = DesireeIAEngine.Gpus();
+            if (gpus.Count == 0) return true;
+            var traits = ModelTraits.Read(ModelPath);
+            ulong perToken = traits.KvBytesPerTokenFor(Plan.KvCompression);
+            if (perToken == 0) return true;
+            long free = gpus.Max(g => g.FreeBytes);
+            long needed = (long)traits.KvBytesFor(Plan.KvCompression, positions);
+            // A cache already reserved is already out of the free figure: only the difference is new.
+            long already = (long)traits.KvBytesFor(Plan.KvCompression, Math.Max(0, _reservedPositions));
+            long extra = Math.Max(0, needed - already);
+            if (extra + (long)(ComputeMarginMb * 1024 * 1024) <= free) return true;
+            reason = $"a KV cache for {positions} positions needs ~{extra / (1024 * 1024)} MB more video memory, " +
+                     $"{free / (1024 * 1024)} MB are free (keeping {ComputeMarginMb} MB for the compute buffers)";
+            return false;
+        }
+        catch (Exception) { return true; }   // a probe that fails must not stop a load that would have worked
+    }
+
+    /// <summary>
+    /// Where the memory of this model goes, in megabytes: video memory total/free now, the weights (file size), the KV
+    /// cache reserved and its cost per token. Estimated from the model header, not read back from the allocator.
+    /// </summary>
+    public MemoryBreakdown GetMemoryBreakdown()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        long total = 0, free = 0;
+        string device = "";
+        try
+        {
+            var gpu = DesireeIAEngine.Gpus().OrderByDescending(g => g.FreeBytes).FirstOrDefault();
+            if (gpu is not null) { total = gpu.TotalBytes; free = gpu.FreeBytes; device = gpu.Name; }
+        }
+        catch (Exception) { }
+        ulong perToken = 0, reservedBytes = 0; long weights = 0;
+        try
+        {
+            var traits = ModelTraits.Read(ModelPath);
+            perToken = traits.KvBytesPerTokenFor(Plan.KvCompression);
+            reservedBytes = traits.KvBytesFor(Plan.KvCompression, Math.Max(0, _reservedPositions));
+            weights = traits.FileSizeBytes;
+        }
+        catch (Exception) { }
+        const long Mb = 1024 * 1024;
+        return new MemoryBreakdown(device, total / Mb, free / Mb, weights / Mb,
+            (long)reservedBytes / Mb, _reservedPositions, (long)perToken);
+    }
+
+    /// <summary>
+    /// One short prefill and decode that brings CUDA, the kernels and the buffers up, then drops the session. The first
+    /// request after a load otherwise pays for it (measured: ~11 s before the first layer of the first prompt).
+    /// </summary>
+    public void Warmup()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        try
+        {
+            var tokens = Tokenize("Hello", addBos: true);
+            if (tokens is { Length: > 0 })
+            {
+                var e = StreamAsync(tokens, new GenerateOptions { MaxTokens = 1 }).GetAsyncEnumerator();
+                try { while (e.MoveNextAsync().AsTask().GetAwaiter().GetResult()) { } }
+                finally { e.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
+            }
+        }
+        finally { ResetSession(); }
     }
 
     /// <summary>Gives back the whole KV cache (chat closed, app idle) and drops the session.</summary>

@@ -30,7 +30,8 @@ public static class DesireeIAEngine
             IntelGpuCount: hw.IntelGpuCount,
             AxeleraDeviceCount: hw.AxeleraDeviceCount,
             Metal: hw.HasMetal != 0,
-            Vulkan: hw.HasVulkan != 0);
+            Vulkan: hw.HasVulkan != 0,
+            Gpus: hw.CudaDeviceCount > 0 ? Gpus() : null);
     }
 
     public static ExecutionPlan BuildPlan(string? modelPath, ExecutionPlan? overrides = null)

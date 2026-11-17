@@ -365,7 +365,34 @@ public:
     // rejected drafts after speculative verification): bytes beyond
     // new_cols stay in the buffer but get overwritten by the next step()
     // calls, no explicit erasure needed.
-    void truncate_cache(size_t new_cols) { if (new_cols <= cache_cols_) cache_cols_ = new_cols; }
+    void truncate_cache(size_t new_cols) {
+        if (new_cols > cache_cols_) return;
+        // With the windowed cache a local layer only holds the last positions: a cut that would need rows already
+        // dropped cannot be honoured (callers ask usable_prefix() first; this is the safety net).
+        if (kv_windowed_ && new_cols != cache_cols_ && usable_prefix(new_cols) != new_cols) { cache_cols_ = 0; kv_set_base_(0); return; }
+        cache_cols_ = new_cols;
+    }
+    // Windowed KV cache (quantized cache, models with local-attention layers): the local layers keep only the last
+    // window of positions, the global ones all of them. True when this model runs that way.
+    bool kv_windowed() const { return kv_windowed_; }
+    // How many of the first n positions can be kept as the live cache: n itself, or 0 when a local layer no longer
+    // holds the rows the position n would need (the whole prompt is then prefilled again).
+    size_t usable_prefix(size_t n) const {
+        if (!kv_windowed_ || n >= cache_cols_) return n;
+        const size_t w1 = cfg_.n_swa > 0 ? cfg_.n_swa - 1 : 0;
+        const size_t need = n > w1 ? n - w1 : 0;
+        return need >= kv_local_base_ ? n : 0;
+    }
+    // Whether a snapshot whose local layers hold rows from `local_start` on can be restored at m positions.
+    bool restorable_prefix(size_t m, size_t local_start) const {
+        if (!kv_windowed_) return true;
+        const size_t w1 = cfg_.n_swa > 0 ? (size_t) cfg_.n_swa - 1 : 0;
+        return (m > w1 ? m - w1 : 0) >= local_start;
+    }
+    // First position the local layers still hold (0 when the cache is not windowed or nothing was dropped yet).
+    size_t kv_local_base() const { return kv_windowed_ ? kv_local_base_ : 0; }
+    // Positions that fit in the device/host cache for the global layers, and bytes of the whole allocation.
+    size_t kv_total_bytes() const;
     // Session persistence (desireeia_session_save/load): bytes one position
     // occupies in ONE layer of the cache (0 when this cache layout cannot be
     // saved - MLA's latent cache), the first n positions of every layer
@@ -376,7 +403,7 @@ public:
                    float theta, float scale) const;
     size_t kv_bytes_per_pos() const;
     bool kv_quantized() const { return kv_quantized_; }
-    bool export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v);
+    bool export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v, size_t* local_start = nullptr);
     bool import_kv(size_t n, const uint8_t* k, const uint8_t* v) { return import_kv(n, k, v, n); }
     // The first n positions of buffers laid out layer by layer with src_n positions per layer (src_n >= n).
     bool import_kv(size_t n, const uint8_t* k, const uint8_t* v, size_t src_n);
@@ -682,6 +709,26 @@ private:
     std::vector<float> v_cache_;
     size_t cache_capacity_ = 0;
     size_t cache_cols_ = 0;
+
+    // Windowed KV cache (see kv_windowed()). Layer regions are laid out one after the other, a local layer's region
+    // is a fixed kv_local_cap_ positions long and holds the absolute positions [kv_local_base_, kv_local_base_+cap).
+    // Everything that addresses the cache goes through kv_layer_off(): the byte offset of position 0 of the layer,
+    // virtual for a local layer (start - base*pos_bytes, wrapping), so that "offset + pos*pos_bytes" is right for
+    // every position the layer holds and the attention kernels did not have to change.
+    bool kv_windowed_ = false;
+    size_t kv_win_keep_ = 0;        // positions kept behind the current one when the local layers slide
+    size_t kv_local_cap_ = 0;       // positions a local layer holds
+    size_t kv_local_base_ = 0;      // first absolute position held by the local layers
+    std::vector<uint8_t> kv_is_local_;
+    std::vector<size_t> kv_start_;  // byte start of each layer's region (n_layers + 1 entries)
+    static constexpr size_t kKvBlock = 1024;       // tokens per forward block when the cache is windowed
+    size_t kv_pos_bytes_() const { return (size_t) cfg_.n_head_kv * kv_q_row_bytes_; }
+    size_t kv_layer_cap_(uint32_t l) const { return (kv_windowed_ && kv_is_local_[l]) ? kv_local_cap_ : cache_capacity_; }
+    void kv_layout_(size_t global_cap, std::vector<size_t>& starts) const;
+    size_t layer_kv_off(uint32_t l) const;
+    void kv_make_room_(size_t col0, size_t n_tokens);
+    // Moves the base of the local layers. The decode graphs bake the layer offsets in, so they are dropped when it changes.
+    void kv_set_base_(size_t base);
 
     // Attention probe state (diagnostics). Positions beyond kProbeMaxPos are not recorded.
     static constexpr uint32_t kProbeMaxPos = 16384;

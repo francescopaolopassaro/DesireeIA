@@ -634,6 +634,8 @@ DESIREEIA_INTERNAL bool cuda_kv_cache_download(void* k_host, void* v_host,
                                               size_t total_bytes);
 DESIREEIA_INTERNAL bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v,
                                            size_t bytes);
+// Moves `bytes` inside the device cache (the two ranges may overlap), for K and V alike.
+DESIREEIA_INTERNAL bool cuda_kv_cache_move(size_t dst_off, size_t src_off, size_t bytes);
 // Drops every captured graph (another model is taking over the device).
 DESIREEIA_INTERNAL void cuda_drop_graphs();
 // Tells the decode attention which kernel to use for the next step: grouped (long contexts) or per head (short ones).

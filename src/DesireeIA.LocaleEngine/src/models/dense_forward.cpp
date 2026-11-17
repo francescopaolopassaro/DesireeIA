@@ -1135,8 +1135,25 @@ bool DenseForward::open(ModelReader& rd, const ModelMeta& meta, ArchKind arch, u
         else kv_q_row_bytes_ = kv_quant_row_bytes(cfg_.head_dim);
     }
 
+    // Windowed cache: the local-attention layers of a model keep only the last window of positions. Only for the
+    // quantized cache (float and MLA keep the plain layout) and switchable off with DESIREEIA_KV_WINDOW=0.
+    kv_windowed_ = false;
+    kv_local_base_ = 0;
+    kv_is_local_.assign(cfg_.n_layers, 0);
+    if (kv_quantized_ && !quirks_.mla && cfg_.n_swa > 0) {
+        const char* env = std::getenv("DESIREEIA_KV_WINDOW");
+        size_t locals = 0;
+        for (uint32_t l = 0; l < cfg_.n_layers; ++l) if (cfg_.layer_is_swa(l)) { kv_is_local_[l] = 1; ++locals; }
+        if (locals > 0 && !(env && env[0] == '0')) {
+            kv_windowed_ = true;
+            // keep: the window behind the current position plus a margin for rolled-back drafts
+            kv_win_keep_ = (size_t) cfg_.n_swa - 1 + 64;
+            kv_local_cap_ = kv_win_keep_ + kKvBlock;
+        }
+    }
     cache_capacity_ = 0;
     cache_cols_ = 0;
+    kv_start_.clear();
     grow_cache(512);
 
     // Opt-in, same reasoning as every other new capability this session:
@@ -1186,8 +1203,17 @@ DenseForward::~DenseForward() {
     unlock_matvec(out_head_);
 }
 
+void DenseForward::kv_set_base_(size_t base) {
+    if (base == kv_local_base_) return;
+    kv_local_base_ = base;
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (cuda_kv_ready_ && g_active_backend == DESIREEIA_BACKEND_CUDA) cuda_drop_graphs();
+#endif
+}
+
 void DenseForward::reset_cache() {
     cache_cols_ = 0;
+    kv_set_base_(0);
 }
 
 bool DenseForward::prefill_interrupted(uint32_t layers_done) {
@@ -1209,6 +1235,8 @@ bool DenseForward::reserve_positions(size_t n) {
 void DenseForward::release_cache() {
     cache_cols_ = 0;
     cache_capacity_ = 0;
+    kv_set_base_(0);
+    kv_start_.clear();
     std::vector<uint8_t>().swap(k_cache_q_);
     std::vector<uint8_t>().swap(v_cache_q_);
     std::vector<float>().swap(k_cache_);
@@ -1225,20 +1253,31 @@ size_t DenseForward::kv_bytes_per_pos() const {
     return (size_t) cfg_.n_head_kv * cfg_.head_dim * sizeof(float);
 }
 
-bool DenseForward::export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v) {
+bool DenseForward::export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint8_t>& v, size_t* local_start) {
     const size_t bpp = kv_bytes_per_pos();
+    if (local_start) *local_start = 0;
     if (bpp == 0 || n > cache_cols_) return false;
     claim_device_kv();
+    // Windowed cache: a local layer holds the positions [kv_local_base_, n) only; the earlier rows of the blob stay
+    // zero and the caller is told where the real rows start.
+    const size_t first_local = kv_windowed_ ? std::min(kv_local_base_, n) : 0;
+    // A prefix whose window the local layers have already slid past has no rows to save: restoring it would read zeros.
+    if (kv_windowed_ && usable_prefix(n) != n) return false;
+    if (local_start) *local_start = first_local;
+    auto rows_of = [&](uint32_t l) { return (kv_windowed_ && kv_is_local_[l]) ? n - first_local : n; };
+    auto src_of = [&](uint32_t l) { return kv_quantized_ ? kv_start_[l] : (size_t) l * cache_capacity_ * bpp; };
+    auto dst_of = [&](uint32_t l) {
+        return (size_t) l * n * bpp + ((kv_windowed_ && kv_is_local_[l]) ? first_local * bpp : 0);
+    };
+    k.assign((size_t) cfg_.n_layers * n * bpp, 0);
+    v.assign(k.size(), 0);
 #ifdef DESIREEIA_CUDA_ENABLED
     // Decode on the fused path writes the device cache only, so on CUDA the device is the authority: read just the
-    // n positions of each layer from it (not the whole allocation, which for a long context is most of VRAM).
+    // rows of each layer from it (not the whole allocation, which for a long context is most of VRAM).
     if (kv_quantized_ && cuda_kv_ready_ && cache_capacity_ > 0 && g_active_backend == DESIREEIA_BACKEND_CUDA) {
-        k.resize((size_t) cfg_.n_layers * n * bpp);
-        v.resize(k.size());
         bool ok = true;
         for (uint32_t l = 0; l < cfg_.n_layers && ok; ++l) {
-            ok = cuda_kv_cache_read((size_t) l * cache_capacity_ * bpp, k.data() + (size_t) l * n * bpp,
-                                    v.data() + (size_t) l * n * bpp, n * bpp);
+            ok = cuda_kv_cache_read(src_of(l), k.data() + dst_of(l), v.data() + dst_of(l), rows_of(l) * bpp);
         }
         if (ok) return true;
         // a failed partial read: fall through to the whole-cache download, as before
@@ -1247,13 +1286,9 @@ bool DenseForward::export_kv(size_t n, std::vector<uint8_t>& k, std::vector<uint
 #endif
     const uint8_t* kb = kv_quantized_ ? k_cache_q_.data() : reinterpret_cast<const uint8_t*>(k_cache_.data());
     const uint8_t* vb = kv_quantized_ ? v_cache_q_.data() : reinterpret_cast<const uint8_t*>(v_cache_.data());
-    k.resize((size_t) cfg_.n_layers * n * bpp);
-    v.resize(k.size());
     for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
-        const size_t src = (size_t) l * cache_capacity_ * bpp;
-        const size_t dst = (size_t) l * n * bpp;
-        std::memcpy(k.data() + dst, kb + src, n * bpp);
-        std::memcpy(v.data() + dst, vb + src, n * bpp);
+        std::memcpy(k.data() + dst_of(l), kb + src_of(l), rows_of(l) * bpp);
+        std::memcpy(v.data() + dst_of(l), vb + src_of(l), rows_of(l) * bpp);
     }
     return true;
 }
@@ -1266,27 +1301,34 @@ bool DenseForward::import_kv(size_t n, const uint8_t* k, const uint8_t* v, size_
     claim_device_kv();
     uint8_t* kb = kv_quantized_ ? k_cache_q_.data() : reinterpret_cast<uint8_t*>(k_cache_.data());
     uint8_t* vb = kv_quantized_ ? v_cache_q_.data() : reinterpret_cast<uint8_t*>(v_cache_.data());
+    // Windowed cache: a local layer takes the last window of rows only, which then start at the base.
+    const size_t w1 = cfg_.n_swa > 0 ? (size_t) cfg_.n_swa - 1 : 0;
+    const size_t new_base = kv_windowed_ ? (n > w1 ? n - w1 : 0) : 0;
+    auto local = [&](uint32_t l) { return kv_windowed_ && kv_is_local_[l]; };
+    auto dst_of = [&](uint32_t l) { return kv_quantized_ ? kv_start_[l] : (size_t) l * cache_capacity_ * bpp; };
     for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
-        const size_t dst = (size_t) l * cache_capacity_ * bpp;
-        const size_t src = (size_t) l * src_n * bpp;
-        std::memcpy(kb + dst, k + src, n * bpp);
-        std::memcpy(vb + dst, v + src, n * bpp);
+        const size_t from = local(l) ? new_base : 0;
+        const size_t src = (size_t) l * src_n * bpp + from * bpp;
+        std::memcpy(kb + dst_of(l), k + src, (n - from) * bpp);
+        std::memcpy(vb + dst_of(l), v + src, (n - from) * bpp);
     }
+    if (kv_windowed_) kv_set_base_(new_base);
 #ifdef DESIREEIA_CUDA_ENABLED
     // The device cache is what attention reads on CUDA: bring it in line
     // with the host copy just filled (whole allocation, same as a growth).
     if (cuda_kv_ready_ && g_active_backend == DESIREEIA_BACKEND_CUDA) {
         if (kv_quantized_) {
-            // Only the n positions just written, layer by layer (the rest of the allocation is unused).
+            // Only the rows just written, layer by layer (the rest of the allocation is unused).
             bool ok = true;
             for (uint32_t l = 0; l < cfg_.n_layers && ok; ++l) {
-                const size_t off = (size_t) l * cache_capacity_ * bpp;
-                ok = cuda_kv_cache_write(off, kb + off, vb + off, n * bpp);
+                const size_t off = dst_of(l);
+                ok = cuda_kv_cache_write(off, kb + off, vb + off, (n - (local(l) ? new_base : 0)) * bpp);
             }
             if (!ok) cuda_kv_ready_ = cuda_kv_cache_upload(kb, vb, k_cache_q_.size());
         } else {
             cuda_kv_ready_ = cuda_kv_cache_upload(kb, vb, k_cache_.size() * sizeof(float));
         }
+        cuda_drop_graphs();       // the layer offsets of a windowed cache moved with the base
     }
     kv_host_stale_ = false;                       // host and device now hold the same rows
 #endif
@@ -1703,7 +1745,7 @@ void DenseForward::probe_configure_() {
     probe_src_.assign(cfg_.n_layers, (uint8_t) 0);
     probe_gpu_ = false;
 #ifdef DESIREEIA_CUDA_ENABLED
-    if (g_active_backend == DESIREEIA_BACKEND_CUDA && cuda_kv_ready_ && kv_quantized_ && cache_capacity_ > 0) {
+    if (g_active_backend == DESIREEIA_BACKEND_CUDA && cuda_kv_ready_ && kv_quantized_ && !kv_windowed_ && cache_capacity_ > 0) {
         const size_t pos_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
         probe_gpu_ = cuda_attention_probe_configure(true, cfg_.n_layers, cfg_.n_head, kProbeMaxPos, cache_capacity_ * pos_bytes);
     }
@@ -2360,6 +2402,58 @@ const LayerWeights* DenseForward::get_layer(ModelReader& rd, uint32_t il) {
     return &scratch_;
 }
 
+// Byte start of every layer's region (n_layers + 1 entries, the last one is the total) for a global capacity.
+void DenseForward::kv_layout_(size_t global_cap, std::vector<size_t>& starts) const {
+    const size_t pb = kv_pos_bytes_();
+    starts.assign((size_t) cfg_.n_layers + 1, 0);
+    for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
+        const size_t cap = (kv_windowed_ && kv_is_local_[l]) ? kv_local_cap_ : global_cap;
+        starts[l + 1] = starts[l] + cap * pb;
+    }
+}
+
+size_t DenseForward::kv_total_bytes() const {
+    if (!kv_quantized_) return 0;
+    std::vector<size_t> st;
+    kv_layout_(cache_capacity_, st);
+    return st.back();
+}
+
+// Byte offset of POSITION 0 of the layer: "layer_kv_off(l) + pos * pos_bytes" addresses the row of absolute position
+// pos for every position the layer holds. For a local layer the offset is virtual (its region start minus the rows
+// slid away), computed in modular arithmetic.
+size_t DenseForward::layer_kv_off(uint32_t l) const {
+    const size_t pb = kv_pos_bytes_();
+    if (!kv_windowed_) return (size_t) l * cache_capacity_ * pb;
+    return kv_start_[l] - (kv_is_local_[l] ? kv_local_base_ * pb : 0);
+}
+
+// Makes room for positions [col0, col0 + n) in the local layers: when they do not fit, the layers slide - the rows
+// kept behind col0 move to the front of each region and the base moves up. Never runs for a plain cache.
+void DenseForward::kv_make_room_(size_t col0, size_t n_tokens) {
+    if (!kv_windowed_) return;
+    if (col0 + n_tokens <= kv_local_base_ + kv_local_cap_) return;
+    const size_t keep = std::min(kv_win_keep_, col0);
+    const size_t new_base = col0 - keep;
+    if (new_base <= kv_local_base_) return;           // cannot happen: the block is smaller than cap - keep
+    const size_t shift = new_base - kv_local_base_;
+    const size_t pb = kv_pos_bytes_();
+    for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
+        if (!kv_is_local_[l]) continue;
+        const size_t dst = kv_start_[l];
+        const size_t src = kv_start_[l] + shift * pb;
+        const size_t bytes = keep * pb;
+        if (!k_cache_q_.empty()) {
+            std::memmove(k_cache_q_.data() + dst, k_cache_q_.data() + src, bytes);
+            std::memmove(v_cache_q_.data() + dst, v_cache_q_.data() + src, bytes);
+        }
+#ifdef DESIREEIA_CUDA_ENABLED
+        if (cuda_kv_ready_ && g_active_backend == DESIREEIA_BACKEND_CUDA) cuda_kv_cache_move(dst, src, bytes);
+#endif
+    }
+    kv_set_base_(new_base);   // drops the captured graphs: they bake in the layer offsets, which just changed
+}
+
 void DenseForward::grow_cache(size_t needed) {
     if (needed <= cache_capacity_) return;
     probe_dirty_ = attn_probe_on_;   // the layer stride of the device cache is about to change
@@ -2387,31 +2481,47 @@ void DenseForward::grow_cache(size_t needed) {
             cuda_kv_cache_download(k_cache_q_.data(), v_cache_q_.data(), k_cache_q_.size());
         }
 #endif
-        std::vector<uint8_t> nk(cfg_.n_layers * new_cols * row_bytes, 0);
-        std::vector<uint8_t> nv(cfg_.n_layers * new_cols * row_bytes, 0);
-        if (cache_capacity_ > 0) {
-            // Same per-layer copy as the float path below, and for the same
-            // reason: a flat memcpy only preserves layer 0 once the
-            // per-layer stride changes between the old and new capacity.
+        // Region of every layer for the new capacity: with the windowed cache the local layers keep their size, only
+        // the global ones grow, so the regions move and are copied one by one.
+        std::vector<size_t> new_start;
+        kv_layout_(new_cols, new_start);
+        std::vector<uint8_t> nk(new_start.back(), 0);
+        std::vector<uint8_t> nv(new_start.back(), 0);
+        if (cache_capacity_ > 0 && kv_start_.size() == (size_t) cfg_.n_layers + 1) {
             for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
-                std::memcpy(nk.data() + (size_t) l * new_cols * row_bytes,
-                            k_cache_q_.data() + (size_t) l * cache_capacity_ * row_bytes,
-                            cache_capacity_ * row_bytes);
-                std::memcpy(nv.data() + (size_t) l * new_cols * row_bytes,
-                            v_cache_q_.data() + (size_t) l * cache_capacity_ * row_bytes,
-                            cache_capacity_ * row_bytes);
+                const size_t old_bytes = kv_start_[l + 1] - kv_start_[l];
+                const size_t new_bytes = new_start[l + 1] - new_start[l];
+                const size_t n = std::min(old_bytes, new_bytes);
+                std::memcpy(nk.data() + new_start[l], k_cache_q_.data() + kv_start_[l], n);
+                std::memcpy(nv.data() + new_start[l], v_cache_q_.data() + kv_start_[l], n);
             }
         }
+        std::vector<uint8_t> dbg_old_k;
+        std::vector<size_t> dbg_old_start;
+        if (std::getenv("DESIREEIA_KV_TRACE")) { dbg_old_k = k_cache_q_; dbg_old_start = kv_start_; }
         k_cache_q_.swap(nk);
         v_cache_q_.swap(nv);
+        kv_start_ = std::move(new_start);
         cache_capacity_ = new_cols;
 #ifdef DESIREEIA_CUDA_ENABLED
         if (g_active_backend == DESIREEIA_BACKEND_CUDA) {
             if (g_kv_owner != nullptr && g_kv_owner != this) { g_kv_owner->sync_host_kv(); cuda_drop_graphs(); }
             g_kv_owner = this;
             const size_t bytes = k_cache_q_.size();
-            cuda_kv_ready_ = cuda_kv_cache_reserve(bytes) &&
-                              cuda_kv_cache_upload(k_cache_q_.data(), v_cache_q_.data(), bytes);
+            const bool r_ok = cuda_kv_cache_reserve(bytes);
+            const bool u_ok = r_ok && cuda_kv_cache_upload(k_cache_q_.data(), v_cache_q_.data(), bytes);
+            cuda_kv_ready_ = r_ok && u_ok;
+            if (std::getenv("DESIREEIA_KV_TRACE")) std::fprintf(stderr, "[kv] grow to %zu positions, base=%zu, bytes=%zu reserve=%d upload=%d\n", cache_capacity_, kv_local_base_, bytes, (int) r_ok, (int) u_ok);
+            if (std::getenv("DESIREEIA_KV_TRACE") && u_ok && !dbg_old_k.empty()) {
+                std::vector<uint8_t> chk_k(bytes), chk_v(bytes);
+                cuda_kv_cache_download(chk_k.data(), chk_v.data(), bytes);
+                size_t bad = 0, badl = (size_t) -1;
+                for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
+                    const size_t n = std::min(dbg_old_start[l + 1] - dbg_old_start[l], kv_start_[l + 1] - kv_start_[l]);
+                    if (std::memcmp(chk_k.data() + kv_start_[l], dbg_old_k.data() + dbg_old_start[l], n) != 0) { ++bad; if (badl == (size_t) -1) badl = l; }
+                }
+                std::fprintf(stderr, "[kv] layers whose rows changed through the growth: %zu (first %lld)\n", bad, (long long) badl);
+            }
         }
 #endif
         return;
@@ -2480,8 +2590,8 @@ void DenseForward::write_kv_cache(uint32_t l, uint32_t pos, const float* k, cons
     // why a single wide row wouldn't fit how GQA/MHA actually read this).
     const size_t row_bytes = kv_q_row_bytes_;
     const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
-    uint8_t* kc = k_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes + (size_t) pos * pos_bytes;
-    uint8_t* vc = v_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes + (size_t) pos * pos_bytes;
+    uint8_t* kc = k_cache_q_.data() + layer_kv_off(l) + (size_t) pos * pos_bytes;
+    uint8_t* vc = v_cache_q_.data() + layer_kv_off(l) + (size_t) pos * pos_bytes;
     for (uint32_t h = 0; h < cfg_.n_head_kv; ++h) {
         kv_quantize_row(k + (size_t) h * cfg_.head_dim, cfg_.head_dim, kc + (size_t) h * row_bytes);
         kv_quantize_row(v + (size_t) h * cfg_.head_dim, cfg_.head_dim, vc + (size_t) h * row_bytes);
@@ -2491,7 +2601,7 @@ void DenseForward::write_kv_cache(uint32_t l, uint32_t pos, const float* k, cons
     // for the same reason as the float branch above: this is the only
     // place the KV cache is ever written.
     if (cuda_kv_ready_ && !kv_mirror_deferred_) {
-        const size_t byte_off = (size_t) l * cache_capacity_ * pos_bytes + (size_t) pos * pos_bytes;
+        const size_t byte_off = layer_kv_off(l) + (size_t) pos * pos_bytes;
         cuda_kv_cache_write(byte_off, kc, vc, pos_bytes);
     }
 #endif
@@ -2768,7 +2878,7 @@ bool DenseForward::prefill_cuda_layers(ModelReader& rd, std::vector<float>& x,
             a.n_head = cfg_.n_head; a.n_head_kv = cfg_.n_head_kv;
             a.heads_per_kv = cfg_.n_head / cfg_.n_head_kv;
             a.head_dim = cfg_.head_dim; a.n_rot = n_rot;
-            a.kv_layer_off = (size_t) l * cache_capacity_ * pos_bytes;
+            a.kv_layer_off = layer_kv_off(l);
             a.pos0 = col0 + (uint32_t) c0;
             a.n_tok = m;
             a.x_row0 = (uint32_t) c0;
@@ -2804,6 +2914,19 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
     if (n_tokens == 0 || tokens == nullptr) { last_fail_ = "bad args to step"; return false; }
     if (tok_embd_.empty()) { last_fail_ = "tok_embd_ empty"; return false; }
 
+    // Windowed cache: a local layer holds a bounded number of positions, so a long prompt goes through in blocks, each
+    // one through every layer before the next starts (the tail of a block is what the next block's window needs).
+    if (kv_windowed_ && n_tokens > kKvBlock) {
+        if (all_logits) all_logits->clear();
+        for (size_t off = 0; off < n_tokens; off += kKvBlock) {
+            const size_t m = std::min(kKvBlock, n_tokens - off);
+            std::vector<float> part;
+            if (!step(rd, tokens + off, m, last_logits, all_logits ? &part : nullptr)) return false;
+            if (all_logits) all_logits->insert(all_logits->end(), part.begin(), part.end());
+        }
+        return true;
+    }
+
     const uint32_t n_embd  = cfg_.n_embd;
     const uint32_t n_layers = cfg_.n_layers;
     const uint32_t n_head  = cfg_.n_head;
@@ -2823,6 +2946,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
     if (n_tokens == 1 && g_active_backend == DESIREEIA_BACKEND_CUDA) cuda_set_attention_long(col0 >= kGroupedAttnFromPos);
 #endif
     claim_device_kv();
+    kv_make_room_(col0, n_tokens);
     if (attn_probe_on_ && probe_dirty_) probe_configure_();
     if (attn_probe_on_) {
         // A prefill is not captured. A decode token: layers attended on the GPU are in the device buffer; a layer that
@@ -3275,7 +3399,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             // silently attend to stale positions.
             if (defer_mirror) {
                 const size_t pos_bytes_m = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
-                const size_t base_off = (size_t) l * cache_capacity_ * pos_bytes_m
+                const size_t base_off = layer_kv_off(l)
                                       + (size_t) col0 * pos_bytes_m;
                 cuda_kv_cache_write(base_off,
                                     k_cache_q_.data() + base_off,
@@ -3322,7 +3446,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     q_all.data(), attn_out_all.data(),
                     (uint32_t) n_tokens, n_head, heads_per_kv, cfg_.head_dim, q_dim,
                     row_bytes, pos_bytes,
-                    (size_t) l * cache_capacity_ * pos_bytes,
+                    layer_kv_off(l),
                     col0, is_swa_layer ? cfg_.n_swa : 0u) == DESIREEIA_OK;
             }
             if (!cuda_attn_batch_done) {
@@ -3335,7 +3459,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             if (tiled_cpu_attn && kv_quantized_ && !quirks_.alibi) {
                 const size_t row_bytes = kv_q_row_bytes_;
                 const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
-                const size_t layer_off = (size_t) l * cache_capacity_ * pos_bytes;
+                const size_t layer_off = layer_kv_off(l);
                 const bool is_swa_layer = cfg_.n_swa > 0 && cfg_.layer_is_swa(l);
                 cpu_tiled_done = attention_prefill_cpu_q8(
                     q_all.data(), attn_out_all.data(), (uint32_t) n_tokens, n_head, heads_per_kv,
@@ -3363,9 +3487,9 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                     if (kv_quantized_) {
                         const size_t row_bytes = kv_q_row_bytes_;
                         const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
-                        const uint8_t* kb = k_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                        const uint8_t* kb = k_cache_q_.data() + layer_kv_off(l)
                                            + (size_t) hkv * row_bytes;
-                        const uint8_t* vb = v_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                        const uint8_t* vb = v_cache_q_.data() + layer_kv_off(l)
                                            + (size_t) hkv * row_bytes;
                         if (quirks_.alibi) {
                             const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);
@@ -3622,7 +3746,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 la.n_head = n_head; la.n_head_kv = cfg_.n_head_kv;
                 la.heads_per_kv = n_head / cfg_.n_head_kv;
                 la.head_dim = cfg_.head_dim; la.n_rot = cfg_.layer_n_rot(l);
-                la.kv_layer_off = (size_t) l * cache_capacity_ * pos_bytes;
+                la.kv_layer_off = layer_kv_off(l);
                 la.cc_start = swa_here
                     ? ((pos + 1 > cfg_.n_swa) ? (pos + 1 - cfg_.n_swa) : 0) : 0;
                 la.pos = pos;
@@ -3740,7 +3864,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 }
 
                 const size_t pos_bytes = (size_t) cfg_.n_head_kv * kv_q_row_bytes_;
-                const size_t layer_off = (size_t) l * cache_capacity_ * pos_bytes;
+                const size_t layer_off = layer_kv_off(l);
                 const bool swa_here = cfg_.n_swa > 0 && cfg_.layer_is_swa(l);
                 CudaQkvAttnArgs ca{};
                 ca.wq_qs = lw->wq.cuda_qs.get();   ca.wq_scale = lw->wq.cuda_scale.get();
@@ -3874,7 +3998,7 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
             // of these, proceeds with the CPU path below, which remains the
             // reference definition.
             const size_t kv_layer_off = kv_quantized_
-                ? (size_t) l * cache_capacity_ * ((size_t) cfg_.n_head_kv * kv_q_row_bytes_)
+                ? layer_kv_off(l)
                 : ((size_t) l * cache_capacity_) * kv_dim * sizeof(float);
             // NOT WITH A PER-HEAD ATTENTION GATE (DenseQuirks::attn_gate): this
             // episode goes straight from the attention to the output projection
@@ -3928,9 +4052,9 @@ bool DenseForward::step(ModelReader& rd, const int32_t* tokens, size_t n_tokens,
                 if (kv_quantized_) {
                     const size_t row_bytes = kv_q_row_bytes_;
                     const size_t pos_bytes = (size_t) cfg_.n_head_kv * row_bytes;
-                    const uint8_t* kb = k_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                    const uint8_t* kb = k_cache_q_.data() + layer_kv_off(l)
                                        + (size_t) hkv * row_bytes;
-                    const uint8_t* vb = v_cache_q_.data() + (size_t) l * cache_capacity_ * pos_bytes
+                    const uint8_t* vb = v_cache_q_.data() + layer_kv_off(l)
                                        + (size_t) hkv * row_bytes;
                     if (quirks_.alibi) {
                         const float slope = alibi_slope(h, n_head, cfg_.max_alibi_bias);

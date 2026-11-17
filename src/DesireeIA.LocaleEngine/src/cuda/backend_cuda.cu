@@ -4044,6 +4044,25 @@ bool cuda_kv_cache_write(size_t byte_off, const void* k, const void* v, size_t b
     return true;
 }
 
+// A range of the device cache moved inside itself (the windowed cache slides its local layers). The ranges may
+// overlap, so the bytes go through a staging buffer; K and V alike. Runs on the shared stream, in order with the
+// kernels that read the rows.
+bool cuda_kv_cache_move(size_t dst_off, size_t src_off, size_t bytes) {
+    if (bytes == 0 || dst_off == src_off) return true;
+    if (!g_scratch.d_kcache || std::max(dst_off, src_off) + bytes > g_scratch.kv_bytes) return false;
+    cudaStream_t stream = scratch_stream();
+    void* stage = nullptr;
+    if (cudaMalloc(&stage, bytes) != cudaSuccess) { cudaGetLastError(); return false; }
+    bool ok = true;
+    for (uint8_t* base : {g_scratch.d_kcache, g_scratch.d_vcache}) {
+        ok = ok && cudaMemcpyAsync(stage, base + src_off, bytes, cudaMemcpyDeviceToDevice, stream) == cudaSuccess
+                && cudaMemcpyAsync(base + dst_off, stage, bytes, cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
+        ok = ok && cudaStreamSynchronize(stream) == cudaSuccess;    // the staging buffer is reused for V
+    }
+    cudaFree(stage);
+    return ok;
+}
+
 void cuda_set_attention_long(bool long_context) {
     if (long_context == g_attn_long) return;
     g_attn_long = long_context;

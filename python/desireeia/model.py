@@ -17,7 +17,7 @@ from ctypes import (
 from typing import Callable, Generator, Iterator, List, Optional, Tuple
 
 from . import _native as _nat
-from .enums import Error, SpecialToken
+from .enums import Error, InferenceBackend, SpecialToken
 from .generation import StopSequenceScanner
 from .types import (
     ExecutionPlan,
@@ -45,7 +45,7 @@ class LocalModel:
             print(model.token_piece(token))
     """
 
-    __slots__ = ("_ctx", "_closed", "_model_path", "_plan", "_log_cb_ref", "_lock", "_progress_ref")
+    __slots__ = ("_ctx", "_closed", "_model_path", "_plan", "_log_cb_ref", "_lock", "_progress_ref", "_reserved_positions")
 
     def __init__(
         self,
@@ -61,6 +61,7 @@ class LocalModel:
         self._closed = False
         self._lock = threading.Lock()  # native ctx is NOT thread-safe
         self._progress_ref = None      # keeps the progress callback alive
+        self._reserved_positions = 0
 
     # -- properties ----------------------------------------------------------
 
@@ -175,13 +176,98 @@ class LocalModel:
             self._progress_ref = _nat.PROGRESS_CB(_cb)
         _nat.get_lib().desireeia_set_progress_callback(self._ctx, self._progress_ref, None)
 
+    # Video memory kept free after the KV cache, for the compute buffers of a prefill.
+    COMPUTE_MARGIN_MB = 384
+
+    def can_reserve(self, positions: int):
+        """Whether the KV cache for `positions` fits the free video memory, as ``(fits, reason)``.
+
+        Always fits off CUDA or when the GPU cannot be probed."""
+        if self._plan.backend != InferenceBackend.CUDA:
+            return True, None
+        try:
+            from .autoconfig import ModelTraits
+            from .engine import gpus
+            found = gpus()
+            if not found:
+                return True, None
+            traits = ModelTraits.read(self._model_path)
+            if traits.kv_bytes_per_token_for(self._plan.kv_compression) <= 0:
+                return True, None
+            free = max(g["free_bytes"] for g in found)
+            # A cache already reserved is already out of the free figure: only the difference is new.
+            kv_for = traits.kv_bytes_for
+            extra = max(0, kv_for(self._plan.kv_compression, positions) - kv_for(self._plan.kv_compression, self._reserved_positions))
+            margin = self.COMPUTE_MARGIN_MB * 1024 * 1024
+            if extra + margin <= free:
+                return True, None
+            return False, (f"a KV cache for {positions} positions needs ~{extra // (1024 * 1024)} MB more video memory, "
+                           f"{free // (1024 * 1024)} MB are free (keeping {self.COMPUTE_MARGIN_MB} MB for the compute buffers)")
+        except Exception:
+            return True, None   # a probe that fails must not stop a load that would have worked
+
     def reserve_context(self, positions: int) -> bool:
-        """Allocate the KV cache for `positions` at once (no growth by doubling)."""
+        """Allocate the KV cache for `positions` at once (no growth by doubling).
+
+        Refused (False) when it would not fit the free video memory: the driver does not refuse it, it spills into shared
+        memory and every prefill after it runs several times slower."""
         self._check()
         if positions < 0:
             raise ValueError("positions must be >= 0")
+        if not self.can_reserve(positions)[0]:
+            return False
         with self._lock:
-            return _nat.get_lib().desireeia_reserve_context(self._ctx, int(positions)) == 0
+            ok = _nat.get_lib().desireeia_reserve_context(self._ctx, int(positions)) == 0
+        if ok:
+            self._reserved_positions = int(positions)
+        return ok
+
+    def memory_breakdown(self) -> dict:
+        """Where the memory of this model goes, in megabytes (estimated from the model header and the reserved context)."""
+        self._check()
+        from .autoconfig import ModelTraits
+        from .engine import gpus
+        total = free = 0
+        device = ""
+        try:
+            found = gpus()
+            if found:
+                gpu = max(found, key=lambda g: g["free_bytes"])
+                device, total, free = gpu["name"], gpu["total_bytes"], gpu["free_bytes"]
+        except Exception:
+            pass
+        per_token = weights = reserved_bytes = 0
+        try:
+            traits = ModelTraits.read(self._model_path)
+            per_token = traits.kv_bytes_per_token_for(self._plan.kv_compression)
+            reserved_bytes = traits.kv_bytes_for(self._plan.kv_compression, self._reserved_positions)
+            weights = traits.file_size_bytes
+        except Exception:
+            pass
+        mb = 1024 * 1024
+        return {
+            "device": device,
+            "video_total_mb": total // mb,
+            "video_free_mb": free // mb,
+            "video_used_mb": max(0, total - free) // mb,
+            "weights_mb": weights // mb,
+            "kv_reserved_mb": reserved_bytes // mb,
+            "reserved_positions": self._reserved_positions,
+            "kv_bytes_per_token": per_token,
+        }
+
+    def warmup(self) -> None:
+        """One short prefill and decode that brings CUDA, the kernels and the buffers up, then drops the session.
+
+        The first request after a load otherwise pays for it (measured: ~11 s before the first layer of the first prompt)."""
+        self._check()
+        try:
+            tokens = self.tokenize("Hello", add_bos=True)
+            if tokens:
+                for _ in self.stream(tokens, GenerateOptions(max_tokens=1)):
+                    pass
+        finally:
+            self.reset_session()
 
     def trim_cache(self) -> None:
         """Give back the whole KV cache (chat closed, app idle); drops the session."""

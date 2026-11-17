@@ -1,5 +1,49 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.4.6 · PyPI `desireeia` 0.4.6 · engine 0.4.6 (ABI 6)
+
+### Changed - the KV cache of a model with local-attention layers is windowed
+
+A model such as Spark-X2.6 (36 layers, 27 of them with a 512-position attention window and 9 global) kept the K/V of EVERY
+layer for the whole context, although a local layer never reads further back than its window. With the Q8_0 cache (the
+default) the engine now gives a local layer a fixed region of `window - 1 + 1088` positions and lets it slide, so only the
+global layers grow with the context: 16384 positions cost ~395 MB instead of 1.2 GB, 65536 cost ~1.3 GB instead of 5.1 GB
+(host copy and video memory alike). A long prompt goes through in blocks of 1024 tokens, each through every layer.
+MEASURED on a 4B model, greedy decoding, a 12,000-token prompt and 1,700 generated tokens: the token stream is identical to
+the one of the whole cache, and the video memory in use went from 5796 to 4848 MB. The saved sessions and the prefix store
+keep working; a cut that needs rows a local layer has already dropped (a prompt that diverges early) is prefilled again.
+`DESIREEIA_KV_WINDOW=0` turns it off.
+
+`ModelTraits` reads the per-layer flags of `attention.sliding_window_pattern` (`LocalLayerCount`, `KvBytesFor`,
+`MaxPositionsFor`; the same in the Python wrapper), so `AutoConfigurator` and `CanReserve` count the windowed cache: on a
+6 GB card the context that fits goes from ~20k to ~75k positions. `KvBytesPerTokenFor` stays the whole-layer upper bound.
+
+## NuGet `DesireeIA` 0.4.5 · PyPI `desireeia` 0.4.5 · engine 0.4.3 (ABI 6)
+
+Republication of 0.4.4 with the same contents (0.4.4 was already on NuGet when this build was pushed). No native change.
+
+## NuGet `DesireeIA` 0.4.4 · PyPI `desireeia` 0.4.4 · engine 0.4.3 (ABI 6)
+
+The context now follows the VIDEO MEMORY of the GPU, and a model can be asked where its memory goes. The native engine is the one of 0.4.3 (nothing to rebuild); the PyPI wrapper, which stayed at 0.4.1, catches up with everything since.
+
+### Fixed — a context that did not fit the video memory made every prefill crawl
+
+- `AutoConfigurator` planned the context against the RAM only ("VRAM size isn't probed") and always aimed at 16384 tokens. A larger context was not refused by the driver: the KV cache spilled into shared memory and the GPU stayed at 100% while the prefill got slower. MEASURED on a 6 GB laptop card with a 4B model (3.5 GB of weights, 78 KB of Q8_0 KV cache per token): a 9174-token prefill takes 15.7 s at a context of 16384 and its first layer alone takes 80 s at 40960.
+- **`HardwareProfile.Gpus`** (`hardware.gpus` in Python): the GPUs with their total and FREE video memory at the moment of the probe.
+- **`AutoConfigurator.MaxContextByVideoMemory`**: weights + KV cache per token + a 384 MB margin against the free video memory of the GPU with the most room. `Compute`/`Configure` use it to limit the context, and **`AutoConfiguration.MaxContextSize`** reports the largest context that still fits (trained length, RAM and video memory), so a caller can grow the context only as far as the device allows. The new `targetContext` argument replaces the fixed 16384 as the aim. Without a GPU probe (a profile built by hand) nothing changes.
+- **`LocalModel.ReserveContext` refuses** (returns false) a KV cache that does not fit the free video memory, before allocating; `CanReserve(positions, out reason)` tells why.
+
+### Added
+
+- **`LocalModel.GetMemoryBreakdown()`** (`memory_breakdown()`): video memory total/free/used, weights, KV cache reserved and its cost per token, in one record with a one-line `ToString()`.
+- **`LocalModel.Warmup()`** (`warmup()`): one short prefill and decode that brings CUDA and the buffers up. The first prompt after a load paid ~11 s for it.
+- Verified on a real GPU: `Dispose()` gives the video memory back (5080 → 784 → 5060 MB free around a load with a 16384-token cache).
+- Python: `auto_configure(path, overrides, target_context)`, `compute_configuration(..., target_context)`, `max_context_by_video_memory`, `can_reserve`, plus the loop stop and Spark X2.6 fixes of 0.4.2-0.4.3 that the PyPI packages did not have.
+
+### Known
+
+- `desireeia_set_json_schema` can end a number with a stray `0` on small models (`JsonSchema_MakesEveryAnswerParseWithTheRequiredKeys`, with Spark X2.6): already so in 0.4.3, not touched here.
+
 ## NuGet `DesireeIA` 0.4.3 · engine 0.4.3 (ABI 6)
 
 A reply that starts repeating itself now ends by itself. Nothing changes in the API; the PyPI packages stay at 0.4.1.

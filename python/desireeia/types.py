@@ -33,6 +33,9 @@ class HardwareProfile:
     axelera_device_count: int
     metal: bool
     vulkan: bool
+    # The GPUs the engine can use, as the dicts of engine.gpus() (total_bytes, free_bytes at the moment of the probe).
+    # Empty when not probed (a profile built by hand): the planner then keeps to the RAM budget.
+    gpus: tuple = ()
 
     @staticmethod
     def from_native(hw: _nat.HwInfo) -> HardwareProfile:

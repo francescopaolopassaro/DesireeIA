@@ -191,6 +191,7 @@ struct EngineContext {
         std::vector<int32_t> tokens;
         std::vector<uint8_t> k, v;     // layer-major, tokens.size() positions per layer (the session image layout)
         uint64_t stamp = 0;
+        size_t local_start = 0;        // windowed cache: first position whose rows the local layers hold in this entry
         size_t bytes() const { return k.size() + v.size() + tokens.size() * sizeof(int32_t); }
     };
     std::vector<PrefixEntry> prefix_store;
@@ -244,7 +245,8 @@ static size_t reusable_prefix(const EngineContext* c, const int32_t* tokens, siz
     size_t limit = std::min({cached, c->kv_tokens.size(), n_tokens - 1, df->cache_len()});
     size_t n = 0;
     while (n < limit && c->kv_tokens[n] == tokens[n]) ++n;
-    return n;
+    // windowed cache: the local layers may no longer hold the rows the cut needs; then the prompt is prefilled again
+    return df->usable_prefix(n);
 }
 
 static void invalidate_session(EngineContext* c) {
@@ -294,7 +296,7 @@ static void prefix_store_save_live(EngineContext* c, size_t reuse) {
     }
     EngineContext::PrefixEntry e;
     e.tokens.assign(c->kv_tokens.begin(), c->kv_tokens.begin() + (std::ptrdiff_t) n);
-    if (!df->export_kv(n, e.k, e.v)) return;
+    if (!df->export_kv(n, e.k, e.v, &e.local_start)) return;
     if (e.bytes() > c->prefix_budget) return;   // a single prompt larger than the whole budget is not kept
     e.stamp = ++c->prefix_clock;
     // entries that are a prefix of the new one are redundant now
@@ -306,6 +308,12 @@ static void prefix_store_save_live(EngineContext* c, size_t reuse) {
     prefix_store_trim(c);
 }
 
+// Whether an entry saved with the local layers holding rows from `local_start` can be restored at m positions.
+static bool df_restorable(const EngineContext* c, size_t m, size_t local_start) {
+    const DenseForward* df = dynamic_cast<const DenseForward*>(c->gf);
+    return df && df->restorable_prefix(m, local_start);
+}
+
 // The longest stored prefix of `tokens` (leaving at least one token to prefill), or npos-like 0.
 static size_t prefix_store_find(const EngineContext* c, const int32_t* tokens, size_t n_tokens, size_t& entry) {
     size_t best = 0;
@@ -313,7 +321,7 @@ static size_t prefix_store_find(const EngineContext* c, const int32_t* tokens, s
     if (c->prefix_budget == 0 || n_tokens < 2) return 0;
     for (size_t i = 0; i < c->prefix_store.size(); ++i) {
         const size_t n = std::min(common_prefix_len(c->prefix_store[i].tokens, tokens, n_tokens), n_tokens - 1);
-        if (n > best) { best = n; entry = i; }
+        if (n > best && df_restorable(c, n, c->prefix_store[i].local_start)) { best = n; entry = i; }
     }
     return best >= (size_t) c->prefix_min_tokens ? best : 0;
 }
