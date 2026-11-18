@@ -102,6 +102,7 @@ ArchKind detect_arch(const std::string& tag) {
 
     // --- parallel topology (attention + FFN from the same normalized input) ---
     if (tag == "cohere2") return ArchKind::Cohere2;
+    if (tag == "command-r") return ArchKind::CommandR;
     // Same parallel topology as above, but with QKV fused into one tensor
     // (see DenseQuirks::fused_qkv and ArchKind::Falcon).
     if (tag == "falcon") return ArchKind::Falcon;
@@ -131,6 +132,7 @@ ArchKind detect_arch(const std::string& tag) {
     // layers, which would just get silently ignored — worse than a clean
     // rejection.
     if (tag == "mamba2") return ArchKind::Mamba2;
+    if (tag == "gemma4") return ArchKind::Gemma4;
 
     // --- same exact shape as the baseline dense family (no quirks) ---
     // Checked one by one: RMSNorm before attention, gated SiLU FFN, no
@@ -138,7 +140,8 @@ ArchKind detect_arch(const std::string& tag) {
     if (tag == legacy_dense_tag() || tag == legacy_dense_tag_v2() ||
         tag == "internlm2" || tag == "exaone"  || tag == "smollm3" ||
         tag == "nanbeige"  || tag == "baichuan" || tag == "xverse" ||
-        tag == "plamo"     || tag == "refact"  || tag == "pangu-embedded") {
+        tag == "plamo"     || tag == "refact"  || tag == "pangu-embedded" ||
+        tag == "ernie4_5"  || tag == "mistral3") {
         return ArchKind::DenseGqa;
     }
     return ArchKind::Unknown;
@@ -146,7 +149,7 @@ ArchKind detect_arch(const std::string& tag) {
 
 TokenizerKind detect_tokenizer(const std::string& tag) {
     if (tag == legacy_dense_tag()) return TokenizerKind::SpmUnigram;
-    if (tag == "gpt2") return TokenizerKind::Bpe;
+    if (tag == "gpt2" || tag == "gemma4") return TokenizerKind::Bpe;
     return TokenizerKind::Unknown;
 }
 
@@ -156,7 +159,8 @@ bool arch_rope_adjacent_pairs(const std::string& tag) {
     return tag == legacy_dense_tag() || tag == legacy_dense_tag_v2() ||
            tag == "internlm2" || tag == "baichuan" || tag == "xverse"  ||
            tag == "smollm3"   || tag == "nanbeige" || tag == "mistral" ||
-           tag == "arcee"     || tag == "cohere2";
+           tag == "arcee"     || tag == "cohere2"  || tag == "command-r" ||
+           tag == "ernie4_5"  || tag == "mistral3";
 }
 
 DenseQuirks quirks_for(ArchKind kind) {
@@ -247,6 +251,12 @@ DenseQuirks quirks_for(ArchKind kind) {
             q.layer_norm = true; // mean+variance, no bias
             q.parallel_residual = true;
             q.rope_only_swa = true;
+            break;
+        case ArchKind::CommandR:
+            q.gelu_tanh = false; // SiLU, gated FFN
+            q.qkv_bias = true;   // optional, read if present
+            q.layer_norm = true; // mean+variance, no bias
+            q.parallel_residual = true;
             break;
         case ArchKind::Falcon:
             q.layer_norm = true; // WITH bias (unlike cohere2)

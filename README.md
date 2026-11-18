@@ -369,6 +369,8 @@ Dense causal transformers (RoPE, grouped-query attention, gated/non-gated feed-f
 - Starcoder2 (+ CodeShell), Nemotron, Arcee
 - Olmo2, Exaone4 (post-norm topology)
 - Cohere2, Falcon (parallel attention/FFN topology, fused QKV)
+- Gemma 4 (dense variants with per-layer embeddings and shared KV; the routed-experts variant is not implemented yet): **supported**; the automated test (`python/tests/test_gemma4.py`) needs a Gemma 4 file in `DESIREEIA_TEST_GEMMA4` and is skipped without it, so it is not part of the regular run. On a CUDA GPU the whole token runs on the device (about 39 tokens/s with the E4B Q2_K_XL file on a 6 GB laptop GPU); `DESIREEIA_G4_HOST=1` forces the host path
+- Command-R, ERNIE 4.5 (dense), Mistral 3 (text only): **supported, not covered by the automated tests** (the layout matches an architecture that is tested; no model of these families is run in the test suite, so they are not claimed as tested)
 - GPT-2, BLOOM, MPT (absolute position embeddings / ALiBi, no RoPE)
 - Spark2_5 (hybrid sliding-window attention: per-layer flag array rather
   than a fixed period, dual RoPE — full rotation with one base on

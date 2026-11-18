@@ -3331,6 +3331,48 @@ int matmul_kquant_cuda_resident(int format, const void* d_w, size_t rows, size_t
     return DESIREEIA_OK;
 }
 
+int matmul_kquant_cuda_resident_same_x(const CudaKQuantJob* jobs, size_t n, size_t cols, const float* x) {
+    if (!jobs || n == 0 || cols % 32 != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
+    size_t total = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t pb = cuda_block_weights(jobs[i].format);
+        if (!jobs[i].d_w || jobs[i].rows == 0 || pb == 0 || cols % pb != 0) return DESIREEIA_ERR_NOT_SUPPORTED;
+        total += jobs[i].rows;
+    }
+    const size_t nb = cols / 32;
+    if (!scratch_reserve(nb, total)) return DESIREEIA_ERR_IO;
+    if (!scratch_reserve_sums(nb)) return DESIREEIA_ERR_IO;
+    if (cols > g_scratch.xin_cap) {
+        if (g_scratch.d_xin) cudaFree(g_scratch.d_xin);
+        g_scratch.d_xin = nullptr;
+        g_scratch.xin_cap = 0;
+        invalidate_graphs();
+        if (cudaMalloc(&g_scratch.d_xin, cols * sizeof(float)) != cudaSuccess) return DESIREEIA_ERR_IO;
+        g_scratch.xin_cap = cols;
+    }
+    cudaStream_t stream = scratch_stream();
+    cudaMemcpyAsync(g_scratch.d_xin, x, cols * sizeof(float), cudaMemcpyHostToDevice, stream);
+    int8_t* d_xq = reinterpret_cast<int8_t*>(g_scratch.d_stage);
+    float* d_xscale = reinterpret_cast<float*>(g_scratch.d_stage + nb * 32);
+    quantize_q8_0_kernel<<<(unsigned) nb, 32, 0, stream>>>(g_scratch.d_xin, cols, d_xq, d_xscale, g_scratch.d_xsum);
+    size_t off = 0;
+    for (size_t i = 0; i < n; ++i) {
+        launch_matmul_kquant(jobs[i].format, static_cast<const uint8_t*>(jobs[i].d_w), d_xq, d_xscale,
+                             g_scratch.d_xsum, cols, jobs[i].rows, g_scratch.d_y + off, nullptr, stream);
+        off += jobs[i].rows;
+    }
+    if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
+    std::vector<float> host(total);
+    cudaMemcpyAsync(host.data(), g_scratch.d_y, total * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) return DESIREEIA_ERR_IO;
+    off = 0;
+    for (size_t i = 0; i < n; ++i) {
+        std::memcpy(jobs[i].y, host.data() + off, jobs[i].rows * sizeof(float));
+        off += jobs[i].rows;
+    }
+    return DESIREEIA_OK;
+}
+
 // Output head of a decoded token without leaving the device: the last
 // layer left x in d_xin, so the final RMS norm (in place), the Q8_0 form of
 // the result and the head product run right behind it, and only the logits
@@ -8637,10 +8679,17 @@ int cuda_layer_forward_batch(const CudaLayerBatchArgs& a) {
                 __half* kh = s.kv16;
                 __half* vh = s.kv16 + (size_t) prompt_end * a.kv_dim;
                 if (s.kv16_valid < end) {
-                    const size_t work = (size_t) (end - s.kv16_valid) * a.n_head_kv * (a.head_dim / 32);
+                    // A local-attention layer never reads further back than its window, and the windowed cache no longer
+                    // holds those rows (their address lies outside the layer's region): convert from the window start.
+                    uint32_t from = s.kv16_valid;
+                    if (a.n_swa > 0) {
+                        const uint32_t win_lo = a.pos0 + 1 > a.n_swa ? a.pos0 + 1 - a.n_swa : 0;
+                        if (win_lo > from) from = win_lo;
+                    }
+                    const size_t work = (size_t) (end - from) * a.n_head_kv * (a.head_dim / 32);
                     kv_q8_to_f16_kernel<<<(unsigned) ((work + 255) / 256), 256, 0, stream>>>(
                         g_scratch.d_kcache, g_scratch.d_vcache, a.kv_layer_off, pos_bytes, kv_row_bytes,
-                        a.n_head_kv, a.head_dim, s.kv16_valid, end, kh, vh);
+                        a.n_head_kv, a.head_dim, from, end, kh, vh);
                     s.kv16_valid = end;
                 }
                 const float q_scale = inv_d * 1.4426950408889634f;
@@ -8811,6 +8860,301 @@ int cuda_layer_forward_batch(const CudaLayerBatchArgs& a) {
                         cudaMemcpyDeviceToHost, stream);
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) return DESIREEIA_ERR_IO;
+    return DESIREEIA_OK;
+}
+
+
+// ===================================================================================================================================
+// Gemma 4: one whole decoded token on the device (see models/gemma4_forward.cpp). The activations never leave the GPU between the
+// operations of a token: every norm, rotation, attention, gated product and residual runs as a kernel on one stream, the products
+// use the same K-quant kernels as everywhere else, and the host synchronises once per token (to read the logits).
+// ===================================================================================================================================
+namespace {
+
+__device__ __forceinline__ float g4_gelu(float x) {
+    const float c = 0.7978845608028654f;
+    return 0.5f * x * (1.0f + tanhf(c * (x + 0.044715f * x * x * x)));
+}
+
+__device__ float g4_block_sum(float v, float* sh) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) sh[wid] = v;
+    __syncthreads();
+    const int nw = (blockDim.x + 31) >> 5;
+    float r = (threadIdx.x < nw) ? sh[threadIdx.x] : 0.0f;
+    if (wid == 0) for (int o = 16; o > 0; o >>= 1) r += __shfl_xor_sync(0xffffffffu, r, o);
+    if (threadIdx.x == 0) sh[0] = r;
+    __syncthreads();
+    const float out = sh[0];
+    __syncthreads();
+    return out;
+}
+
+// y = x / rms(x) * w over one vector (w may be null). In place is allowed.
+__global__ void g4_rms_kernel(const float* x, const float* w, float* y, int n, float eps) {
+    __shared__ float sh[32];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+    ss = g4_block_sum(ss, sh);
+    const float s = rsqrtf(ss / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * s * (w ? w[i] : 1.0f);
+}
+
+// The same per head: grid = number of heads, hd values each.
+__global__ void g4_head_rms_kernel(float* x, const float* w, int hd, float eps) {
+    __shared__ float sh[32];
+    float* xh = x + (size_t) blockIdx.x * hd;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) ss += xh[i] * xh[i];
+    ss = g4_block_sum(ss, sh);
+    const float s = rsqrtf(ss / (float) hd + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) xh[i] = xh[i] * s * (w ? w[i] : 1.0f);
+}
+
+// Rotation of the first n_rot values of every head (split-half pairing); factors divides the frequencies.
+__global__ void g4_rope_kernel(float* x, int hd, int n_rot, float base, const float* factors, int pos) {
+    float* xh = x + (size_t) blockIdx.x * hd;
+    const int half = n_rot / 2;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        float freq = powf(base, -2.0f * (float) i / (float) n_rot);
+        if (factors) freq /= factors[i];
+        const float th = (float) pos * freq;
+        float sn, cs;
+        sincosf(th, &sn, &cs);
+        const float a = xh[i], b = xh[i + half];
+        xh[i] = a * cs - b * sn;
+        xh[i + half] = a * sn + b * cs;
+    }
+}
+
+__global__ void g4_kv_store_kernel(const float* k, const float* v, __half* kc, __half* vc, int n, int slot) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        kc[(size_t) slot * n + i] = __float2half(k[i]);
+        vc[(size_t) slot * n + i] = __float2half(v[i]);
+    }
+}
+
+// One block per query head. Scores in global scratch, softmax in the block, then the weighted sum of V. No 1/sqrt(d) scaling.
+__global__ void g4_attn_kernel(const float* q, const __half* kc, const __half* vc, float* out, float* scores, int hd, int nk,
+                               int group, int lo, int span, int cap, size_t score_stride) {
+    extern __shared__ float qs[];
+    __shared__ float sh[32];
+    const int h = blockIdx.x;
+    const int kvh = h / group;
+    const int row = nk * hd;
+    for (int t = threadIdx.x; t < hd; t += blockDim.x) qs[t] = q[(size_t) h * hd + t];
+    __syncthreads();
+    float* sc = scores + (size_t) h * score_stride;
+    float mx = -3.0e38f;
+    for (int j = threadIdx.x; j < span; j += blockDim.x) {
+        const __half* kj = kc + (size_t) ((lo + j) % cap) * row + (size_t) kvh * hd;
+        float d = 0.0f;
+        for (int t = 0; t < hd; ++t) d += qs[t] * __half2float(kj[t]);
+        sc[j] = d;
+        mx = fmaxf(mx, d);
+    }
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if ((threadIdx.x & 31) == 0) sh[threadIdx.x >> 5] = mx;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = sh[0];
+        for (int w = 1; w < (int) ((blockDim.x + 31) >> 5); ++w) m = fmaxf(m, sh[w]);
+        sh[31] = m;
+    }
+    __syncthreads();
+    const float gmax = sh[31];
+    __syncthreads();
+    float den = 0.0f;
+    for (int j = threadIdx.x; j < span; j += blockDim.x) {
+        const float e = expf(sc[j] - gmax);
+        sc[j] = e;
+        den += e;
+    }
+    den = g4_block_sum(den, sh);
+    const float inv = 1.0f / den;
+    __syncthreads();
+    for (int t = threadIdx.x; t < hd; t += blockDim.x) {
+        float acc = 0.0f;
+        for (int j = 0; j < span; ++j) {
+            acc += sc[j] * __half2float(vc[(size_t) ((lo + j) % cap) * row + (size_t) kvh * hd + t]);
+        }
+        out[(size_t) h * hd + t] = acc * inv;
+    }
+}
+
+__global__ void g4_gelu_mul_kernel(float* g, const float* u, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) g[i] = g4_gelu(g[i]) * u[i];
+}
+
+// x += rms(t) * w
+__global__ void g4_rms_add_kernel(float* x, const float* t, const float* w, int n, float eps) {
+    __shared__ float sh[32];
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += t[i] * t[i];
+    ss = g4_block_sum(ss, sh);
+    const float s = rsqrtf(ss / (float) n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) x[i] += t[i] * s * w[i];
+}
+
+__global__ void g4_scale_kernel(float* x, float s, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) x[i] *= s;
+}
+
+__global__ void g4_softcap_kernel(float* y, int n, float cap) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] = cap * tanhf(y[i] / cap);
+}
+
+struct G4Dev {
+    bool ready = false;
+    uint32_t n_layers = 0, E = 0, P = 0, n_vocab = 0, max_cols = 0, cap_global = 0;
+    float eps = 1e-6f, softcap = 0.0f;
+    size_t score_stride = 0;
+    float *x = nullptr, *h = nullptr, *t = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *att = nullptr, *g = nullptr, *u = nullptr,
+          *gp = nullptr, *pe = nullptr, *ple = nullptr, *logits = nullptr, *scores = nullptr, *out_norm = nullptr, *factors = nullptr;
+    int8_t* xq = nullptr;
+    float* xs = nullptr;
+    int32_t* xsum = nullptr;
+    G4DevMat head{};
+    std::vector<G4DevLayer> layers;
+    std::vector<float*> norms; // every device vector uploaded for the layers (freed together)
+    std::vector<__half*> kc, vc;
+};
+G4Dev g_g4;
+
+float* g4_upload(const float* h, size_t n) {
+    if (!h || n == 0) return nullptr;
+    float* d = nullptr;
+    if (cudaMalloc(&d, n * sizeof(float)) != cudaSuccess) return nullptr;
+    if (cudaMemcpy(d, h, n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) { cudaFree(d); return nullptr; }
+    return d;
+}
+
+void g4_quant(const float* d_in, size_t cols, cudaStream_t s) {
+    quantize_q8_0_kernel<<<(unsigned) (cols / 32), 32, 0, s>>>(d_in, cols, g_g4.xq, g_g4.xs, g_g4.xsum);
+}
+
+void g4_mm(const G4DevMat& m, float* d_out, cudaStream_t s) {
+    launch_matmul_kquant(m.format, static_cast<const uint8_t*>(m.d_w), g_g4.xq, g_g4.xs, g_g4.xsum, m.cols, m.rows, d_out, nullptr, s);
+}
+
+} // namespace
+
+void g4_dev_free() {
+    G4Dev& d = g_g4;
+    auto fr = [](void* p) { if (p) cudaFree(p); };
+    fr(d.x); fr(d.h); fr(d.t); fr(d.q); fr(d.k); fr(d.v); fr(d.att); fr(d.g); fr(d.u); fr(d.gp); fr(d.pe); fr(d.ple); fr(d.logits);
+    fr(d.scores); fr(d.out_norm); fr(d.factors); fr(d.xq); fr(d.xs); fr(d.xsum);
+    for (float* p : d.norms) fr(p);
+    for (auto* p : d.kc) fr(p);
+    for (auto* p : d.vc) fr(p);
+    d = G4Dev{};
+}
+
+bool g4_dev_init(uint32_t n_layers, uint32_t E, uint32_t P, uint32_t n_vocab, float eps, float softcap, uint32_t cap_global,
+                 uint32_t max_cols, uint32_t max_q, uint32_t max_ff, uint32_t max_kv, const G4DevMat& head, const float* out_norm,
+                 const float* factors, size_t n_factors) {
+    g4_dev_free();
+    G4Dev& d = g_g4;
+    d.n_layers = n_layers; d.E = E; d.P = P; d.n_vocab = n_vocab; d.eps = eps; d.softcap = softcap;
+    d.cap_global = cap_global; d.max_cols = max_cols; d.head = head;
+    d.score_stride = cap_global;
+    auto al = [](float** p, size_t n) { return cudaMalloc(p, n * sizeof(float)) == cudaSuccess; };
+    bool ok = al(&d.x, E) && al(&d.h, E) && al(&d.t, E) && al(&d.q, max_q) && al(&d.k, max_kv) && al(&d.v, max_kv) && al(&d.att, max_q) &&
+              al(&d.g, max_ff) && al(&d.u, max_ff) && al(&d.gp, P ? P : 32) && al(&d.pe, E) && al(&d.ple, (size_t) n_layers * (P ? P : 1)) &&
+              al(&d.logits, n_vocab) && al(&d.scores, (size_t) 64 * d.score_stride) && al(&d.xs, max_cols / 32 + 1);
+    ok = ok && cudaMalloc(&d.xq, max_cols) == cudaSuccess && cudaMalloc(&d.xsum, (max_cols / 32 + 1) * sizeof(int32_t)) == cudaSuccess;
+    d.out_norm = g4_upload(out_norm, E);
+    d.factors = g4_upload(factors, n_factors);
+    d.layers.assign(n_layers, G4DevLayer{});
+    d.kc.assign(n_layers, nullptr);
+    d.vc.assign(n_layers, nullptr);
+    if (!ok || !d.out_norm) { g4_dev_free(); return false; }
+    return true;
+}
+
+bool g4_dev_set_layer(uint32_t l, const G4DevLayer& in, const float* attn_norm, const float* q_norm, const float* k_norm,
+                      const float* post_attn, const float* ffn_norm, const float* post_ffn, const float* ple_post) {
+    G4Dev& d = g_g4;
+    if (l >= d.n_layers) return false;
+    G4DevLayer L = in;
+    auto up = [&](const float* h, size_t n) { float* p = g4_upload(h, n); if (p) d.norms.push_back(p); return p; };
+    L.d_attn_norm = up(attn_norm, d.E);
+    L.d_q_norm = up(q_norm, L.hd);
+    L.d_k_norm = k_norm ? up(k_norm, L.hd) : nullptr;
+    L.d_post_attn = up(post_attn, d.E);
+    L.d_ffn_norm = up(ffn_norm, d.E);
+    L.d_post_ffn = up(post_ffn, d.E);
+    L.d_ple_post = ple_post ? up(ple_post, d.E) : nullptr;
+    if (!L.d_attn_norm || !L.d_q_norm || !L.d_post_attn || !L.d_ffn_norm || !L.d_post_ffn) return false;
+    if (L.owns) {
+        const size_t n = (size_t) L.cap * L.nk * L.hd;
+        if (cudaMalloc(&d.kc[l], n * sizeof(__half)) != cudaSuccess || cudaMalloc(&d.vc[l], n * sizeof(__half)) != cudaSuccess) return false;
+    }
+    d.layers[l] = L;
+    return true;
+}
+
+int g4_dev_token(const float* x_in, const float* ple_in, uint32_t pos, float* logits_out) {
+    G4Dev& d = g_g4;
+    cudaStream_t s = scratch_stream();
+    const uint32_t E = d.E, P = d.P;
+    cudaMemcpyAsync(d.x, x_in, E * sizeof(float), cudaMemcpyHostToDevice, s);
+    if (P > 0) cudaMemcpyAsync(d.ple, ple_in, (size_t) d.n_layers * P * sizeof(float), cudaMemcpyHostToDevice, s);
+    for (uint32_t l = 0; l < d.n_layers; ++l) {
+        const G4DevLayer& L = d.layers[l];
+        const int hd = (int) L.hd, nh = (int) L.nh, nk = (int) L.nk;
+        g4_rms_kernel<<<1, 256, 0, s>>>(d.x, L.d_attn_norm, d.h, (int) E, d.eps);
+        g4_quant(d.h, E, s);
+        g4_mm(L.wq, d.q, s);
+        if (L.owns) {
+            g4_mm(L.wk, d.k, s);
+            if (L.has_v) g4_mm(L.wv, d.v, s); else cudaMemcpyAsync(d.v, d.k, (size_t) nk * hd * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        }
+        g4_head_rms_kernel<<<nh, 128, 0, s>>>(d.q, L.d_q_norm, hd, d.eps);
+        g4_rope_kernel<<<nh, 128, 0, s>>>(d.q, hd, (int) L.rot, L.base, L.use_factors ? d.factors : nullptr, (int) pos);
+        if (L.owns) {
+            g4_head_rms_kernel<<<nk, 128, 0, s>>>(d.k, L.d_k_norm, hd, d.eps);
+            g4_rope_kernel<<<nk, 128, 0, s>>>(d.k, hd, (int) L.rot, L.base, L.use_factors ? d.factors : nullptr, (int) pos);
+            g4_head_rms_kernel<<<nk, 128, 0, s>>>(d.v, nullptr, hd, d.eps);
+            g4_kv_store_kernel<<<8, 256, 0, s>>>(d.k, d.v, d.kc[l], d.vc[l], nk * hd, (int) (pos % L.cap));
+        }
+        const G4DevLayer& S = d.layers[L.src];
+        const int lo = (L.swa && L.n_swa > 0 && pos + 1 > L.n_swa) ? (int) (pos + 1 - L.n_swa) : 0;
+        const int span = (int) pos + 1 - lo;
+        const int group = nh / (int) S.nk > 0 ? nh / (int) S.nk : 1;
+        g4_attn_kernel<<<nh, 256, hd * sizeof(float), s>>>(d.q, d.kc[L.src], d.vc[L.src], d.att, d.scores, hd, (int) S.nk, group, lo, span,
+                                                           (int) S.cap, d.score_stride);
+        g4_quant(d.att, (size_t) nh * hd, s);
+        g4_mm(L.wo, d.t, s);
+        g4_rms_add_kernel<<<1, 256, 0, s>>>(d.x, d.t, L.d_post_attn, (int) E, d.eps);
+        g4_rms_kernel<<<1, 256, 0, s>>>(d.x, L.d_ffn_norm, d.h, (int) E, d.eps);
+        g4_quant(d.h, E, s);
+        g4_mm(L.gate, d.g, s);
+        g4_mm(L.up, d.u, s);
+        g4_gelu_mul_kernel<<<64, 256, 0, s>>>(d.g, d.u, (int) L.ff);
+        g4_quant(d.g, L.ff, s);
+        g4_mm(L.down, d.t, s);
+        g4_rms_add_kernel<<<1, 256, 0, s>>>(d.x, d.t, L.d_post_ffn, (int) E, d.eps);
+        if (P > 0) {
+            g4_quant(d.x, E, s);
+            g4_mm(L.ple_gate, d.gp, s);
+            g4_gelu_mul_kernel<<<1, 256, 0, s>>>(d.gp, d.ple + (size_t) l * P, (int) P);
+            g4_quant(d.gp, P, s);
+            g4_mm(L.ple_proj, d.pe, s);
+            g4_rms_add_kernel<<<1, 256, 0, s>>>(d.x, d.pe, L.d_ple_post, (int) E, d.eps);
+        }
+        if (L.out_scale != 1.0f) g4_scale_kernel<<<8, 256, 0, s>>>(d.x, L.out_scale, (int) E);
+    }
+    if (logits_out) {
+        g4_rms_kernel<<<1, 256, 0, s>>>(d.x, d.out_norm, d.h, (int) E, d.eps);
+        g4_quant(d.h, E, s);
+        g4_mm(d.head, d.logits, s);
+        if (d.softcap > 0.0f) g4_softcap_kernel<<<256, 256, 0, s>>>(d.logits, (int) d.n_vocab, d.softcap);
+        cudaMemcpyAsync(logits_out, d.logits, (size_t) d.n_vocab * sizeof(float), cudaMemcpyDeviceToHost, s);
+    }
+    if (cudaGetLastError() != cudaSuccess) return DESIREEIA_ERR_IO;
+    if (cudaStreamSynchronize(s) != cudaSuccess) return DESIREEIA_ERR_IO;
     return DESIREEIA_OK;
 }
 

@@ -16,6 +16,7 @@
 #include "core/thread_pool.h"
 #include "models/dense_forward.h"
 #include "models/ssm_forward.h"
+#include "models/gemma4_forward.h"
 #include "models/bert_forward.h"
 #include "models/decision_model.h"
 #include "vision/vision_gguf.h"
@@ -840,6 +841,17 @@ desireeia_ctx* engine_create(const char* model_path, const desireeia_plan& plan,
         } else {
             delete bf;
             if (log) log(3, "bert encoder init failed");
+        }
+    } else if (meta.format == DESIREEIA_FORMAT_GGUF && arch_kind == ArchKind::Gemma4) {
+        Gemma4Forward* g4 = new Gemma4Forward;
+        if (g4->open(*reader, meta, ctx->st.plan.backend)) {
+            ctx->gf = g4;
+            ctx->hooks.cancel = &ctx->cancel;
+            ctx->gf->set_hooks(&ctx->hooks);
+            if (log) log(5, "gemma4 forward ready");
+        } else {
+            if (log) log(3, ("gemma4 forward init failed: " + g4->last_fail()).c_str());
+            delete g4;
         }
     } else if (meta.format == DESIREEIA_FORMAT_GGUF && arch_kind == ArchKind::Mamba2) {
         SsmForward* sf = new SsmForward;

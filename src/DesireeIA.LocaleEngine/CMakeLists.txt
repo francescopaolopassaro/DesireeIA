@@ -54,6 +54,7 @@ add_library(DesireeIALocaleEngine SHARED
     src/models/moe_route.cpp
     src/models/prerouter.cpp
     src/models/ssm_forward.cpp
+    src/models/gemma4_forward.cpp
     src/models/bert_forward.cpp
     src/models/decision_ops.cpp
     src/models/modernbert_forward.cpp

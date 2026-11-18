@@ -8,6 +8,7 @@
 #include "bpe_tokenizer.h"
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <functional>
 #include <unordered_map>
 
@@ -200,6 +201,8 @@ bool BpeTokenizer::load(const VocabData& vocab) {
     eos_id_ = vocab.eos_id;
     unk_id_ = vocab.unk_id;
     add_bos_default_ = vocab.add_bos;
+    raw_ = vocab.tokenizer_tag == "gemma4";
+    if (raw_) add_bos_default_ = true; // the model is trained with it whatever the file declares
 
     // GGUF token types: 2=UNKNOWN, 3=CONTROL, 4=USER_DEFINED. These three
     // types are recognized as atomic BEFORE ordinary pre-tokenization/BPE
@@ -234,6 +237,21 @@ bool BpeTokenizer::piece(int32_t id, std::string& out) const {
     // Detokenization: inverse of the byte->"visible" unicode GPT2 map
     // applied in encode(). Without it, the output would literally contain
     // the markers (Ġ instead of space, Ċ instead of newline).
+    if (raw_) {
+        const std::string& t = id_to_piece_[(size_t) id];
+        // byte token "<0xNN>"
+        if (t.size() == 6 && t[0] == '<' && t[1] == '0' && t[2] == 'x' && t[5] == '>') {
+            auto hex = [](char ch) { return ch >= '0' && ch <= '9' ? ch - '0' : (ch | 32) >= 'a' && (ch | 32) <= 'f' ? (ch | 32) - 'a' + 10 : -1; };
+            const int hi = hex(t[3]), lo = hex(t[4]);
+            if (hi >= 0 && lo >= 0) { out.assign(1, (char) (hi * 16 + lo)); return true; }
+        }
+        out.clear();
+        for (size_t i = 0; i < t.size();) {
+            if (i + 2 < t.size() && (unsigned char) t[i] == 0xE2 && (unsigned char) t[i + 1] == 0x96 && (unsigned char) t[i + 2] == 0x81) { out += ' '; i += 3; }
+            else out += t[i++];
+        }
+        return true;
+    }
     out = unmap_bytes(id_to_piece_[(size_t) id]);
     return true;
 }
@@ -273,7 +291,36 @@ void encode_plain(const std::string& text,
                   const std::unordered_map<std::string, int32_t>& piece_to_id,
                   int32_t unk_id,
                   const std::function<std::vector<std::string>(const std::string&)>& bpe_merge_fn,
-                  std::vector<int32_t>& out) {
+                  std::vector<int32_t>& out, bool raw) {
+    if (raw) {
+        std::string norm;
+        for (char ch : text) { if (ch == ' ') norm += "\xE2\x96\x81"; else norm += ch; }
+        for (size_t i = 0; i < norm.size();) {
+            const bool nl = norm[i] == '\n';
+            size_t j = i;
+            while (j < norm.size() && (norm[j] == '\n') == nl) ++j;
+            const std::string chunk = norm.substr(i, j - i);
+            i = j;
+            auto whole = piece_to_id.find(chunk);
+            if (nl && whole != piece_to_id.end()) { out.push_back(whole->second); continue; }
+            for (const std::string& sym : bpe_merge_fn(chunk)) {
+                auto it = piece_to_id.find(sym);
+                if (it != piece_to_id.end()) { out.push_back(it->second); continue; }
+                bool all = true;
+                std::vector<int32_t> bytes;
+                for (unsigned char b : sym) {
+                    char nm[8];
+                    std::snprintf(nm, sizeof(nm), "<0x%02X>", b);
+                    auto bt = piece_to_id.find(nm);
+                    if (bt == piece_to_id.end()) { all = false; break; }
+                    bytes.push_back(bt->second);
+                }
+                if (all) out.insert(out.end(), bytes.begin(), bytes.end());
+                else if (unk_id >= 0) out.push_back(unk_id);
+            }
+        }
+        return;
+    }
     for (const std::string& chunk : pre_tokenize(text)) {
         const std::string mapped = map_bytes(chunk);
         for (const std::string& sym : bpe_merge_fn(mapped)) {
@@ -304,7 +351,7 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
     auto merge_fn = [this](const std::string& s) { return bpe_merge(s); };
 
     if (special_tokens_.empty()) {
-        encode_plain(text, piece_to_id_, unk_id_, merge_fn, out);
+        encode_plain(text, piece_to_id_, unk_id_, merge_fn, out, raw_);
         return out;
     }
 
@@ -332,14 +379,14 @@ std::vector<int32_t> BpeTokenizer::encode(const std::string& text, bool add_bos)
             continue;
         }
         if (pos > plain_start) {
-            encode_plain(text.substr(plain_start, pos - plain_start), piece_to_id_, unk_id_, merge_fn, out);
+            encode_plain(text.substr(plain_start, pos - plain_start), piece_to_id_, unk_id_, merge_fn, out, raw_);
         }
         out.push_back(matched_id);
         pos += matched_len;
         plain_start = pos;
     }
     if (plain_start < text.size()) {
-        encode_plain(text.substr(plain_start), piece_to_id_, unk_id_, merge_fn, out);
+        encode_plain(text.substr(plain_start), piece_to_id_, unk_id_, merge_fn, out, raw_);
     }
     return out;
 }

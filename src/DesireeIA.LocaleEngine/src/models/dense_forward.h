@@ -324,6 +324,14 @@ void lora_apply_delta_for_test(const MatVec& m, size_t r, size_t c, const float*
 // architecture. Weights are streamed from the reader layer by layer,
 // dequantized on demand (or cached in RAM if the model fits the planned
 // budget, see open()); embeddings and the KV cache stay resident.
+// Matrix helpers shared with the forward engines in their own files.
+void mv_set_backend(int32_t backend);
+int mv_cuda_format(const MatVec& m, const void** d_w);
+bool mv_load(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out, bool resident);
+void mv_apply(const MatVec& m, size_t r, size_t c, const float* x, float* y);
+void mv_apply_group(const MatVec* const* ms, const size_t* rows, float* const* ys, size_t n, size_t c, const float* x);
+bool mv_row(const MatVec& m, uint32_t cols, uint32_t idx, float* out);
+
 class DenseForward : public IForwardEngine {
 public:
     ~DenseForward() override;

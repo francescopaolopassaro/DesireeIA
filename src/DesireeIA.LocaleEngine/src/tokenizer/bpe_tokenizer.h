@@ -51,6 +51,8 @@ private:
     // that predates this check behaving exactly as before; load() then
     // overwrites it with whatever the file actually declares.
     bool add_bos_default_ = true;
+    // Raw UTF-8 mode (tokenizer tag "gemma4"): space -> U+2581, split only on newlines, no GPT2 byte map, <0xNN> byte fallback.
+    bool raw_ = false;
 
     // Special-token cache (CONTROL/USER_DEFINED/UNKNOWN), sorted by
     // decreasing text length so the longest match wins.

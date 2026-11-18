@@ -1,5 +1,18 @@
 # Changelog
 
+## NuGet `DesireeIA` 0.4.7 · PyPI `desireeia` 0.4.7 · engine 0.4.7 (ABI 6)
+
+0.4.6 shipped the windowed KV cache with the Windows engine only: the Linux and ARM libraries inside the package were the old ones. 0.4.7 is the
+same code with EVERY platform built from it, plus the fixes found while testing it with a real agent:
+
+- `gemma4`: its own forward pass (models/gemma4_forward.cpp): per-layer head sizes, per-layer embeddings, KV shared between layers, norm without weights on V, no score scaling, proportional RoPE on the global layers, final soft capping; and its tokenizer mode (raw UTF-8 BPE, space as U+2581, byte fallback). Q2_K / Q3_K and the i-quant formats of the mixed "dynamic" files are re-encoded as Q4_K on the GPU instead of running on the host (1.6 -> 19 tokens/s on a 6 GB laptop GPU with the E4B Q2_K_XL file), and on CUDA the whole token runs as one device episode (norms, rotation, attention over a half-precision KV ring, gated products, per-layer embeddings; one synchronisation per token): 39 tokens/s. `DESIREEIA_G4_HOST=1` forces the host path, `DESIREEIA_G4_CTX` sets the device cache length (default 16384). New optional test `python/tests/test_gemma4.py`. Routed-experts variants are not implemented yet.
+- new architecture tags that reuse already-tested layouts: `command-r` (parallel attention/FFN, LayerNorm, RoPE on every layer), `ernie4_5` (dense) and `mistral3` (text only). Supported but not covered by the automated tests; the existing families are unchanged (flags default off).
+- the decode graphs are dropped whenever the base of the local layers moves (a reset cache left them reading the old offsets: garbage output);
+- a session saved for a prefix shorter than the cache is refused when the local layers have already slid past it (it used to save zero rows);
+- the FP16 copy of the K/V of a local layer starts at its window, not at position 0 (rows the windowed cache no longer holds: with a cache that grew
+  after the layers slid, a prompt past 32k tokens took 200 s and decoded garbage; now 27 s and identical to the whole cache);
+- `tools/compat_matrix.py`: which model files load and whether what they generate makes sense (one process per file).
+
 ## NuGet `DesireeIA` 0.4.6 · PyPI `desireeia` 0.4.6 · engine 0.4.6 (ABI 6)
 
 ### Changed - the KV cache of a model with local-attention layers is windowed

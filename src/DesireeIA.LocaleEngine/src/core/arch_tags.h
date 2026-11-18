@@ -74,6 +74,7 @@ enum class ArchKind {
                // logit scale. A sibling architecture with a similar
                // parallel topology but a fused QKV tensor isn't covered
                // by this ArchKind — see Falcon below.
+    CommandR,  // cohere2 without the sliding-window/NoPE layout: every layer uses RoPE
     Falcon,    // parallel topology like Cohere2, but with QKV fused into
                // one tensor (DenseQuirks::fused_qkv) and LayerNorm WITH
                // bias. RoPE applies on every layer (unlike Cohere2, no
@@ -114,6 +115,7 @@ enum class ArchKind {
                // logits, no sampling). Covers only the plain variant
                // (absolute position, no RoPE) — see the extended note in
                // bert_forward.h for the related variants left out.
+    Gemma4,    // per-layer head sizes, per-layer embeddings, shared KV (own forward: models/gemma4_forward.cpp)
     Mamba2,    // pure state-space model: no attention at all, forward
                // path COMPLETELY separate (models/ssm_forward.h/.cpp),
                // doesn't touch DenseQuirks/DenseForward at all — this

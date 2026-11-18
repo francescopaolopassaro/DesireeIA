@@ -13,7 +13,7 @@
        session (KV prefix reuse) - see CHANGELOG.md. -->
   <PropertyGroup>
     <PackageId>DesireeIA</PackageId>
-    <Version>0.4.6</Version>
+    <Version>0.4.7</Version>
     <Authors>Passaro Francesco Paolo</Authors>
     <Description>C# wrapper for DesireeIA, a local LLM inference engine (GGUF models, CPU/CUDA backends). Bundles the native engine for every platform this package was built for - see the runtimes/ folder in the package for what's included.</Description>
     <PackageTags>llm;inference;local;gguf;desireeia;ai</PackageTags>
@@ -22,7 +22,7 @@
     <PackageProjectUrl>https://github.com/francescopaolopassaro/DesireeIA</PackageProjectUrl>
     <RepositoryUrl>https://github.com/francescopaolopassaro/DesireeIA</RepositoryUrl>
     <PackageReadmeFile>README.md</PackageReadmeFile>
-    <PackageReleaseNotes>0.4.6: the quantized KV cache of a model with local-attention layers keeps only a window of positions in those layers (a 4B model with 27 local layers of 36 needs ~4x less KV for the same context, in video memory and in RAM); the context that fits grows accordingly (MaxContextSize). 0.4.5: republication of 0.4.4, no native change. 0.4.4: the context follows the VIDEO MEMORY (AutoConfigurator reads the free VRAM of the GPU and reports MaxContextSize; ReserveContext refuses a KV cache that would spill into shared memory), LocalModel.GetMemoryBreakdown() and Warmup(); the PyPI wrapper catches up with 0.4.2-0.4.3. 0.4.3: loop stop — a reply that repeats the same tokens three times in a row ends by itself (no logit is touched, tool calls written as text are exempt; DESIREEIA_NO_LOOP_STOP=1 turns it off). DRY also suspends itself inside a tool call written as text. No API change (interface 6). Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
+    <PackageReleaseNotes>0.4.7: every platform carries the windowed KV cache and its fixes (0.4.6 had the Windows engine only), ModelTraits reads the local-layer flags, tools/compat_matrix.py. 0.4.6: the quantized KV cache of a model with local-attention layers keeps only a window of positions in those layers (a 4B model with 27 local layers of 36 needs ~4x less KV for the same context, in video memory and in RAM); the context that fits grows accordingly (MaxContextSize). 0.4.5: republication of 0.4.4, no native change. 0.4.4: the context follows the VIDEO MEMORY (AutoConfigurator reads the free VRAM of the GPU and reports MaxContextSize; ReserveContext refuses a KV cache that would spill into shared memory), LocalModel.GetMemoryBreakdown() and Warmup(); the PyPI wrapper catches up with 0.4.2-0.4.3. 0.4.3: loop stop — a reply that repeats the same tokens three times in a row ends by itself (no logit is touched, tool calls written as text are exempt; DESIREEIA_NO_LOOP_STOP=1 turns it off). DRY also suspends itself inside a tool call written as text. No API change (interface 6). Full notes: CHANGELOG.md in the repository.</PackageReleaseNotes>
   </PropertyGroup>
 
   <ItemGroup>

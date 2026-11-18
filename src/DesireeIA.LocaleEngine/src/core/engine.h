@@ -533,6 +533,9 @@ DESIREEIA_INTERNAL bool cuda_upload_weights(int format, const uint8_t* data, siz
                                            void** out_d_qs, void** out_d_scale);
 DESIREEIA_INTERNAL int matmul_kquant_cuda_resident(int format, const void* d_w, size_t rows, size_t cols,
                                                   const float* x, float* y);
+// Several resident matrices read the SAME activation (q/k/v, gate/up): one upload, one quantization, one synchronisation.
+struct CudaKQuantJob { int format; const void* d_w; size_t rows; float* y; };
+DESIREEIA_INTERNAL int matmul_kquant_cuda_resident_same_x(const CudaKQuantJob* jobs, size_t n, size_t cols, const float* x);
 // Batched (prefill) form: n_tok activation columns in one episode, each
 // weight read once for all of them instead of once per column. y is
 // [token][row]. Returns NOT_SUPPORTED for formats without a batched
@@ -636,6 +639,25 @@ DESIREEIA_INTERNAL bool cuda_kv_cache_write(size_t byte_off, const void* k, cons
                                            size_t bytes);
 // Moves `bytes` inside the device cache (the two ranges may overlap), for K and V alike.
 DESIREEIA_INTERNAL bool cuda_kv_cache_move(size_t dst_off, size_t src_off, size_t bytes);
+
+// Gemma 4 whole-token device episode (backend_cuda.cu, models/gemma4_forward.cpp).
+struct G4DevMat { int format = 0; const void* d_w = nullptr; uint32_t rows = 0, cols = 0; };
+struct G4DevLayer {
+    G4DevMat wq, wk, wv, wo, gate, up, down, ple_gate, ple_proj;
+    bool owns = false, has_v = false, swa = false, use_factors = false;
+    uint32_t hd = 0, nh = 0, nk = 0, ff = 0, rot = 0, cap = 0, n_swa = 0, src = 0;
+    float base = 0.0f, out_scale = 1.0f;
+    float *d_attn_norm = nullptr, *d_q_norm = nullptr, *d_k_norm = nullptr, *d_post_attn = nullptr, *d_ffn_norm = nullptr,
+          *d_post_ffn = nullptr, *d_ple_post = nullptr;
+};
+DESIREEIA_INTERNAL bool g4_dev_init(uint32_t n_layers, uint32_t E, uint32_t P, uint32_t n_vocab, float eps, float softcap,
+                                    uint32_t cap_global, uint32_t max_cols, uint32_t max_q, uint32_t max_ff, uint32_t max_kv,
+                                    const G4DevMat& head, const float* out_norm, const float* factors, size_t n_factors);
+DESIREEIA_INTERNAL bool g4_dev_set_layer(uint32_t l, const G4DevLayer& in, const float* attn_norm, const float* q_norm,
+                                         const float* k_norm, const float* post_attn, const float* ffn_norm, const float* post_ffn,
+                                         const float* ple_post);
+DESIREEIA_INTERNAL int g4_dev_token(const float* x_in, const float* ple_in, uint32_t pos, float* logits_out);
+DESIREEIA_INTERNAL void g4_dev_free();
 // Drops every captured graph (another model is taking over the device).
 DESIREEIA_INTERNAL void cuda_drop_graphs();
 // Tells the decode attention which kernel to use for the next step: grouped (long contexts) or per head (short ones).

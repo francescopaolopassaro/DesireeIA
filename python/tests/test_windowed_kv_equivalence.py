@@ -88,3 +88,35 @@ def test_a_cut_back_cache_decodes_like_the_whole_cache():
         assert r.returncode == 0, r.stderr[-800:]
         return json.loads(r.stdout.strip().splitlines()[-1])
     assert run("1") == run("0")
+
+
+GROW = r'''
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from desireeia.model import LocalModel
+from desireeia.autoconfig import auto_configure
+from desireeia.types import SamplingOptions
+cfg = auto_configure(sys.argv[2], None)
+m = LocalModel.load(sys.argv[2], cfg.plan)
+m.set_sampling(SamplingOptions(temperature=0.0))
+assert m.reserve_context(3000)
+base = "Section %d: engineers measured pressure, temperature and flow in the tunnel and wrote %d, %d and %d in the log. "
+toks = m.tokenize("".join(base % (i, i * 7, i * 13, i * 31) for i in range(400)))[:4200]
+out = [m.predict(toks)]
+for _ in range(39):
+    out.append(m.next_token())
+print(json.dumps(out))
+m.close()
+'''
+
+
+@pytest.mark.skipif(not MODEL or not LIB, reason="DESIREEIA_TEST_MODEL_PATH / DESIREEIA_NATIVE_LIB not set")
+def test_the_cache_growing_after_the_local_layers_slid_still_decodes_like_the_whole_cache():
+    # the context reserved (3000) is passed in the middle of the prompt, when the local layers have already slid: the FP16
+    # copy of the K/V of a local layer must start at its window, not at position 0 (rows the windowed cache no longer holds)
+    def run(window):
+        r = subprocess.run([sys.executable, "-I", "-c", GROW, ROOT, MODEL], env=dict(os.environ, DESIREEIA_KV_WINDOW=window),
+                           capture_output=True, text=True, timeout=900)
+        assert r.returncode == 0, r.stderr[-800:]
+        return json.loads(r.stdout.strip().splitlines()[-1])
+    assert run("1") == run("0")

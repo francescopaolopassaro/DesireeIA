@@ -2496,9 +2496,6 @@ void DenseForward::grow_cache(size_t needed) {
                 std::memcpy(nv.data() + new_start[l], v_cache_q_.data() + kv_start_[l], n);
             }
         }
-        std::vector<uint8_t> dbg_old_k;
-        std::vector<size_t> dbg_old_start;
-        if (std::getenv("DESIREEIA_KV_TRACE")) { dbg_old_k = k_cache_q_; dbg_old_start = kv_start_; }
         k_cache_q_.swap(nk);
         v_cache_q_.swap(nv);
         kv_start_ = std::move(new_start);
@@ -2508,20 +2505,8 @@ void DenseForward::grow_cache(size_t needed) {
             if (g_kv_owner != nullptr && g_kv_owner != this) { g_kv_owner->sync_host_kv(); cuda_drop_graphs(); }
             g_kv_owner = this;
             const size_t bytes = k_cache_q_.size();
-            const bool r_ok = cuda_kv_cache_reserve(bytes);
-            const bool u_ok = r_ok && cuda_kv_cache_upload(k_cache_q_.data(), v_cache_q_.data(), bytes);
-            cuda_kv_ready_ = r_ok && u_ok;
-            if (std::getenv("DESIREEIA_KV_TRACE")) std::fprintf(stderr, "[kv] grow to %zu positions, base=%zu, bytes=%zu reserve=%d upload=%d\n", cache_capacity_, kv_local_base_, bytes, (int) r_ok, (int) u_ok);
-            if (std::getenv("DESIREEIA_KV_TRACE") && u_ok && !dbg_old_k.empty()) {
-                std::vector<uint8_t> chk_k(bytes), chk_v(bytes);
-                cuda_kv_cache_download(chk_k.data(), chk_v.data(), bytes);
-                size_t bad = 0, badl = (size_t) -1;
-                for (uint32_t l = 0; l < cfg_.n_layers; ++l) {
-                    const size_t n = std::min(dbg_old_start[l + 1] - dbg_old_start[l], kv_start_[l + 1] - kv_start_[l]);
-                    if (std::memcmp(chk_k.data() + kv_start_[l], dbg_old_k.data() + dbg_old_start[l], n) != 0) { ++bad; if (badl == (size_t) -1) badl = l; }
-                }
-                std::fprintf(stderr, "[kv] layers whose rows changed through the growth: %zu (first %lld)\n", bad, (long long) badl);
-            }
+            cuda_kv_ready_ = cuda_kv_cache_reserve(bytes) &&
+                              cuda_kv_cache_upload(k_cache_q_.data(), v_cache_q_.data(), bytes);
         }
 #endif
         return;
@@ -4418,6 +4403,140 @@ int32_t DenseForward::argmax(const std::vector<float>& v) {
         if (v[i] > v[best]) best = (int32_t) i;
     }
     return best;
+}
+
+// ---- Shared matrix helpers for the forward engines that live in their own file (see gemma4_forward.cpp). ----
+void mv_set_backend(int32_t backend) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    g_active_backend = backend;
+#else
+    (void) backend;
+#endif
+}
+
+// Device format code of a resident K-quant matrix, 0 when the matrix is not (fully) on the device in such a format.
+int mv_cuda_format(const MatVec& m, const void** d_w) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (g_active_backend == DESIREEIA_BACKEND_CUDA && m.cuda_qs && m.format != MatVecFormat::Q8_0 && m.lora.empty()) {
+        const int f = cuda_fmt_of(m.format);
+        if (f) { *d_w = m.cuda_qs.get(); return f; }
+    }
+#else
+    (void) m; (void) d_w;
+#endif
+    return 0;
+}
+
+bool mv_load(ModelReader& rd, const std::string& name, uint32_t rows, uint32_t cols, MatVec& out, bool resident) {
+    out = MatVec{};
+    std::vector<uint8_t> raw;
+    int quant_type = 0;
+    uint64_t ne0 = 0, tensor_rows = 0;
+    if (rd.read_tensor_raw(name, raw, quant_type, ne0, tensor_rows) && ne0 == cols && tensor_rows == rows) {
+        MatVecFormat fmt;
+        if (quant_format_for(quant_type, cols, fmt)) {
+#ifdef DESIREEIA_CUDA_ENABLED
+            // Q2_K / Q3_K have no device kernel: on the GPU they are re-encoded as Q4_K (from their exact dequantized values), so the
+            // whole matrix runs on the device instead of falling back to the host for every product.
+            if (resident && g_active_backend == DESIREEIA_BACKEND_CUDA && (fmt == MatVecFormat::Q2_K || fmt == MatVecFormat::Q3_K) &&
+                cols % QK_K == 0 && rows > 0) {
+                const int qt = quant_type;
+                const size_t n_super = cols / QK_K;
+                const size_t src_row = desireeia_row_size(qt, (int64_t) cols);
+                if (src_row > 0 && raw.size() == src_row * rows) {
+                    const size_t dst_row = n_super * sizeof(block_q4_K);
+                    std::vector<uint8_t> q4(dst_row * rows);
+                    std::atomic<bool> ok{true};
+                    parallel_rows(rows, [&](size_t r0, size_t r1) {
+                        std::vector<float> row((size_t) cols);
+                        for (size_t r = r0; r < r1; ++r) {
+                            if (desireeia_dequantize_row(qt, raw.data() + r * src_row, row.data(), (int64_t) cols) != DESIREEIA_OK) { ok.store(false); return; }
+                            quantize_row_q4_K(row.data(), reinterpret_cast<block_q4_K*>(q4.data() + r * dst_row), (int64_t) cols);
+                        }
+                    });
+                    if (ok.load()) { raw.swap(q4); fmt = MatVecFormat::Q4_K; }
+                }
+            }
+#endif
+            out.raw = std::move(raw);
+            out.format = fmt;
+#ifdef DESIREEIA_CUDA_ENABLED
+            cuda_make_resident(out, rows, cols, resident);
+            if (std::getenv("DESIREEIA_G4_PROF") && (name.find("ffn_") != std::string::npos || name.find("blk.0.") != std::string::npos))
+                std::fprintf(stderr, "mv %s fmt=%d resident=%d\n", name.c_str(), (int) out.format, out.cuda_qs ? 1 : 0);
+#else
+            (void) resident;
+#endif
+            return true;
+        }
+#ifdef DESIREEIA_CUDA_ENABLED
+        // A format without a direct kernel (the i-quant families of the mixed "dynamic" files): on the GPU it is re-encoded as Q4_K from
+        // its dequantized values instead of becoming a float matrix that every product multiplies on the host.
+        if (resident && g_active_backend == DESIREEIA_BACKEND_CUDA && cols % QK_K == 0 && rows > 0) {
+            const size_t src_row = desireeia_row_size(quant_type, (int64_t) cols);
+            if (src_row > 0 && raw.size() == src_row * rows) {
+                const size_t dst_row = (cols / QK_K) * sizeof(block_q4_K);
+                std::vector<uint8_t> q4(dst_row * rows);
+                std::atomic<bool> ok{true};
+                parallel_rows(rows, [&](size_t r0, size_t r1) {
+                    std::vector<float> row((size_t) cols);
+                    for (size_t r = r0; r < r1; ++r) {
+                        if (desireeia_dequantize_row(quant_type, raw.data() + r * src_row, row.data(), (int64_t) cols) != DESIREEIA_OK) { ok.store(false); return; }
+                        quantize_row_q4_K(row.data(), reinterpret_cast<block_q4_K*>(q4.data() + r * dst_row), (int64_t) cols);
+                    }
+                });
+                if (ok.load()) {
+                    out.raw = std::move(q4);
+                    out.format = MatVecFormat::Q4_K;
+                    cuda_make_resident(out, rows, cols, resident);
+                    return true;
+                }
+            }
+        }
+#endif
+    }
+    std::vector<float> f;
+    if (!rd.read_tensor(name, f) || f.size() != (size_t) rows * cols) return false;
+    out.f = std::move(f);
+    out.format = MatVecFormat::Float;
+    return true;
+}
+
+void mv_apply(const MatVec& m, size_t r, size_t c, const float* x, float* y) { matvec(m, r, c, x, y); }
+
+// Matrices that read the same activation: one device episode when they are all resident K-quant matrices.
+void mv_apply_group(const MatVec* const* ms, const size_t* rows, float* const* ys, size_t n, size_t c, const float* x) {
+#ifdef DESIREEIA_CUDA_ENABLED
+    if (g_active_backend == DESIREEIA_BACKEND_CUDA && n <= 4) {
+        CudaKQuantJob jobs[4];
+        bool all = true;
+        for (size_t i = 0; i < n && all; ++i) {
+            const MatVec& m = *ms[i];
+            const int f = cuda_fmt_of(m.format);
+            if (!m.cuda_qs || f == 0 || m.format == MatVecFormat::Q8_0 || !m.lora.empty()) { all = false; break; }
+            jobs[i] = CudaKQuantJob{f, m.cuda_qs.get(), rows[i], ys[i]};
+        }
+        if (all && matmul_kquant_cuda_resident_same_x(jobs, n, c, x) == DESIREEIA_OK) return;
+    }
+#endif
+    for (size_t i = 0; i < n; ++i) matvec(*ms[i], rows[i], c, x, ys[i]);
+}
+
+// One row of a [rows x cols] matrix as floats (embedding lookup).
+bool mv_row(const MatVec& m, uint32_t cols, uint32_t idx, float* out) {
+    if (m.format == MatVecFormat::Float) {
+        const size_t off = (size_t) idx * cols;
+        if (off + cols > m.f.size()) return false;
+        std::memcpy(out, m.f.data() + off, cols * sizeof(float));
+        return true;
+    }
+    const int qtype = matvec_quant_type(m.format);
+    if (qtype < 0) return false;
+    const size_t row_bytes = desireeia_row_size(qtype, (int64_t) cols);
+    if (row_bytes == 0) return false;
+    const size_t off = (size_t) idx * row_bytes;
+    if (off + row_bytes > m.raw.size()) return false;
+    return desireeia_dequantize_row(qtype, m.raw.data() + off, out, (int64_t) cols) == 0;
 }
 
 }
